@@ -20,9 +20,13 @@ jobs:
       - name: Extract clean application source
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path work | Out-Null
-          Expand-Archive -Path "MQL-Indicator-Library-Repo-Ready.zip" -DestinationPath work -Force
-          $app = Get-ChildItem -Path work -Directory | Select-Object -First 1
+          $work = Join-Path $env:RUNNER_TEMP "mql-indicator-library-build"
+          if (Test-Path $work) {
+            Remove-Item -Recurse -Force $work
+          }
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Expand-Archive -Path "MQL-Indicator-Library-Repo-Ready.zip" -DestinationPath $work -Force
+          $app = Get-ChildItem -Path $work -Directory | Select-Object -First 1
           if (-not $app) { throw "Application source folder was not found after extraction." }
           "APP_DIR=$($app.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Application source: $($app.FullName)"
