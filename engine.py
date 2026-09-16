@@ -121,6 +121,21 @@ def unchanged(conn,p):
     st=p.stat(); row=conn.execute('SELECT size,mtime_ns,scan_status,classifier_version FROM indicators WHERE path=?',(display_path(p),)).fetchone()
     return bool(row and row['scan_status']=='complete' and row['size']==st.st_size and row['mtime_ns']==st.st_mtime_ns and row['classifier_version']=='evidence-v3')
 
+def empty_scan_message(diagnostics):
+    parts=[]
+    for d in diagnostics:
+        if not d['exists']:
+            parts.append(f"Path not found: {d['path']}")
+            continue
+        src=d['mq4']+d['mq5']; compiled=d['compiled_ex4']+d['compiled_ex5']
+        msg=f"{d['path']}: {src} MQ4/MQ5 source files"
+        if compiled:
+            msg+=f", {compiled} compiled EX4/EX5 files (compiled files cannot be source-classified)"
+        if d['access_errors']:
+            msg+=f", {len(d['access_errors'])} inaccessible subfolder(s)"
+        parts.append(msg)
+    return 'No MQ4/MQ5 source files were discovered. ' + ' | '.join(parts)
+
 def scan(db,sources,force=False):
     conn=connect(db)
     for src in sources: conn.execute('INSERT INTO sources(path,enabled) VALUES(?,1) ON CONFLICT(path) DO UPDATE SET enabled=1',(display_path(src),))
@@ -131,7 +146,10 @@ def scan(db,sources,force=False):
     total=len(files)
     emit('scan_start',total=total,sources=[display_path(x) for x in sources])
     if total==0:
-        emit('scan_empty',total=0,diagnostics=diagnostics)
+        message=empty_scan_message(diagnostics)
+        emit('fatal',error=message,diagnostics=diagnostics)
+        conn.close()
+        return
     processed=skipped=failed=0; started=time.time()
     sha_first={r['sha256']:r['path'] for r in conn.execute('SELECT sha256,path FROM indicators WHERE sha256 IS NOT NULL AND duplicate_of IS NULL')}
     for idx,p in enumerate(files,1):
