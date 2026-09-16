@@ -1,8 +1,7 @@
 from __future__ import annotations
-import argparse, csv, hashlib, json, os, re, sqlite3, sys
-from dataclasses import dataclass, asdict, field
+import hashlib, re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 DRAW_TYPES = [
     'DRAW_LINE','DRAW_SECTION','DRAW_HISTOGRAM','DRAW_HISTOGRAM2','DRAW_ARROW','DRAW_COLOR_ARROW',
@@ -12,22 +11,14 @@ BUILTINS = {
     'iMA': ('Trend','Moving Average'), 'iBands': ('Volatility','Bollinger Bands'), 'iIchimoku': ('Trend','Ichimoku'),
     'iADX': ('Trend','ADX'), 'iRSI': ('Oscillator','RSI'), 'iStochastic': ('Oscillator','Stochastic'),
     'iCCI': ('Oscillator','CCI'), 'iMACD': ('Oscillator','MACD'), 'iMomentum': ('Momentum','Momentum'),
-    'iATR': ('Volatility','ATR'), 'iStdDev': ('Volatility','Standard Deviation'), 'iMFI': ('Volume','Money Flow Index'),
+    'iATR': ('Volatility','ATR'), 'iStdDev': ('Statistical','Standard Deviation'), 'iMFI': ('Volume','Money Flow Index'),
     'iOBV': ('Volume','On Balance Volume'), 'iVolumes': ('Volume','Volumes'), 'iAlligator': ('Bill Williams','Alligator'),
     'iAO': ('Bill Williams','Awesome Oscillator'), 'iAC': ('Bill Williams','Accelerator Oscillator'),
     'iFractals': ('Bill Williams','Fractals'), 'iSAR': ('Trend','Parabolic SAR'), 'iWPR': ('Oscillator','Williams %R'),
     'iRVI': ('Oscillator','RVI'), 'iDeMarker': ('Oscillator','DeMarker'), 'iBearsPower': ('Oscillator','Bears Power'),
     'iBullsPower': ('Oscillator','Bulls Power'), 'iForce': ('Volume','Force Index')
 }
-NAME_HINTS = [
-    (r'\brsi\b|rsx|jrsx', 'Oscillator','RSI/RSX family'), (r'\bmacd\b', 'Oscillator','MACD'),
-    (r'\bstoch', 'Oscillator','Stochastic'), (r'\bcci\b', 'Oscillator','CCI'), (r'\batr\b', 'Volatility','ATR'),
-    (r'bolli|bollinger|\bbb\b', 'Volatility','Bollinger Bands'), (r'awesome|\bao\b', 'Bill Williams','Awesome Oscillator'),
-    (r'fractal', 'Bill Williams','Fractals'), (r'volume|\bobv\b|\bmfi\b|\bkvo\b', 'Volume','Volume'),
-    (r'supertrend|trend|hull|tema|dema|\bema\b|\bsma\b|moving average|stepma', 'Trend','Trend'),
-    (r'zigzag', 'Support/Resistance','ZigZag'), (r'pivot|support|resistance|s[_ -]?r|levels?', 'Support/Resistance','Levels'),
-    (r'heiken|ha(?:shi)?', 'Price Action','Heiken Ashi'), (r'divergen', 'Signal','Divergence'),
-]
+CATEGORIES = ['Trend','Oscillator','Volume','Bill Williams','Volatility','Support/Resistance','Momentum','Signal','Price Action','Market Structure','Statistical','Utility','Custom / Specialized','Composite / Multi-Purpose','Unknown']
 
 @dataclass
 class Analysis:
@@ -53,29 +44,38 @@ class Analysis:
     secondary_categories: list[str] = field(default_factory=list)
     visual_category: str = 'Unknown'
     behavior_tags: list[str] = field(default_factory=list)
+    techniques: list[str] = field(default_factory=list)
+    evidence: list[dict] = field(default_factory=list)
+    classification_status: str = 'Unknown'
+    review_reason: str = ''
+    classifier_version: str = 'evidence-v3'
     confidence: int = 0
     warnings: list[str] = field(default_factory=list)
     duplicate_of: str | None = None
+    family_fingerprint: str = ''
 
 
 def read_text(path: Path) -> str:
     raw = path.read_bytes()
     for enc in ('utf-8-sig','utf-8','cp1252','latin1'):
-        try: return raw.decode(enc)
-        except UnicodeDecodeError: pass
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            pass
     return raw.decode('latin1', errors='replace')
 
+
 def strip_comments(text: str) -> str:
-    # preserve strings while removing comments well enough for static analysis
     text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
     text = re.sub(r'//[^\r\n]*', ' ', text)
     return text
 
+
 def normalize_newlines(text: str) -> str:
     return text.replace('\r\n','\n').replace('\r','\n').replace('\x00','')
 
+
 def function_spans(code: str) -> list[tuple[str,int,int]]:
-    # tolerant parser for MQL/C-style functions
     pat = re.compile(r'(?m)^\s*(?:[\w:<>&*\[\]]+\s+)+(?P<name>[A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{')
     spans=[]
     for m in pat.finditer(code):
@@ -86,8 +86,10 @@ def function_spans(code: str) -> list[tuple[str,int,int]]:
                 depth -= 1
                 if depth==0:
                     end=i+1; break
-        if end: spans.append((m.group('name'), m.start(), end))
+        if end:
+            spans.append((m.group('name'), m.start(), end))
     return spans
+
 
 def logic_code(code: str) -> tuple[str,bool]:
     spans=function_spans(code)
@@ -101,15 +103,17 @@ def logic_code(code: str) -> tuple[str,bool]:
     parts.append(code[pos:])
     return '\n'.join(parts), True
 
+
 def count_actual_calls(code: str, name: str) -> int:
-    # Call token followed by (, minus function definitions for exactly this name.
     total=len(re.findall(r'\b'+re.escape(name)+r'\s*\(', code))
     defs=len(re.findall(r'(?m)^\s*(?:[\w:<>&*\[\]]+\s+)+'+re.escape(name)+r'\s*\([^;{}]*\)\s*\{', code))
     return max(0,total-defs)
 
+
 def extract_int_property(code: str, prop: str) -> int:
     m=re.search(r'#property\s+'+re.escape(prop)+r'\s+(\d+)', code, re.I)
     return int(m.group(1)) if m else 0
+
 
 def infer_visual(a: Analysis) -> str:
     has_line=a.line_plots>0; has_hist=a.histogram_plots>0; has_arrow=a.arrow_plots>0; has_fill=a.filling_plots>0
@@ -119,168 +123,133 @@ def infer_visual(a: Analysis) -> str:
     if has_hist: return 'Histogram'
     if has_fill: return 'Zones/Filling'
     if has_line:
-        if a.line_plots==1: return 'One-Line'
-        if a.line_plots==2: return 'Two-Line'
-        return 'Multi-Line'
+        return 'One-Line' if a.line_plots==1 else ('Two-Line' if a.line_plots==2 else 'Multi-Line')
     if a.object_usage: return 'Objects'
     return 'Unknown'
 
-def score_categories(filename: str, logic: str, stds: list[str], a: Analysis) -> tuple[str,list[str],list[str],int]:
-    scores={k:0 for k in ['Trend','Oscillator','Volume','Bill Williams','Volatility','Support/Resistance','Momentum','Signal','Price Action','Statistical','Utility']}
-    tags=[]
+
+def add_evidence(evidence: list[dict], scores: dict[str,float], category: str, weight: float, kind: str, detail: str, technique: str | None = None):
+    scores[category] = scores.get(category, 0.0) + weight
+    item={'category':category,'weight':round(weight,2),'kind':kind,'detail':detail}
+    if technique: item['technique']=technique
+    evidence.append(item)
+
+
+def structural_fingerprint(logic: str) -> str:
+    normalized = re.sub(r'"(?:\\.|[^"\\])*"', '"STR"', logic)
+    normalized = re.sub(r'\b\d+(?:\.\d+)?\b', 'N', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip().lower()
+    tokens = re.findall(r'[a-z_][a-z0-9_]*|[+\-*/<>=!&|]+', normalized)
+    return hashlib.sha256(' '.join(tokens[:12000]).encode('utf-8', errors='ignore')).hexdigest()
+
+
+def classify(filename: str, logic: str, stds: list[str], a: Analysis):
+    scores={k:0.0 for k in CATEGORIES if k not in ('Unknown','Custom / Specialized','Composite / Multi-Purpose')}
+    evidence=[]; tags=[]; techniques=[]
+
     for std in stds:
         base=std.replace('MQL4_','')
-        if base in BUILTINS:
-            cat,tech=BUILTINS[base]; scores[cat]+=35; tags.append(tech)
-            if base in ('iRSI','iCCI','iStochastic','iMACD','iWPR','iRVI','iDeMarker'): scores['Momentum']+=10
-            if base=='iBands': scores['Trend']+=8; scores['Support/Resistance']+=8
-            if base=='iFractals': scores['Support/Resistance']+=18; scores['Signal']+=12
-    low=(filename+' '+logic[:8000]).lower()
-    for pat,cat,tech in NAME_HINTS:
-        if re.search(pat, low, re.I):
-            scores[cat]+=18; tags.append(tech)
-    # direct formula/behavior cues
-    if re.search(r'ObjectCreate\s*\(|OBJ_HLINE|OBJ_TREND|OBJ_RECTANGLE|OBJ_FIBO', logic, re.I): scores['Support/Resistance']+=8
-    if a.arrow_plots: scores['Signal']+=18; tags.append('Buy/Sell or event markers')
-    if re.search(r'alert\s*\(|SendNotification\s*\(|SendMail\s*\(', logic, re.I): scores['Signal']+=8; tags.append('Alerts')
-    if re.search(r'High\s*\[.*\].*Low\s*\[|iHighest\s*\(|iLowest\s*\(', logic, re.I|re.S): scores['Support/Resistance']+=6
-    if re.search(r'StdDev|standard\s+deviation|MathSqrt\s*\(', logic, re.I): scores['Statistical']+=10
-    if re.search(r'Heiken|ha(Open|Close|High|Low)', logic, re.I): scores['Price Action']+=25
+        if base not in BUILTINS: continue
+        cat,tech=BUILTINS[base]
+        add_evidence(evidence,scores,cat,32,'active_builtin',f'{base} is actively called in calculation logic',tech)
+        techniques.append(tech)
+        if base in ('iRSI','iCCI','iStochastic','iMACD','iWPR','iRVI','iDeMarker'):
+            add_evidence(evidence,scores,'Momentum',8,'derived_behavior',f'{base} commonly contributes momentum information')
+        if base=='iBands':
+            add_evidence(evidence,scores,'Support/Resistance',8,'derived_behavior','Bollinger bands can act as dynamic boundaries')
+        if base=='iFractals':
+            add_evidence(evidence,scores,'Support/Resistance',14,'derived_behavior','Fractals identify local extrema')
+            add_evidence(evidence,scores,'Signal',8,'derived_behavior','Fractal events may be used as signals')
+
+    if re.search(r'\b(?:Volume|tick_volume|real_volume)\b', logic, re.I):
+        add_evidence(evidence,scores,'Volume',14,'data_dependency','Uses volume/tick-volume data'); techniques.append('Volume analysis')
+    if re.search(r'\b(?:MathSqrt|MathPow|StdDev|variance|deviation|correlation|regression)\b', logic, re.I):
+        add_evidence(evidence,scores,'Statistical',16,'formula','Statistical/deviation mathematics detected'); techniques.append('Statistical calculation')
+    if re.search(r'\b(?:iHighest|iLowest)\s*\(|\bHigh\s*\[.*?\].*?\bLow\s*\[', logic, re.I|re.S):
+        add_evidence(evidence,scores,'Support/Resistance',12,'price_structure','High/low extrema logic detected'); techniques.append('Extrema / levels')
+    if re.search(r'\b(?:swing|bos|choch|break\s*of\s*structure|market\s*structure)\b', logic, re.I):
+        add_evidence(evidence,scores,'Market Structure',22,'behavior','Market-structure terminology/logic detected'); techniques.append('Market structure')
+    if re.search(r'\b(?:Open|High|Low|Close)\s*\[[^\]]+\].*\b(?:Open|High|Low|Close)\s*\[', logic, re.I|re.S):
+        add_evidence(evidence,scores,'Price Action',8,'price_dependency','Direct multi-price-bar calculations detected')
+    if re.search(r'\b(?:Heiken|haOpen|haClose|haHigh|haLow)\b', logic, re.I):
+        add_evidence(evidence,scores,'Price Action',24,'formula','Heiken Ashi-style calculation detected','Heiken Ashi'); techniques.append('Heiken Ashi')
+    if re.search(r'\b(?:cross|crossover|crossunder)\b', logic, re.I) or re.search(r'\[[^\]]*\]\s*[<>]\s*[^;\n]+\[[^\]]*\]',logic):
+        add_evidence(evidence,scores,'Signal',10,'behavior','Cross/comparison signal logic detected'); tags.append('Crossover / comparative signal')
+    if re.search(r'\b(?:divergen|bullish divergence|bearish divergence)\b', logic, re.I):
+        add_evidence(evidence,scores,'Signal',20,'behavior','Divergence logic detected'); tags.append('Divergence')
+    if re.search(r'\b(?:breakout|break\s+above|break\s+below)\b', logic, re.I):
+        add_evidence(evidence,scores,'Signal',12,'behavior','Breakout logic detected'); add_evidence(evidence,scores,'Support/Resistance',8,'behavior','Breakout references price boundaries'); tags.append('Breakout')
+    if re.search(r'\b(?:70|80)\b.*\b(?:30|20)\b|\boverbought\b|\boversold\b', logic, re.I|re.S):
+        add_evidence(evidence,scores,'Oscillator',12,'threshold','Overbought/oversold threshold behavior detected'); tags.append('Overbought/Oversold')
+    if re.search(r'\b(?:Alert|SendNotification|SendMail)\s*\(', logic, re.I):
+        add_evidence(evidence,scores,'Signal',8,'output','Alert/notification output detected'); tags.append('Alerts')
+    if a.arrow_plots:
+        add_evidence(evidence,scores,'Signal',14,'visual_output','Arrow/icon plot output detected'); tags.append('Event markers')
+    if a.object_usage: add_evidence(evidence,scores,'Support/Resistance',6,'visual_output','Chart-object drawing detected')
+    if re.search(r'\b(?:OBJ_HLINE|OBJ_TREND|OBJ_RECTANGLE|OBJ_FIBO)\b', logic, re.I):
+        add_evidence(evidence,scores,'Support/Resistance',12,'visual_output','Support/resistance-style chart objects detected')
+    if re.search(r'\b(?:ObjectCreate|Comment|Print)\s*\(', logic, re.I) and not stds:
+        add_evidence(evidence,scores,'Utility',6,'utility_behavior','Utility/display behavior detected without strong indicator dependency')
+
     ranked=sorted(scores.items(), key=lambda kv:kv[1], reverse=True)
-    best, bestscore=ranked[0]
-    if bestscore < 12: return 'Unknown', [], sorted(set(tags)), 35 if a.visual_category!='Unknown' else 20
-    secondary=[k for k,v in ranked[1:] if v>=max(12,bestscore*0.45)]
-    # confidence rewards multiple independent cues but avoids false certainty
-    confidence=min(98, 50 + min(bestscore,35) + 5*len(stds) + (5 if a.visual_category!='Unknown' else 0))
-    return best, secondary, sorted(set(tags)), confidence
+    positive=[(c,s) for c,s in ranked if s>0]
+    if not positive:
+        return 'Unknown', [], sorted(set(tags)), sorted(set(techniques)), evidence, 20, 'Unknown', 'No reliable functional evidence detected'
+
+    best,bestscore=positive[0]; secondscore=positive[1][1] if len(positive)>1 else 0
+    independent=[c for c,s in positive if s>=max(14,bestscore*0.55)]
+    if len(independent)>=2 and secondscore>=18 and secondscore/bestscore>=0.60:
+        primary='Composite / Multi-Purpose'; secondary=independent[:5]
+        confidence=min(92,int(55+min(25,bestscore/2)+min(12,secondscore/3)))
+        status='High Confidence' if confidence>=85 else 'Probable'; reason='Multiple independent functional families have strong evidence'
+    elif bestscore>=24:
+        primary=best; secondary=[c for c,s in positive[1:] if s>=max(12,bestscore*0.45)][:5]
+        evidence_count=sum(1 for e in evidence if e['category']==best); margin=max(0,bestscore-secondscore)
+        confidence=min(97,int(58+min(22,bestscore/2)+min(10,margin/3)+min(7,evidence_count*2)))
+        status='High Confidence' if confidence>=85 else ('Probable' if confidence>=70 else 'Needs Review')
+        reason='' if status!='Needs Review' else 'Evidence is present but not strong enough for automatic trust'
+    else:
+        primary='Custom / Specialized' if (a.custom_dependencies or len(evidence)>=2) else 'Unknown'
+        secondary=[c for c,s in positive if s>=8][:5]; confidence=min(69,int(35+bestscore)); status='Needs Review'
+        reason='Some functional evidence exists, but it is insufficient for a definitive standard category'
+    return primary,secondary,sorted(set(tags)),sorted(set(techniques)),evidence,confidence,status,reason
+
 
 def analyze(path: Path) -> Analysis:
     text=normalize_newlines(read_text(path)); code=strip_comments(text)
     platform='MQL5' if path.suffix.lower()=='.mq5' else 'MQL4'
-    sha=hashlib.sha256(path.read_bytes()).hexdigest()
-    a=Analysis(str(path.resolve()), path.name, platform, sha, path.stat().st_size)
-    converted=bool(re.search(r'AUTO[- ]CONVERTED\s+MQL4\s*[-=]>?\s*MQL5|compatibility helpers generated', text, re.I))
-    marker=re.search(r'=====\s*Converted source\s*=====', text, re.I)
-    if converted and marker:
-        logic=strip_comments(text[marker.end():])
-        compat=True
-    else:
-        logic, compat=logic_code(code)
+    raw=path.read_bytes(); sha=hashlib.sha256(raw).hexdigest(); a=Analysis(str(path.resolve()),path.name,platform,sha,len(raw))
+    converted=bool(re.search(r'AUTO[- ]CONVERTED\s+MQL4\s*[-=]>?\s*MQL5|compatibility helpers generated',text,re.I)); marker=re.search(r'=====\s*Converted source\s*=====',text,re.I)
+    if converted and marker: logic=strip_comments(text[marker.end():]); compat=True
+    else: logic,compat=logic_code(code)
     if platform=='MQL5' and converted: a.source_structure='Converted MQL4→MQL5'
     elif platform=='MQL5' and compat: a.source_structure='Compatibility-heavy MQL5'
     else: a.source_structure='Native/Legacy '+platform
-    if re.search(r'#property\s+indicator_chart_window', code, re.I): a.display_location='Main Chart'
-    if re.search(r'#property\s+indicator_separate_window', code, re.I): a.display_location='Separate Window'
-    a.declared_buffers=extract_int_property(code,'indicator_buffers')
-    a.declared_plots=extract_int_property(code,'indicator_plots')
-    a.active_buffers=len(set(re.findall(r'SetIndexBuffer\s*\(\s*(\d+)', logic, re.I)))
+    if re.search(r'#property\s+indicator_chart_window',code,re.I): a.display_location='Main Chart'
+    if re.search(r'#property\s+indicator_separate_window',code,re.I): a.display_location='Separate Window'
+    a.declared_buffers=extract_int_property(code,'indicator_buffers'); a.declared_plots=extract_int_property(code,'indicator_plots')
+    a.active_buffers=len(set(re.findall(r'SetIndexBuffer\s*\(\s*(\d+)',logic,re.I)))
     draw=[]
     for dt in DRAW_TYPES:
-        n=len(re.findall(r'\b'+dt+r'\b', logic, re.I))
-        draw.extend([dt]*n)
-    # MQ5 property draw types (may be in declarations outside functions)
-    for dt in DRAW_TYPES:
-        n=len(re.findall(r'#property\s+indicator_type\d+\s+'+dt+r'\b', code, re.I))
-        draw.extend([dt]*n)
+        if re.search(r'\b'+dt+r'\b',logic,re.I) or re.search(r'#property\s+indicator_type\d+\s+'+dt+r'\b',code,re.I): draw.append(dt)
     a.draw_types=sorted(set(draw))
-    # plot counts by SetIndexStyle/property occurrences; set uniqueness is impossible if variable index used
-    style_entries=re.findall(r'(?:MQL4_)?SetIndexStyle\s*\(\s*([^,]+)\s*,\s*(DRAW_[A-Z0-9_]+)', logic, re.I)
-    prop_entries=re.findall(r'#property\s+indicator_type\d+\s+(DRAW_[A-Z0-9_]+)', code, re.I)
-    types=[t.upper() for _,t in style_entries]+[t.upper() for t in prop_entries]
-    # runtime MQL5 PlotIndexSetInteger(...PLOT_DRAW_TYPE...)
-    types += [t.upper() for t in re.findall(r'PlotIndexSetInteger\s*\([^,]+,\s*PLOT_DRAW_TYPE\s*,\s*(DRAW_[A-Z0-9_]+)', logic, re.I)]
-    a.line_plots=sum(t in ('DRAW_LINE','DRAW_COLOR_LINE','DRAW_SECTION','DRAW_ZIGZAG') for t in types)
-    a.histogram_plots=sum(t in ('DRAW_HISTOGRAM','DRAW_HISTOGRAM2') for t in types)
-    a.arrow_plots=sum(t in ('DRAW_ARROW','DRAW_COLOR_ARROW') for t in types)
-    a.filling_plots=sum(t=='DRAW_FILLING' for t in types)
-    a.object_usage=bool(re.search(r'ObjectCreate\s*\(|OBJ_(?:HLINE|VLINE|TREND|RECTANGLE|TEXT|LABEL|ARROW|FIBO)', logic, re.I))
+    types=[t.upper() for _,t in re.findall(r'(?:MQL4_)?SetIndexStyle\s*\(\s*([^,]+)\s*,\s*(DRAW_[A-Z0-9_]+)',logic,re.I)]
+    types += [t.upper() for t in re.findall(r'#property\s+indicator_type\d+\s+(DRAW_[A-Z0-9_]+)',code,re.I)]
+    types += [t.upper() for t in re.findall(r'PlotIndexSetInteger\s*\([^,]+,\s*PLOT_DRAW_TYPE\s*,\s*(DRAW_[A-Z0-9_]+)',logic,re.I)]
+    a.line_plots=sum(t in ('DRAW_LINE','DRAW_COLOR_LINE','DRAW_SECTION','DRAW_ZIGZAG') for t in types); a.histogram_plots=sum(t in ('DRAW_HISTOGRAM','DRAW_HISTOGRAM2') for t in types); a.arrow_plots=sum(t in ('DRAW_ARROW','DRAW_COLOR_ARROW') for t in types); a.filling_plots=sum(t=='DRAW_FILLING' for t in types)
+    a.object_usage=bool(re.search(r'ObjectCreate\s*\(|OBJ_(?:HLINE|VLINE|TREND|RECTANGLE|TEXT|LABEL|ARROW|FIBO)',logic,re.I))
     stds=[]
     for base in BUILTINS:
         for nm in (base,'MQL4_'+base):
             if count_actual_calls(logic,nm)>0: stds.append(nm)
     a.standard_indicators=sorted(set(stds))
     deps=[]
-    for m in re.finditer(r'\biCustom\s*\((.*?)\)', logic, re.I|re.S):
-        chunk=m.group(1)[:500]
-        ss=re.findall(r'"([^"]+)"',chunk)
+    for m in re.finditer(r'\biCustom\s*\((.*?)\)',logic,re.I|re.S):
+        ss=re.findall(r'"([^"]+)"',m.group(1)[:800])
         if ss: deps.append(ss[0])
-    a.custom_dependencies=sorted(set(deps))
-    a.visual_category=infer_visual(a)
-    a.primary_category,a.secondary_categories,a.behavior_tags,a.confidence=score_categories(path.stem,logic,a.standard_indicators,a)
-    if compat: a.warnings.append('Compatibility/helper functions detected and excluded from indicator-call scoring')
-    if a.visual_category=='Unknown': a.warnings.append('No reliable plot style detected; may be object-only or dynamically configured')
-    if a.primary_category=='Unknown': a.warnings.append('Low-confidence functional classification; manual review recommended')
+    a.custom_dependencies=sorted(set(deps)); a.visual_category=infer_visual(a); a.family_fingerprint=structural_fingerprint(logic)
+    (a.primary_category,a.secondary_categories,a.behavior_tags,a.techniques,a.evidence,a.confidence,a.classification_status,a.review_reason)=classify(path.stem,logic,a.standard_indicators,a)
+    if compat: a.warnings.append('Compatibility/helper functions were excluded from active indicator-call scoring')
+    if a.visual_category=='Unknown': a.warnings.append('No reliable static plot style detected; the indicator may configure output dynamically or use objects only')
+    if a.classification_status in ('Needs Review','Unknown'): a.warnings.append('Functional classification intentionally abstained from high-confidence labeling')
     return a
-
-def init_db(conn: sqlite3.Connection):
-    conn.executescript('''
-    PRAGMA journal_mode=WAL;
-    CREATE TABLE IF NOT EXISTS indicators(
-      id INTEGER PRIMARY KEY, path TEXT UNIQUE, filename TEXT, platform TEXT, sha256 TEXT, size INTEGER,
-      source_structure TEXT, display_location TEXT, declared_buffers INTEGER, declared_plots INTEGER,
-      active_buffers INTEGER, draw_types TEXT, line_plots INTEGER, histogram_plots INTEGER, arrow_plots INTEGER,
-      filling_plots INTEGER, object_usage INTEGER, standard_indicators TEXT, custom_dependencies TEXT,
-      primary_category TEXT, secondary_categories TEXT, visual_category TEXT, behavior_tags TEXT,
-      confidence INTEGER, warnings TEXT, duplicate_of TEXT, analyzed_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_sha ON indicators(sha256);
-    CREATE INDEX IF NOT EXISTS idx_primary ON indicators(primary_category);
-    CREATE INDEX IF NOT EXISTS idx_visual ON indicators(visual_category);
-    CREATE INDEX IF NOT EXISTS idx_platform ON indicators(platform);
-    ''')
-
-def save(conn: sqlite3.Connection, a: Analysis):
-    d=asdict(a)
-    for k in ['draw_types','standard_indicators','custom_dependencies','secondary_categories','behavior_tags','warnings']:
-        d[k]=json.dumps(d[k],ensure_ascii=False)
-    d['object_usage']=1 if d['object_usage'] else 0
-    cols=list(d.keys()); vals=[d[c] for c in cols]
-    sql=f"INSERT INTO indicators({','.join(cols)}) VALUES({','.join('?' for _ in cols)}) ON CONFLICT(path) DO UPDATE SET "+','.join(f'{c}=excluded.{c}' for c in cols if c!='path')
-    conn.execute(sql,vals)
-
-def scan(paths: Iterable[Path], db: Path, csv_path: Path | None=None):
-    files=[]
-    for root in paths:
-        if root.is_file() and root.suffix.lower() in ('.mq4','.mq5'): files.append(root)
-        elif root.is_dir(): files += [p for p in root.rglob('*') if p.suffix.lower() in ('.mq4','.mq5')]
-    files=sorted(files,key=lambda p:str(p).lower())
-    conn=sqlite3.connect(db); init_db(conn)
-    results=[]; sha_first={}
-    for i,p in enumerate(files,1):
-        a=analyze(p)
-        if a.sha256 in sha_first: a.duplicate_of=sha_first[a.sha256]
-        else: sha_first[a.sha256]=a.path
-        save(conn,a); results.append(a)
-        if i%25==0: conn.commit()
-    conn.commit(); conn.close()
-    if csv_path:
-        fields=list(asdict(results[0]).keys()) if results else list(Analysis.__annotations__.keys())
-        with csv_path.open('w',newline='',encoding='utf-8-sig') as f:
-            w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
-            for a in results:
-                row=asdict(a)
-                for k,v in row.items():
-                    if isinstance(v,list): row[k]='; '.join(v)
-                w.writerow(row)
-    return results
-
-def summary(results):
-    from collections import Counter
-    return {
-      'total':len(results),'platforms':dict(Counter(a.platform for a in results)),
-      'primary_categories':dict(Counter(a.primary_category for a in results)),
-      'visual_categories':dict(Counter(a.visual_category for a in results)),
-      'source_structure':dict(Counter(a.source_structure for a in results)),
-      'duplicates':sum(bool(a.duplicate_of) for a in results),
-      'needs_review':sum(a.confidence<70 or a.primary_category=='Unknown' for a in results),
-      'average_confidence':round(sum(a.confidence for a in results)/len(results),1) if results else 0,
-    }
-
-def main():
-    ap=argparse.ArgumentParser(description='MQL Indicator Library prototype analyzer')
-    ap.add_argument('paths',nargs='+'); ap.add_argument('--db',default='indicator_library.sqlite3'); ap.add_argument('--csv',default='classification_report.csv'); ap.add_argument('--summary',default='summary.json')
-    args=ap.parse_args()
-    results=scan([Path(p) for p in args.paths],Path(args.db),Path(args.csv))
-    s=summary(results); Path(args.summary).write_text(json.dumps(s,indent=2),encoding='utf-8')
-    print(json.dumps(s,indent=2))
-if __name__=='__main__': main()
