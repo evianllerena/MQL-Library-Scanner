@@ -16,6 +16,17 @@
           "args": true
         }
       ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "binaries/mql-engine",
+          "cmd": "binaries/mql-engine",
+          "sidecar": true,
+          "args": true
+        }
+      ]
     }
   ]
 }
