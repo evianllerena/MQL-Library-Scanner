@@ -1,7 +1,8 @@
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 fn log_startup_error(message: &str) {
     let path = std::env::temp_dir().join("mql-indicator-library-startup-error.txt");
@@ -18,6 +19,38 @@ fn open_db(path: &str) -> Result<Connection, String> {
 
 fn parse_json_text(value: String) -> Value {
     serde_json::from_str(&value).unwrap_or_else(|_| json!([]))
+}
+
+fn walk_preview(root: &Path, files: &mut Vec<String>, total: &mut u64, errors: &mut u64, max_preview: usize) {
+    let entries = match fs::read_dir(root) {
+        Ok(v) => v,
+        Err(_) => { *errors += 1; return; }
+    };
+    for entry in entries {
+        let entry = match entry { Ok(v) => v, Err(_) => { *errors += 1; continue; } };
+        let path: PathBuf = entry.path();
+        let meta = match entry.file_type() { Ok(v) => v, Err(_) => { *errors += 1; continue; } };
+        if meta.is_dir() {
+            walk_preview(&path, files, total, errors, max_preview);
+        } else if meta.is_file() {
+            *total += 1;
+            if files.len() < max_preview {
+                files.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn folder_preview(path: String, max_preview: Option<usize>) -> Result<Value, String> {
+    let root = Path::new(&path);
+    if !root.exists() { return Err(format!("Path does not exist: {}", path)); }
+    if !root.is_dir() { return Err(format!("Path is not a folder: {}", path)); }
+    let mut files = Vec::new();
+    let mut total: u64 = 0;
+    let mut errors: u64 = 0;
+    walk_preview(root, &mut files, &mut total, &mut errors, max_preview.unwrap_or(250).clamp(1, 1000));
+    Ok(json!({"path":path,"total_files":total,"preview_files":files,"access_errors":errors}))
 }
 
 #[tauri::command]
@@ -103,7 +136,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }
