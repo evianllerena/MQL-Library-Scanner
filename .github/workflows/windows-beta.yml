@@ -29,7 +29,7 @@ jobs:
           "APP_DIR=$($app.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Application source: $($app.FullName)"
 
-      - name: Harden Windows startup
+      - name: Harden Windows startup and scanner UI
         shell: pwsh
         run: |
           Set-Location $env:APP_DIR
@@ -69,18 +69,37 @@ jobs:
           )
           $lib | Set-Content -Path "src-tauri/src/lib.rs" -Encoding utf8
 
+          $uiPath = "ui/main.js"
+          $ui = Get-Content $uiPath -Raw
+          $oldEngine = "async function engine(args, onLine){`n  const cmd=Command.sidecar('binaries/mql-engine',args);`n  if(onLine){ cmd.stdout.on('data',line=>onLine(line)); cmd.stderr.on('data',line=>console.error(line)); const child=await cmd.spawn(); return child; }`n  const out=await cmd.execute(); if(out.code!==0) throw new Error(out.stderr||``Engine exited `${out.code}``); return out.stdout.trim();`n}"
+          $newEngine = "async function engine(args, onLine, onClose){`n  const cmd=Command.sidecar('binaries/mql-engine',args);`n  if(onLine){`n    cmd.stdout.on('data',line=>onLine(line));`n    cmd.stderr.on('data',line=>console.error(line));`n    if(onClose) cmd.on('close',onClose);`n    cmd.on('error',err=>console.error('Engine error',err));`n    const child=await cmd.spawn(); return child;`n  }`n  const out=await cmd.execute(); if(out.code!==0) throw new Error(out.stderr||``Engine exited `${out.code}``); return out.stdout.trim();`n}"
+          if (-not $ui.Contains($oldEngine)) { throw "Expected engine() block not found in ui/main.js" }
+          $ui = $ui.Replace($oldEngine, $newEngine)
+
+          $oldScanTail = "}); child.on('close',async()=>{state.scanning=false;scanBtn.disabled=false;addFolder.disabled=false;await reloadAll()});}catch(e){scanText.textContent=``Scan failed: `${e}``;scanBtn.disabled=false;addFolder.disabled=false;state.scanning=false}}"
+          $newScanTail = "},async()=>{state.scanning=false;document.querySelector('#scanBtn').disabled=false;document.querySelector('#addFolder').disabled=false;await reloadAll()});}catch(e){scanText.textContent=``Scan failed: `${e}``;document.querySelector('#scanBtn').disabled=false;document.querySelector('#addFolder').disabled=false;state.scanning=false}}"
+          if (-not $ui.Contains($oldScanTail)) { throw "Expected scan completion block not found in ui/main.js" }
+          $ui = $ui.Replace($oldScanTail, $newScanTail)
+
+          $ui = $ui.Replace("addFolder.onclick=addFolder;", "document.querySelector('#addFolder').onclick=addFolder;")
+          $ui = $ui.Replace("scanBtn.onclick=startScan;", "document.querySelector('#scanBtn').onclick=startScan;")
+          $ui = $ui.Replace("refreshBtn.onclick=reloadAll;", "document.querySelector('#refreshBtn').onclick=reloadAll;")
+          $ui = $ui.Replace("closeDetail.onclick=()=>detail.classList.remove('open');", "document.querySelector('#closeDetail').onclick=()=>document.querySelector('#detail').classList.remove('open');")
+          $ui = $ui.Replace("checkUpdates.onclick=checkUpdates;", "const updateBtn=document.querySelector('#checkUpdates'); if(updateBtn) updateBtn.onclick=checkUpdates;")
+          $ui | Set-Content $uiPath -Encoding utf8
+
           $pkg = Get-Content "package.json" -Raw | ConvertFrom-Json
-          $pkg.version = "0.2.0-beta.2"
+          $pkg.version = "0.2.0-beta.3"
           $pkg | ConvertTo-Json -Depth 20 | Set-Content "package.json" -Encoding utf8
 
-          (Get-Content "src-tauri/Cargo.toml" -Raw) -replace 'version = "0.2.0-beta.1"','version = "0.2.0-beta.2"' | Set-Content "src-tauri/Cargo.toml" -Encoding utf8
+          (Get-Content "src-tauri/Cargo.toml" -Raw) -replace 'version = "0.2.0-beta.1"','version = "0.2.0-beta.3"' | Set-Content "src-tauri/Cargo.toml" -Encoding utf8
 
           $conf = Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
-          $conf.version = "0.2.0-beta.2"
+          $conf.version = "0.2.0-beta.3"
           $conf.identifier = "com.mqlindicatorlibrary.desktop"
           $conf | ConvertTo-Json -Depth 30 | Set-Content "src-tauri/tauri.conf.json" -Encoding utf8
 
-          Write-Host "Prepared Beta 0.2.0-beta.2 hardened Windows startup."
+          Write-Host "Prepared Beta 0.2.0-beta.3 scanner UI fixes."
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -140,7 +159,7 @@ jobs:
       - name: Upload finished Setup.exe
         uses: actions/upload-artifact@v4
         with:
-          name: MQL-Indicator-Library-0.2.0-beta.2-Windows-Setup
+          name: MQL-Indicator-Library-0.2.0-beta.3-Windows-Setup
           path: ${{ env.APP_DIR }}/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 14
