@@ -1,8 +1,10 @@
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use tauri::Emitter;
 
 fn log_startup_error(message: &str) {
     let path = std::env::temp_dir().join("mql-indicator-library-startup-error.txt");
@@ -99,6 +101,52 @@ fn browse_directory(path: Option<String>) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn start_scan_engine(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, String> {
+    if args.first().map(String::as_str) != Some("scan") {
+        return Err("Only the scan command is permitted through start_scan_engine".into());
+    }
+    let current = std::env::current_exe().map_err(|e| format!("Cannot resolve app executable: {}", e))?;
+    let dir = current.parent().ok_or_else(|| "Cannot resolve application folder".to_string())?;
+    #[cfg(target_os = "windows")]
+    let engine_path = dir.join("mql-engine.exe");
+    #[cfg(not(target_os = "windows"))]
+    let engine_path = dir.join("mql-engine");
+    if !engine_path.exists() {
+        return Err(format!("Scanner engine was not found at {}", engine_path.display()));
+    }
+
+    let mut cmd = ProcessCommand::new(&engine_path);
+    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("Could not start scanner engine: {}", e))?;
+    let stdout = child.stdout.take().ok_or_else(|| "Could not capture scanner output".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "Could not capture scanner errors".to_string())?;
+
+    let app_out = app.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = app_out.emit("scan-engine-line", json!({"line": line}));
+        }
+    });
+    let app_err = app.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = app_err.emit("scan-engine-stderr", json!({"line": line}));
+        }
+    });
+    std::thread::spawn(move || {
+        let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+        let _ = app.emit("scan-engine-done", json!({"code": code}));
+    });
+
+    Ok(json!({"started":true,"engine":engine_path.to_string_lossy()}))
+}
+
+#[tauri::command]
 fn db_stats(db_path: String) -> Result<Value, String> {
     let conn = open_db(&db_path)?;
     let count = |sql: &str| -> Result<i64, String> {
@@ -181,7 +229,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }
