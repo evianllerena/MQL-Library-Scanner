@@ -52,7 +52,6 @@ jobs:
           Copy-Item "$repo/main.rs" "src-tauri/src/main.rs" -Force
           Copy-Item "$repo/default.json" "src-tauri/capabilities/default.json" -Force
           Copy-Item "$repo/package.json" "package.json" -Force
-
           $conf = Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
           $conf.version = "0.3.0-beta.1"
           $conf.identifier = "com.mqlindicatorlibrary.desktop"
@@ -81,16 +80,17 @@ jobs:
           $sample = Join-Path $env:RUNNER_TEMP "mql-smoke"
           if (Test-Path $sample) { Remove-Item -Recurse -Force $sample }
           New-Item -ItemType Directory -Force -Path $sample | Out-Null
-          @'
-#property indicator_separate_window
-#property indicator_buffers 1
-double Buf[];
-int OnInit(){ SetIndexBuffer(0,Buf); return(0); }
-int OnCalculate(const int rates_total,const int prev_calculated,const datetime &time[],const double &open[],const double &high[],const double &low[],const double &close[],const long &tick_volume[],const long &volume[],const int &spread[]){
-  for(int i=0;i<rates_total;i++) Buf[i]=iRSI(NULL,0,14,PRICE_CLOSE,i);
-  return(rates_total);
-}
-'@ | Set-Content "$sample/smoke_rsi.mq4" -Encoding utf8
+          $sampleLines = @(
+            '#property indicator_separate_window',
+            '#property indicator_buffers 1',
+            'double Buf[];',
+            'int OnInit(){ SetIndexBuffer(0,Buf); return(0); }',
+            'int OnCalculate(const int rates_total,const int prev_calculated,const datetime &time[],const double &open[],const double &high[],const double &low[],const double &close[],const long &tick_volume[],const long &volume[],const int &spread[]){',
+            '  for(int i=0;i<rates_total;i++) Buf[i]=iRSI(NULL,0,14,PRICE_CLOSE,i);',
+            '  return(rates_total);',
+            '}'
+          )
+          $sampleLines | Set-Content "$sample/smoke_rsi.mq4" -Encoding utf8
           python engine/engine.py scan --db "$sample/smoke.sqlite3" --source "$sample"
           python engine/engine.py stats --db "$sample/smoke.sqlite3"
 
