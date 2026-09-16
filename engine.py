@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, sqlite3, sys, time
+import argparse, json, os, sqlite3, sys, time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable
@@ -65,14 +65,48 @@ def migrate(conn):
     conn.execute("INSERT INTO meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(SCHEMA_VERSION),))
     conn.commit()
 
+def display_path(p: Path) -> str:
+    try:
+        return str(p.resolve())
+    except Exception:
+        return str(p.absolute())
+
 def discover(sources: Iterable[Path]):
-    found={}
+    found: dict[str, Path] = {}
+    diagnostics=[]
     for root in sources:
-        if root.is_file() and root.suffix.lower() in ('.mq4','.mq5'): found[str(root.resolve()).lower()]=root
-        elif root.is_dir():
-            for p in root.rglob('*'):
-                if p.is_file() and p.suffix.lower() in ('.mq4','.mq5'): found[str(p.resolve()).lower()]=p
-    return sorted(found.values(),key=lambda p:str(p).lower())
+        root_path=display_path(root)
+        info={'path':root_path,'exists':root.exists(),'is_dir':root.is_dir(),'mq4':0,'mq5':0,'compiled_ex4':0,'compiled_ex5':0,'access_errors':[]}
+        if not root.exists():
+            diagnostics.append(info)
+            continue
+        if root.is_file():
+            ext=root.suffix.lower()
+            if ext in ('.mq4','.mq5'):
+                found[root_path.lower()]=root
+                info[ext[1:]]+=1
+            elif ext=='.ex4': info['compiled_ex4']+=1
+            elif ext=='.ex5': info['compiled_ex5']+=1
+            diagnostics.append(info)
+            continue
+        def onerror(err):
+            info['access_errors'].append(f'{getattr(err,"filename",root_path)}: {err}')
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=onerror, followlinks=False):
+            for name in filenames:
+                ext=Path(name).suffix.lower()
+                if ext not in ('.mq4','.mq5','.ex4','.ex5'):
+                    continue
+                p=Path(dirpath)/name
+                if ext=='.mq4':
+                    info['mq4']+=1
+                    found[display_path(p).lower()]=p
+                elif ext=='.mq5':
+                    info['mq5']+=1
+                    found[display_path(p).lower()]=p
+                elif ext=='.ex4': info['compiled_ex4']+=1
+                elif ext=='.ex5': info['compiled_ex5']+=1
+        diagnostics.append(info)
+    return sorted(found.values(),key=lambda p:str(p).lower()), diagnostics
 
 def save_analysis(conn,a:Analysis,mtime_ns:int):
     d=asdict(a)
@@ -84,13 +118,20 @@ def save_analysis(conn,a:Analysis,mtime_ns:int):
     conn.execute(sql,[d[c] for c in cols_])
 
 def unchanged(conn,p):
-    st=p.stat(); row=conn.execute('SELECT size,mtime_ns,scan_status,classifier_version FROM indicators WHERE path=?',(str(p.resolve()),)).fetchone()
+    st=p.stat(); row=conn.execute('SELECT size,mtime_ns,scan_status,classifier_version FROM indicators WHERE path=?',(display_path(p),)).fetchone()
     return bool(row and row['scan_status']=='complete' and row['size']==st.st_size and row['mtime_ns']==st.st_mtime_ns and row['classifier_version']=='evidence-v3')
 
 def scan(db,sources,force=False):
     conn=connect(db)
-    for src in sources: conn.execute('INSERT INTO sources(path,enabled) VALUES(?,1) ON CONFLICT(path) DO UPDATE SET enabled=1',(str(src.resolve()),))
-    conn.commit(); files=discover(sources); total=len(files); emit('scan_start',total=total,sources=[str(x.resolve()) for x in sources])
+    for src in sources: conn.execute('INSERT INTO sources(path,enabled) VALUES(?,1) ON CONFLICT(path) DO UPDATE SET enabled=1',(display_path(src),))
+    conn.commit()
+    files, diagnostics=discover(sources)
+    for d in diagnostics:
+        emit('source_preflight', **d, source_files=d['mq4']+d['mq5'], compiled_files=d['compiled_ex4']+d['compiled_ex5'])
+    total=len(files)
+    emit('scan_start',total=total,sources=[display_path(x) for x in sources])
+    if total==0:
+        emit('scan_empty',total=0,diagnostics=diagnostics)
     processed=skipped=failed=0; started=time.time()
     sha_first={r['sha256']:r['path'] for r in conn.execute('SELECT sha256,path FROM indicators WHERE sha256 IS NOT NULL AND duplicate_of IS NULL')}
     for idx,p in enumerate(files,1):
@@ -107,7 +148,7 @@ def scan(db,sources,force=False):
         except Exception as exc:
             failed+=1; emit('error',current=idx,total=total,processed=processed,skipped=skipped,failed=failed,filename=p.name,error=str(exc))
     conn.commit(); now=time.strftime('%Y-%m-%d %H:%M:%S')
-    for src in sources: conn.execute('UPDATE sources SET last_scan_at=? WHERE path=?',(now,str(src.resolve())))
+    for src in sources: conn.execute('UPDATE sources SET last_scan_at=? WHERE path=?',(now,display_path(src)))
     conn.commit(); elapsed=round(time.time()-started,3)
     emit('scan_complete',total=total,processed=processed,skipped=skipped,failed=failed,elapsed_seconds=elapsed); conn.close()
 
