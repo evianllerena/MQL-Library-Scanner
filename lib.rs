@@ -54,6 +54,51 @@ fn folder_preview(path: String, max_preview: Option<usize>) -> Result<Value, Str
 }
 
 #[tauri::command]
+fn browse_directory(path: Option<String>) -> Result<Value, String> {
+    #[cfg(target_os = "windows")]
+    if path.as_deref().unwrap_or("").is_empty() {
+        let mut drives = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let root = format!("{}:\\", letter as char);
+            if Path::new(&root).exists() {
+                drives.push(json!({"name":root.clone(),"path":root,"kind":"drive"}));
+            }
+        }
+        return Ok(json!({"path":"This PC","parent":Value::Null,"entries":drives}));
+    }
+
+    let raw = path.unwrap_or_default();
+    let dir = PathBuf::from(&raw);
+    if !dir.exists() { return Err(format!("Path does not exist: {}", raw)); }
+    if !dir.is_dir() { return Err(format!("Path is not a folder: {}", raw)); }
+
+    let parent = dir.parent().map(|p| p.to_string_lossy().to_string());
+    let mut entries: Vec<Value> = Vec::new();
+    let rd = fs::read_dir(&dir).map_err(|e| format!("Cannot read {}: {}", raw, e))?;
+    for item in rd {
+        let item = match item { Ok(v) => v, Err(_) => continue };
+        let file_type = match item.file_type() { Ok(v) => v, Err(_) => continue };
+        let p = item.path();
+        let name = item.file_name().to_string_lossy().to_string();
+        let kind = if file_type.is_dir() { "folder" } else if file_type.is_file() { "file" } else { "other" };
+        let size = if file_type.is_file() { item.metadata().ok().map(|m| m.len()).unwrap_or(0) } else { 0 };
+        entries.push(json!({"name":name,"path":p.to_string_lossy(),"kind":kind,"size":size}));
+    }
+    entries.sort_by(|a,b| {
+        let ak = a.get("kind").and_then(Value::as_str).unwrap_or("file");
+        let bk = b.get("kind").and_then(Value::as_str).unwrap_or("file");
+        let arank = if ak=="folder" || ak=="drive" {0}else{1};
+        let brank = if bk=="folder" || bk=="drive" {0}else{1};
+        arank.cmp(&brank).then_with(|| {
+            let an = a.get("name").and_then(Value::as_str).unwrap_or("").to_lowercase();
+            let bn = b.get("name").and_then(Value::as_str).unwrap_or("").to_lowercase();
+            an.cmp(&bn)
+        })
+    });
+    Ok(json!({"path":dir.to_string_lossy(),"parent":parent,"entries":entries}))
+}
+
+#[tauri::command]
 fn db_stats(db_path: String) -> Result<Value, String> {
     let conn = open_db(&db_path)?;
     let count = |sql: &str| -> Result<i64, String> {
@@ -136,7 +181,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }
