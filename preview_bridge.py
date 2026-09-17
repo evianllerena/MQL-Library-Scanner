@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, os, shutil, subprocess, sys, time
+import argparse, json, os, shutil, sqlite3, subprocess, sys, time
 from pathlib import Path
 
 
@@ -33,7 +33,6 @@ def candidates():
                     seen.add(key)
                     ed=d/editor
                     out.append({'kind':kind,'terminal':str(p),'editor':str(ed) if ed.exists() else None,'install_dir':str(d)})
-    # Also inspect one level under broker/vendor folders in Program Files.
     for root in roots[:2]:
         try:
             for d in root.iterdir():
@@ -82,6 +81,22 @@ def detect():
     return terms
 
 
+def memory_stats(db_s:str):
+    db=Path(db_s)
+    if not db.exists():
+        emit({'ok':True,'corrections':0,'verified':0,'families':0,'latest':[]}); return
+    conn=sqlite3.connect(db)
+    one=lambda sql: conn.execute(sql).fetchone()[0]
+    latest=[]
+    try:
+        for row in conn.execute("SELECT corrected_primary, original_primary, created_at FROM classification_memory ORDER BY id DESC LIMIT 8"):
+            latest.append({'corrected_primary':row[0],'original_primary':row[1],'created_at':row[2]})
+        result={'ok':True,'corrections':one('SELECT COUNT(*) FROM classification_memory'),'verified':one('SELECT COUNT(*) FROM indicators WHERE human_verified=1'),'families':one("SELECT COUNT(DISTINCT family_fingerprint) FROM classification_memory WHERE family_fingerprint IS NOT NULL AND family_fingerprint != ''"),'latest':latest}
+    finally:
+        conn.close()
+    emit(result)
+
+
 def safe_mql_string(s:str)->str:
     return s.replace('\\','\\\\').replace('"','\\"')
 
@@ -115,8 +130,6 @@ def render_mt5(source:Path,out_dir:Path,terminal_info:dict):
     if not data.exists(): raise RuntimeError('MetaTrader 5 data directory could not be mapped. Open MT5 once, then retry.')
     mql5=data/'MQL5'; indicators=mql5/'Indicators'/'MQLLibraryPreview'; scripts=mql5/'Scripts'
     indicators.mkdir(parents=True,exist_ok=True); scripts.mkdir(parents=True,exist_ok=True); out_dir.mkdir(parents=True,exist_ok=True)
-
-    # Prefer an already-compiled sibling. Otherwise compile the original source in place so local includes remain resolvable.
     compiled=source.with_suffix('.ex5')
     if not compiled.exists():
         rc,log=compile_mql(editor,source,mql5)
@@ -130,14 +143,12 @@ def render_mt5(source:Path,out_dir:Path,terminal_info:dict):
         text=source.read_text(encoding='utf-8',errors='ignore')
         separate='indicator_separate_window' in text.lower()
     except Exception: pass
-
     shot_name='MQLLibraryPreview.png'
     renderer=scripts/'MQLLibraryPreviewRenderer.mq5'
     renderer.write_text(f'''#property script_show_inputs\nvoid OnStart(){{\n string name="{safe_mql_string(indicator_rel)}";\n int h=iCustom(_Symbol,_Period,name);\n if(h==INVALID_HANDLE){{Print("MQLLIB_PREVIEW: iCustom failed ",GetLastError()); TerminalClose(21); return;}}\n int win={1 if separate else 0};\n if(win==1) win=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);\n if(!ChartIndicatorAdd(0,win,h)){{Print("MQLLIB_PREVIEW: ChartIndicatorAdd failed ",GetLastError()); IndicatorRelease(h); TerminalClose(22); return;}}\n ChartRedraw(); Sleep(3000);\n bool ok=ChartScreenShot(0,"{shot_name}",1200,720,ALIGN_RIGHT);\n Print("MQLLIB_PREVIEW: screenshot=",ok," err=",GetLastError());\n Sleep(500); IndicatorRelease(h); TerminalClose(ok?0:23);\n}}\n''',encoding='utf-8')
     rc,log=compile_mql(editor,renderer,mql5)
     renderer_ex5=renderer.with_suffix('.ex5')
     if not renderer_ex5.exists(): raise RuntimeError('Could not compile the MT5 preview renderer. '+(log[-900:] if log else f'Exit code {rc}.'))
-
     screenshot=mql5/'Files'/shot_name
     try: screenshot.unlink(missing_ok=True)
     except Exception: pass
@@ -182,10 +193,12 @@ def main():
     sub.add_parser('detect')
     p=sub.add_parser('render'); p.add_argument('--source',required=True); p.add_argument('--out',required=True); p.add_argument('--terminal')
     p=sub.add_parser('open-source'); p.add_argument('--source',required=True)
+    p=sub.add_parser('memory-stats'); p.add_argument('--db',required=True)
     a=ap.parse_args()
     if a.cmd=='detect': detect()
     elif a.cmd=='render': render(a.source,a.out,a.terminal)
     elif a.cmd=='open-source': open_source(a.source)
+    elif a.cmd=='memory-stats': memory_stats(a.db)
 
 if __name__=='__main__':
     try: main()
