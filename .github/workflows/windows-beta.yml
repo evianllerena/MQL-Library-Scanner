@@ -43,7 +43,7 @@ jobs:
           "APP_DIR=$($app.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Application source: $($app.FullName)"
 
-      - name: Apply 0.5.1 source overrides
+      - name: Apply 0.5.2 source overrides
         shell: pwsh
         run: |
           $repo = $env:GITHUB_WORKSPACE
@@ -63,7 +63,7 @@ jobs:
           Copy-Item "$repo/tauri.conf.json" "src-tauri/tauri.conf.json" -Force
           New-Item -ItemType Directory -Force -Path "src-tauri/windows" | Out-Null
           Copy-Item "$repo/windows/*" "src-tauri/windows/" -Force
-          Write-Host "Applied 0.5.1 Evidence Engine v4, learning memory, outside-click close, and MT4/MT5 real preview source set."
+          Write-Host "Applied 0.5.2 automatic MT4/MT5 preview, source removal, archive/reset and learning-memory source set."
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -78,7 +78,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Validate classifier and UI source
+      - name: Validate classifier UI and library admin source
         shell: pwsh
         run: |
           Set-Location $env:APP_DIR
@@ -104,8 +104,13 @@ jobs:
           python engine/engine.py stats --db "$sample/smoke.sqlite3"
           python engine/preview_bridge.py detect
           python engine/preview_bridge.py memory-stats --db "$sample/smoke.sqlite3"
-          python -c "import sys; sys.path.insert(0,'engine'); from preview_bridge import mt4_template; t=mt4_template(r'MQLLibraryPreview\Smoke',True); assert 'name=MQLLibraryPreview\Smoke' in t and 'window_num=1' in t and t.count('<window>')==2; print('MT4 template renderer structure OK')"
+          python engine/preview_bridge.py template-smoke --kind MT4
           python -c "import sqlite3,sys; c=sqlite3.connect(r'$sample/smoke.sqlite3'); rows=c.execute('select classifier_version,classification_status from indicators').fetchall(); print(rows); sys.exit(0 if rows and all(r[0]=='evidence-v4' for r in rows) else 1)"
+          Copy-Item "$sample/smoke.sqlite3" "$sample/admin.sqlite3" -Force
+          python engine/preview_bridge.py remove-source --db "$sample/admin.sqlite3" --source "$sample"
+          python -c "import sqlite3,sys; c=sqlite3.connect(r'$sample/admin.sqlite3'); n=c.execute('select count(*) from indicators').fetchone()[0]; s=c.execute('select count(*) from sources').fetchone()[0]; print('admin remaining',n,s); sys.exit(0 if n==0 and s==0 else 1)"
+          python engine/preview_bridge.py archive-reset --db "$sample/smoke.sqlite3"
+          if (Test-Path "$sample/smoke.sqlite3") { throw "Archive/reset did not remove the active database." }
 
       - name: Build bundled MQL engines
         shell: pwsh
@@ -146,6 +151,9 @@ jobs:
           $preview | ForEach-Object { Write-Host $_ }
           if ($LASTEXITCODE -ne 0) { throw "Packaged MetaTrader preview detector failed." }
           if (($preview -join "`n") -notmatch '"ok": true') { throw "Packaged preview detector returned invalid output." }
+          $template = & "build-sidecar/mql-preview.exe" template-smoke --kind MT4 2>&1
+          $template | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0 -or ($template -join "`n") -notmatch '"ok": true') { throw "Packaged MT4 template renderer smoke test failed." }
 
       - name: Install frontend dependencies
         shell: pwsh
@@ -184,7 +192,7 @@ jobs:
       - name: Upload finished Setup.exe
         uses: actions/upload-artifact@v4
         with:
-          name: MQL-Indicator-Library-0.5.1-Windows-Setup
+          name: MQL-Indicator-Library-0.5.2-Windows-Setup
           path: ${{ env.APP_DIR }}/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 14
