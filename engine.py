@@ -8,8 +8,31 @@ from engine_core import Analysis, analyze
 SCHEMA_VERSION = 3
 JSON_FIELDS = ['draw_types','standard_indicators','custom_dependencies','secondary_categories','behavior_tags','techniques','evidence','warnings','user_tags']
 
+# Windows/PyInstaller can otherwise inherit a legacy ANSI console encoding even
+# when the parent process consumes UTF-8. Keep the engine protocol UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='backslashreplace', line_buffering=True)
+    except Exception:
+        pass
+
 def emit(kind: str, **payload):
-    print(json.dumps({'type':kind, **payload}, ensure_ascii=False), flush=True)
+    """Write one JSON protocol line without depending on the Windows charmap codec."""
+    obj={'type':kind, **payload}
+    text=json.dumps(obj, ensure_ascii=False, default=str) + '\n'
+    data=text.encode('utf-8', errors='backslashreplace')
+    try:
+        # Bypass TextIOWrapper so a legacy Windows code page can never abort a scan.
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    except Exception:
+        # Last-resort ASCII-safe protocol output.
+        safe=(json.dumps(obj, ensure_ascii=True, default=str) + '\n').encode('ascii', errors='backslashreplace')
+        try:
+            sys.stdout.buffer.write(safe)
+            sys.stdout.buffer.flush()
+        except Exception:
+            pass
 
 def connect(db: Path) -> sqlite3.Connection:
     db.parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +129,7 @@ def discover(sources: Iterable[Path]):
                 elif ext=='.ex4': info['compiled_ex4']+=1
                 elif ext=='.ex5': info['compiled_ex5']+=1
         diagnostics.append(info)
-    return sorted(found.values(),key=lambda p:str(p).lower()), diagnostics
+    return sorted(found.values(),key=lambda p:str(p).casefold()), diagnostics
 
 def save_analysis(conn,a:Analysis,mtime_ns:int):
     d=asdict(a)
@@ -150,7 +173,7 @@ def scan(db,sources,force=False):
         emit('fatal',error=message,diagnostics=diagnostics)
         conn.close()
         return
-    processed=skipped=failed=0; started=time.time()
+    processed=skipped=failed=0; started=time.time(); dirty=0
     sha_first={r['sha256']:r['path'] for r in conn.execute('SELECT sha256,path FROM indicators WHERE sha256 IS NOT NULL AND duplicate_of IS NULL')}
     for idx,p in enumerate(files,1):
         try:
@@ -160,11 +183,21 @@ def scan(db,sources,force=False):
                 continue
             a=analyze(p); a.duplicate_of=sha_first.get(a.sha256)
             if a.sha256 not in sha_first: sha_first[a.sha256]=a.path
-            save_analysis(conn,a,p.stat().st_mtime_ns); processed+=1
-            if processed%50==0: conn.commit()
+            save_analysis(conn,a,p.stat().st_mtime_ns); processed+=1; dirty+=1
+            # Keep WAL batching fast but limit crash exposure to at most 24 completed files.
+            if dirty>=25:
+                conn.commit(); dirty=0
             emit('item',current=idx,total=total,processed=processed,skipped=skipped,failed=failed,filename=p.name,category=a.primary_category,status=a.classification_status,confidence=a.confidence)
         except Exception as exc:
-            failed+=1; emit('error',current=idx,total=total,processed=processed,skipped=skipped,failed=failed,filename=p.name,error=str(exc))
+            failed+=1
+            # Roll back only the active uncommitted batch if SQLite itself entered an error state.
+            try:
+                if conn.in_transaction and isinstance(exc, sqlite3.Error):
+                    conn.rollback(); dirty=0
+            except Exception:
+                pass
+            emit('error',current=idx,total=total,processed=processed,skipped=skipped,failed=failed,filename=p.name,error=f'{type(exc).__name__}: {exc}')
+            continue
     conn.commit(); now=time.strftime('%Y-%m-%d %H:%M:%S')
     for src in sources: conn.execute('UPDATE sources SET last_scan_at=? WHERE path=?',(now,display_path(src)))
     conn.commit(); elapsed=round(time.time()-started,3)
@@ -173,7 +206,13 @@ def scan(db,sources,force=False):
 def stats(db):
     conn=connect(db); one=lambda sql,args=(): conn.execute(sql,args).fetchone()[0]
     result={'total':one('SELECT COUNT(*) FROM indicators'),'mq4':one("SELECT COUNT(*) FROM indicators WHERE platform='MQL4'"),'mq5':one("SELECT COUNT(*) FROM indicators WHERE platform='MQL5'"),'review':one("SELECT COUNT(*) FROM indicators WHERE human_verified=0 AND classification_status IN ('Needs Review','Unknown')"),'duplicates':one('SELECT COUNT(*) FROM indicators WHERE duplicate_of IS NOT NULL'),'favorites':one('SELECT COUNT(*) FROM indicators WHERE user_favorite=1'),'verified':one('SELECT COUNT(*) FROM indicators WHERE human_verified=1'),'sources':[dict(r) for r in conn.execute('SELECT path,enabled,last_scan_at FROM sources ORDER BY path')]}
-    print(json.dumps(result,ensure_ascii=False)); conn.close()
+    # stats may include Unicode source paths too, so use the same safe protocol writer.
+    text=json.dumps(result,ensure_ascii=False,default=str)+'\n'
+    try:
+        sys.stdout.buffer.write(text.encode('utf-8',errors='backslashreplace')); sys.stdout.buffer.flush()
+    except Exception:
+        print(json.dumps(result,ensure_ascii=True,default=str),flush=True)
+    conn.close()
 
 def main():
     ap=argparse.ArgumentParser(prog='mql-engine'); sub=ap.add_subparsers(dest='cmd',required=True)
@@ -185,4 +224,4 @@ def main():
 if __name__=='__main__':
     try: main()
     except Exception as exc:
-        emit('fatal',error=str(exc)); sys.exit(1)
+        emit('fatal',error=f'{type(exc).__name__}: {exc}'); sys.exit(1)
