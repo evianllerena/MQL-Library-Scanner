@@ -225,8 +225,22 @@ fn db_stats(db_path: String) -> Result<Value, String> {
     }))
 }
 
+fn sort_sql(sort_by: &str, sort_dir: &str) -> String {
+    let col = match sort_by {
+        "name" => "filename COLLATE NOCASE",
+        "platform" => "platform",
+        "function" => "COALESCE(verified_primary,primary_category) COLLATE NOCASE",
+        "status" => "CASE WHEN human_verified=1 THEN 'Verified' ELSE classification_status END COLLATE NOCASE",
+        "visual" => "visual_category COLLATE NOCASE",
+        "confidence" => "confidence",
+        _ => "filename COLLATE NOCASE",
+    };
+    let dir = if sort_dir.eq_ignore_ascii_case("desc") { "DESC" } else { "ASC" };
+    format!("{} {}", col, dir)
+}
+
 #[tauri::command]
-fn db_query(db_path:String, search:String, platform:String, category:String, review_only:bool, limit:i64, offset:i64) -> Result<Value,String> {
+fn db_query(db_path:String, search:String, platform:String, category:String, review_only:bool, limit:i64, offset:i64, sort_by:Option<String>, sort_dir:Option<String>) -> Result<Value,String> {
     let conn=open_db(&db_path)?;
     let mut clauses:Vec<String>=Vec::new();
     let mut vals:Vec<String>=Vec::new();
@@ -241,7 +255,8 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
     let total_sql=format!("SELECT COUNT(*) FROM indicators{}",where_sql);
     let mut total_stmt=conn.prepare(&total_sql).map_err(|e|e.to_string())?;
     let total:i64=total_stmt.query_row(rusqlite::params_from_iter(vals.iter()),|r|r.get(0)).map_err(|e|e.to_string())?;
-    let sql=format!("SELECT id,path,filename,platform,source_structure,display_location,primary_category,secondary_categories,visual_category,behavior_tags,techniques,evidence,classification_status,review_reason,classifier_version,standard_indicators,custom_dependencies,confidence,warnings,duplicate_of,user_favorite,user_tags,human_verified,verified_primary,verified_secondary,family_fingerprint,analyzed_at FROM indicators{} ORDER BY human_verified DESC,user_favorite DESC,confidence DESC,filename COLLATE NOCASE ASC LIMIT ? OFFSET ?",where_sql);
+    let order=sort_sql(sort_by.as_deref().unwrap_or("name"),sort_dir.as_deref().unwrap_or("asc"));
+    let sql=format!("SELECT id,path,filename,platform,source_structure,display_location,primary_category,secondary_categories,visual_category,behavior_tags,techniques,evidence,classification_status,review_reason,classifier_version,standard_indicators,custom_dependencies,confidence,warnings,duplicate_of,user_favorite,user_tags,human_verified,verified_primary,verified_secondary,family_fingerprint,analyzed_at,draw_types,line_plots,histogram_plots,arrow_plots,filling_plots,object_usage,declared_buffers,declared_plots,active_buffers FROM indicators{} ORDER BY {} LIMIT ? OFFSET ?",where_sql,order);
     let mut all=vals.clone(); all.push(limit.clamp(1,500).to_string()); all.push(offset.max(0).to_string());
     let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;
     let mapped=stmt.query_map(rusqlite::params_from_iter(all.iter()),|r| {
@@ -260,12 +275,15 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
           "review_reason":r.get::<_,String>(13)?,"classifier_version":r.get::<_,String>(14)?,"standard_indicators":parse_json_text(r.get::<_,String>(15)?),
           "custom_dependencies":parse_json_text(r.get::<_,String>(16)?),"confidence":r.get::<_,i64>(17)?,"warnings":parse_json_text(r.get::<_,String>(18)?),
           "duplicate_of":r.get::<_,Option<String>>(19)?,"user_favorite":r.get::<_,i64>(20)?==1,"user_tags":parse_json_text(r.get::<_,String>(21)?),
-          "human_verified":verified==1,"family_fingerprint":r.get::<_,String>(25)?,"analyzed_at":r.get::<_,Option<String>>(26)?
+          "human_verified":verified==1,"family_fingerprint":r.get::<_,String>(25)?,"analyzed_at":r.get::<_,Option<String>>(26)?,
+          "draw_types":parse_json_text(r.get::<_,String>(27)?),"line_plots":r.get::<_,i64>(28)?,"histogram_plots":r.get::<_,i64>(29)?,
+          "arrow_plots":r.get::<_,i64>(30)?,"filling_plots":r.get::<_,i64>(31)?,"object_usage":r.get::<_,i64>(32)?==1,
+          "declared_buffers":r.get::<_,i64>(33)?,"declared_plots":r.get::<_,i64>(34)?,"active_buffers":r.get::<_,i64>(35)?
         }))
     }).map_err(|e|e.to_string())?;
     let mut rows_out=Vec::new();
     for row in mapped { rows_out.push(row.map_err(|e|e.to_string())?); }
-    Ok(json!({"rows":rows_out,"total":total,"limit":limit,"offset":offset}))
+    Ok(json!({"rows":rows_out,"total":total,"limit":limit,"offset":offset,"sort_by":sort_by,"sort_dir":sort_dir}))
 }
 
 #[tauri::command]
@@ -316,6 +334,7 @@ fn export_diagnostics(db_path:String) -> Result<Value,String> {
         "environment":{"username":std::env::var("USERNAME").ok(),"computername":std::env::var("COMPUTERNAME").ok()},
         "database":{},
         "sources":[],
+        "classification_breakdown":[],
         "recent_problem_indicators":[]
     });
     if let Ok(conn)=open_db(&db_path) {
@@ -337,9 +356,16 @@ fn export_diagnostics(db_path:String) -> Result<Value,String> {
             }
         }
         report["sources"]=json!(sources);
+        let mut breakdown=Vec::new();
+        if let Ok(mut st)=conn.prepare("SELECT classification_status,primary_category,COUNT(*) FROM indicators GROUP BY classification_status,primary_category ORDER BY COUNT(*) DESC") {
+            if let Ok(rows)=st.query_map([],|r|Ok(json!({"status":r.get::<_,String>(0)?,"category":r.get::<_,String>(1)?,"count":r.get::<_,i64>(2)?}))) {
+                for x in rows.flatten(){breakdown.push(x);}
+            }
+        }
+        report["classification_breakdown"]=json!(breakdown);
         let mut problems=Vec::new();
-        if let Ok(mut st)=conn.prepare("SELECT path,classification_status,confidence,warnings,review_reason FROM indicators WHERE classification_status IN ('Needs Review','Unknown') OR warnings != '[]' ORDER BY analyzed_at DESC LIMIT 200") {
-            if let Ok(rows)=st.query_map([],|r|Ok(json!({"path":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"confidence":r.get::<_,i64>(2)?,"warnings":r.get::<_,String>(3)?,"review_reason":r.get::<_,String>(4)?}))) {
+        if let Ok(mut st)=conn.prepare("SELECT path,classification_status,confidence,warnings,review_reason,evidence,visual_category,display_location FROM indicators WHERE classification_status IN ('Needs Review','Unknown') OR warnings != '[]' ORDER BY analyzed_at DESC LIMIT 300") {
+            if let Ok(rows)=st.query_map([],|r|Ok(json!({"path":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"confidence":r.get::<_,i64>(2)?,"warnings":r.get::<_,String>(3)?,"review_reason":r.get::<_,String>(4)?,"evidence":r.get::<_,String>(5)?,"visual_category":r.get::<_,String>(6)?,"display_location":r.get::<_,String>(7)?}))) {
                 for x in rows.flatten(){problems.push(x);}
             }
         }
