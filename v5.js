@@ -1,9 +1,12 @@
 import { Command } from '@tauri-apps/plugin-shell';
 import { appDataDir, join } from '@tauri-apps/api/path';
-import { convertFileSrc } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot',"'":'&#39;'}[c]));
+
+async function previewDb(){const base=await appDataDir();return join(base,'library.sqlite3');}
+async function previewLog(level,event,details={}){try{await invoke('app_log',{dbPath:await previewDb(),level,event,details,durationMs:null});}catch{}}
 
 async function previewCmd(args){
   const cmd=Command.sidecar('binaries/mql-preview',args);
@@ -38,20 +41,26 @@ document.addEventListener('pointerdown',e=>{
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDetail();});
 
 async function renderRealPreview(source,status,img,button){
-  button.disabled=true; status.textContent='Starting MetaTrader real preview…'; img.style.display='none';
+  const kind=/\.(mq5|ex5)$/i.test(source)?'MT5':'MT4';
+  const started=performance.now();
+  button.disabled=true; status.textContent=`Starting real ${kind} preview…`; img.style.display='none';
+  await previewLog('INFO','preview_start',{source,kind});
   try{
     const base=await appDataDir(); const outDir=await join(base,'previews');
     const result=await previewCmd(['render','--source',source,'--out',outDir]);
     img.src=convertFileSrc(result.image)+`?t=${Date.now()}`; img.style.display='block';
-    status.textContent=`Real MT5 chart preview • ${result.terminal?.install_dir||'MetaTrader 5'}`;
-  }catch(e){status.textContent=`Preview unavailable: ${e.message}`;}
-  finally{button.disabled=false;}
+    status.textContent=`Real ${result.renderer||kind} chart preview • ${result.terminal?.install_dir||kind}`;
+    await previewLog('INFO','preview_success',{source,kind:result.renderer||kind,image:result.image,terminal:result.terminal?.terminal,elapsedMs:Math.round(performance.now()-started)});
+  }catch(e){
+    status.textContent=`Preview unavailable: ${e.message}`;
+    await previewLog('ERROR','preview_failed',{source,kind,error:e.message,elapsedMs:Math.round(performance.now()-started)});
+  }finally{button.disabled=false;}
 }
 
 async function openInMetaEditor(source,status,button){
   button.disabled=true;
-  try{const out=await previewCmd(['open-source','--source',source]);status.textContent=`Opened in ${out.kind}: ${out.opened}`;}
-  catch(e){status.textContent=`Could not open MetaTrader/MetaEditor: ${e.message}`;}
+  try{const out=await previewCmd(['open-source','--source',source]);status.textContent=`Opened in ${out.kind}: ${out.opened}`;await previewLog('INFO','preview_open_source',{source,kind:out.kind,opened:out.opened});}
+  catch(e){status.textContent=`Could not open MetaTrader/MetaEditor: ${e.message}`;await previewLog('ERROR','preview_open_source_failed',{source,error:e.message});}
   finally{button.disabled=false;}
 }
 
@@ -64,15 +73,15 @@ function injectPreviewCard(){
   if(document.getElementById('v5RealPreview'))return;
   const source=detailFilePath(); if(!source)return;
   const section=document.createElement('div'); section.className='section'; section.id='v5RealPreview';
-  const mt5=/\.(mq5|ex5)$/i.test(source);
+  const kind=/\.(mq5|ex5)$/i.test(source)?'MT5':'MT4';
   section.innerHTML=`<div class="label">Real MetaTrader Preview</div>
     <div style="border:1px solid rgba(127,127,127,.22);border-radius:10px;padding:10px;margin-top:8px">
-      <div class="muted" style="margin-bottom:9px">${mt5?'Runs the actual indicator in MetaTrader 5 and captures the chart.':'MT4 source detected. Automated chart capture is not enabled yet; open it in MetaEditor/MT4 from here.'}</div>
+      <div class="muted" style="margin-bottom:9px">Runs the actual ${kind} indicator in MetaTrader and captures the real chart. MT4 uses a disposable preview template; MT5 uses native indicator attachment.</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn primary" id="v5RenderPreview" ${mt5?'':'disabled'}>Render Real MT5 Preview</button>
+        <button class="btn primary" id="v5RenderPreview">Render Real ${kind} Preview</button>
         <button class="btn" id="v5OpenSource">Open in MetaTrader / MetaEditor</button>
       </div>
-      <div class="status" id="v5PreviewStatus" style="margin-top:9px">${mt5?'Ready':'MT4 automated renderer is a later compatibility step.'}</div>
+      <div class="status" id="v5PreviewStatus" style="margin-top:9px">Ready</div>
       <img id="v5PreviewImage" alt="MetaTrader indicator preview" style="display:none;width:100%;margin-top:10px;border-radius:8px;border:1px solid rgba(127,127,127,.25)"/>
     </div>`;
   body.prepend(section);
@@ -87,16 +96,16 @@ const appRoot=document.getElementById('app'); if(appRoot)observer.observe(appRoo
 
 async function enhanceSettings(){
   for(let i=0;i<50;i++){
-    const brand=document.querySelector('.brand small'); if(brand)brand.textContent='0.5.0 • Evidence Engine v4 + Learning Memory';
+    const brand=document.querySelector('.brand small'); if(brand)brand.textContent='0.5.1 • Evidence Engine v4 + MT4/MT5 Real Preview';
     const panel=document.querySelector('#settings .scan-panel');
     if(panel&&!document.getElementById('v5MetaTraderSettings')){
       const card=document.createElement('div'); card.className='diagnostic-card'; card.id='v5MetaTraderSettings';
-      card.innerHTML=`<h3>MetaTrader Preview</h3><p class="muted">v5 detects installed terminals and uses MT5 as the real chart renderer instead of fabricating an indicator image.</p><div id="v5TerminalStatus" class="status">Detecting MetaTrader…</div><h3 style="margin-top:18px">Learning Memory</h3><p class="muted">Human Verify/Correct decisions remain authoritative across rescans and are stored as reusable classification memory.</p><div id="v5MemoryStatus" class="status">Loading memory…</div>`;
+      card.innerHTML=`<h3>MetaTrader Preview</h3><p class="muted">0.5.1 detects installed MT4 and MT5 terminals and renders real chart previews for both platforms. MT4 uses a generated temporary template and capture script; MT5 uses native indicator attachment.</p><div id="v5TerminalStatus" class="status">Detecting MetaTrader…</div><h3 style="margin-top:18px">Learning Memory</h3><p class="muted">Human Verify/Correct decisions remain authoritative across rescans and are stored as reusable classification memory.</p><div id="v5MemoryStatus" class="status">Loading memory…</div>`;
       panel.insertBefore(card,panel.querySelector('h3:nth-last-of-type(1)')||null);
       try{
         const detected=await previewCmd(['detect']);
         const terms=detected.terminals||[];
-        document.getElementById('v5TerminalStatus').innerHTML=terms.length?terms.map(t=>`<div>${esc(t.kind)} • ${esc(t.install_dir)}${t.data_dir?' • data mapped':''}</div>`).join(''):'No MetaTrader installation detected yet.';
+        document.getElementById('v5TerminalStatus').innerHTML=terms.length?terms.map(t=>`<div>${esc(t.kind)} • ${esc(t.install_dir)}${t.data_dir?' • data mapped':' • data folder not mapped yet'}</div>`).join(''):'No MetaTrader installation detected yet.';
       }catch(e){document.getElementById('v5TerminalStatus').textContent=`Detection error: ${e.message}`;}
       try{
         const base=await appDataDir(),db=await join(base,'library.sqlite3');
