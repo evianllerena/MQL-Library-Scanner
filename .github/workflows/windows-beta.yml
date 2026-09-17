@@ -40,7 +40,7 @@ jobs:
           "APP_DIR=$($app.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Application source: $($app.FullName)"
 
-      - name: Apply Beta 0.3.0-beta.3 source overrides
+      - name: Apply 0.4.0 source overrides
         shell: pwsh
         run: |
           $repo = $env:GITHUB_WORKSPACE
@@ -57,7 +57,7 @@ jobs:
           Copy-Item "$repo/tauri.conf.json" "src-tauri/tauri.conf.json" -Force
           New-Item -ItemType Directory -Force -Path "src-tauri/windows" | Out-Null
           Copy-Item "$repo/windows/*" "src-tauri/windows/" -Force
-          Write-Host "Applied Beta 0.3.0-beta.3 diagnostics, UTF-8 scanner hardening, and installer hook source set."
+          Write-Host "Applied 0.4.0 Evidence Engine v4, sorting, preview, diagnostics, and UTF-8 scanner source set."
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -95,6 +95,7 @@ jobs:
           $sampleLines | Set-Content "$sample/Unicode_测试_Δ_é.mq4" -Encoding utf8
           python engine/engine.py scan --db "$sample/smoke.sqlite3" --source "$sample"
           python engine/engine.py stats --db "$sample/smoke.sqlite3"
+          python -c "import sqlite3,sys; c=sqlite3.connect(r'$sample/smoke.sqlite3'); rows=c.execute('select classifier_version,classification_status from indicators').fetchall(); print(rows); sys.exit(0 if rows and all(r[0]=='evidence-v4' for r in rows) else 1)"
 
       - name: Build bundled MQL analysis engine
         shell: pwsh
@@ -166,7 +167,7 @@ jobs:
       - name: Upload finished Setup.exe
         uses: actions/upload-artifact@v4
         with:
-          name: MQL-Indicator-Library-0.3.0-beta.3-Windows-Setup
+          name: MQL-Indicator-Library-0.4.0-Windows-Setup
           path: ${{ env.APP_DIR }}/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 14
