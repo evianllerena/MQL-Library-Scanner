@@ -5,9 +5,7 @@ import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 let token=0;
 let timer=null;
 let activeChild=null;
-let settingsLoaded=false;
-
-const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let clearConfirmUntil=0;
 
 async function dbPath(){return join(await appDataDir(),'library.sqlite3');}
 async function appLog(level,event,details={}){try{await invoke('app_log',{dbPath:await dbPath(),level,event,details,durationMs:null});}catch{}}
@@ -63,7 +61,10 @@ async function spawnRender(args,myToken){
     cmd.on('error',error=>reject(error));
   });
   const child=await cmd.spawn();
-  if(myToken!==token){try{await child.kill();}catch{};throw new Error('Preview cancelled');}
+  if(myToken!==token){
+    try{await execSidecar('binaries/mql-preview-control',['cancel','--pid',String(child.pid)]);}catch{try{await child.kill();}catch{}}
+    throw new Error('Preview cancelled');
+  }
   activeChild=child;
   const closeData=await closed;
   if(activeChild?.pid===child.pid)activeChild=null;
@@ -116,12 +117,20 @@ function injectPreview(){
   if(!detail?.classList.contains('open')||!body)return;
   const source=detailSource();
   if(!source)return;
-  for(const old of [...body.querySelectorAll('#v5RealPreview,#v57RealPreview,#realMetaPreview')])old.remove();
+
+  const existing=document.getElementById('realMetaPreview');
+  if(existing?.dataset.source===source)return;
+  existing?.remove();
+  for(const old of [...body.querySelectorAll('#v5RealPreview,#v57RealPreview')])old.remove();
+
   const kind=/\.(mq5|ex5)$/i.test(source)?'MT5':'MT4';
   const section=document.createElement('div');
-  section.className='section';section.id='realMetaPreview';
+  section.className='section';
+  section.id='realMetaPreview';
+  section.dataset.source=source;
   section.innerHTML=`<div class="label">Real MetaTrader Preview</div><div style="border:1px solid rgba(127,127,127,.22);border-radius:10px;padding:10px;margin-top:8px"><div class="muted" style="margin-bottom:9px">Real ${kind} rendering starts after the selection settles. Selecting another indicator cancels the previous preview process tree.</div><div class="status" id="previewStatus">Preparing automatic preview…</div><img id="previewImage" alt="MetaTrader indicator preview" style="display:none;width:100%;margin-top:10px;border-radius:8px;border:1px solid rgba(127,127,127,.25)"/><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn" id="retryPreview" style="display:none">Retry Preview</button><button class="btn" id="openPreviewSource">Open in MetaTrader / MetaEditor</button></div></div>`;
   body.prepend(section);
+
   const status=section.querySelector('#previewStatus');
   const img=section.querySelector('#previewImage');
   const retry=section.querySelector('#retryPreview');
@@ -131,45 +140,19 @@ function injectPreview(){
   schedulePreview(source,status,img,retry);
 }
 
-async function createArchive(button,status){
-  button.disabled=true;status.textContent='Creating backup archive…';
-  try{
-    const out=await execSidecar('binaries/mql-preview-control',['archive','--db',await dbPath()]);
-    status.textContent=`Backup created: ${out.archive}`;
-    await appLog('INFO','archive_created',{archive:out.archive,files:out.files});
-  }catch(e){
-    status.textContent=`Archive failed: ${e.message}`;
-    await appLog('ERROR','archive_failed',{error:String(e)});
-  }finally{button.disabled=false;}
-}
-
-function ensureArchiveCard(){
-  const panel=document.querySelector('#settings .scan-panel');
-  if(!panel||document.getElementById('archiveBackupCard'))return;
-  document.getElementById('v5MetaTraderSettings')?.remove();
-  document.getElementById('v57ArchiveCard')?.remove();
-  const card=document.createElement('div');
-  card.className='diagnostic-card';card.id='archiveBackupCard';
-  card.innerHTML=`<h3>Library Archive</h3><p class="muted">Create a backup ZIP of the library database, diagnostics and saved preview images. This does not reset or delete the library. The temporary MetaTrader preview runtime is excluded because it can be rebuilt.</p><button class="btn primary" id="archiveBackupBtn">Create Archive Backup</button><div class="status" id="archiveBackupStatus" style="margin-top:10px">Ready</div><h3 style="margin-top:18px">MetaTrader Preview</h3><div class="status" id="previewTerminalStatus">Open Settings to refresh MetaTrader status.</div>`;
-  panel.appendChild(card);
-  const button=card.querySelector('#archiveBackupBtn');
-  const status=card.querySelector('#archiveBackupStatus');
-  button.onclick=()=>createArchive(button,status);
-  settingsLoaded=false;
-}
-
-async function refreshSettingsStatus(){
-  ensureArchiveCard();
-  if(settingsLoaded)return;
-  settingsLoaded=true;
-  const box=document.getElementById('previewTerminalStatus');
-  if(!box)return;
-  box.textContent='Detecting MetaTrader…';
-  try{
-    const out=await execSidecar('binaries/mql-preview',['detect']);
-    const terms=out.terminals||[];
-    box.innerHTML=terms.length?terms.map(t=>`<div>${esc(t.kind)} • ${esc(t.install_dir)}${t.data_dir?' • data mapped':' • data folder not mapped'}</div>`).join(''):'No MetaTrader installation detected.';
-  }catch(e){box.textContent=`Detection error: ${e.message}`;}
+function armButton(button,label,confirmLabel,ms=6000){
+  const now=Date.now();
+  const until=Number(button.dataset.confirmUntil||0);
+  if(until>now)return true;
+  button.dataset.confirmUntil=String(now+ms);
+  button.textContent=confirmLabel;
+  setTimeout(()=>{
+    if(Number(button.dataset.confirmUntil||0)<=Date.now()&&document.body.contains(button)){
+      button.dataset.confirmUntil='0';
+      button.textContent=label;
+    }
+  },ms+200);
+  return false;
 }
 
 function enhanceSourceRemoval(){
@@ -177,35 +160,114 @@ function enhanceSourceRemoval(){
   for(const row of host.querySelectorAll('.source')){
     if(row.querySelector('.preview-remove-source'))continue;
     const source=row.querySelector('span')?.textContent?.trim();if(!source)continue;
-    const button=document.createElement('button');button.className='btn preview-remove-source';button.textContent='Remove';button.style.marginLeft='auto';
+    const button=document.createElement('button');
+    button.className='btn preview-remove-source';
+    button.textContent='Remove';
+    button.style.marginLeft='auto';
     button.onclick=async e=>{
       e.stopPropagation();
-      if(!confirm(`Remove this folder from the library?\n\n${source}\n\nOriginal files will NOT be deleted.`))return;
+      if(!armButton(button,'Remove','Click Again to Remove'))return;
       button.disabled=true;
-      try{await execSidecar('binaries/mql-preview',['remove-source','--db',await dbPath(),'--source',source]);location.reload();}
-      catch(err){alert(`Could not remove source: ${err.message}`);button.disabled=false;}
+      try{
+        await execSidecar('binaries/mql-preview',['remove-source','--db',await dbPath(),'--source',source]);
+        location.reload();
+      }catch{
+        button.disabled=false;
+        button.dataset.confirmUntil='0';
+        button.textContent='Remove';
+      }
     };
     row.appendChild(button);
   }
 }
 
+async function clearApplication(button,status){
+  const now=Date.now();
+  if(clearConfirmUntil<=now){
+    clearConfirmUntil=now+7000;
+    button.textContent='Click Again to Clear Everything';
+    status.textContent='Only this application’s local data will be cleared. Original MQ4/MQ5 files and source folders on your PC will NOT be deleted.';
+    setTimeout(()=>{
+      if(clearConfirmUntil<=Date.now()&&document.body.contains(button)){
+        clearConfirmUntil=0;
+        button.textContent='Clear Application / Start Fresh';
+        status.textContent='Ready';
+      }
+    },7200);
+    return;
+  }
+
+  clearConfirmUntil=0;
+  button.disabled=true;
+  button.textContent='Clearing Application…';
+  status.textContent='Stopping preview work and removing local application data…';
+  invalidatePreview('application clear');
+
+  try{
+    await new Promise(resolve=>setTimeout(resolve,250));
+    const out=await execSidecar('binaries/mql-preview-control',['clear-app','--db',await dbPath()]);
+    if(out.failed?.length)throw new Error(out.failed.join('; '));
+    status.textContent='Application data cleared. Restarting with an empty library…';
+    location.reload();
+  }catch(e){
+    button.disabled=false;
+    button.textContent='Clear Application / Start Fresh';
+    status.textContent=`Clear failed: ${e.message}`;
+  }
+}
+
+function ensureClearCard(){
+  const panel=document.querySelector('#settings .scan-panel');
+  if(!panel)return;
+  document.getElementById('archiveBackupCard')?.remove();
+  document.getElementById('v57ArchiveCard')?.remove();
+  document.getElementById('v5MetaTraderSettings')?.remove();
+  if(document.getElementById('clearApplicationCard'))return;
+
+  const card=document.createElement('div');
+  card.className='diagnostic-card';
+  card.id='clearApplicationCard';
+  card.innerHTML=`<h3>Application Data</h3><p class="muted">Clear the MQL Indicator Library and start fresh. This removes the local library database, scan/review state, preview cache/runtime and diagnostics created by this app. It does not delete or modify your original indicator files or source folders on your PC.</p><button class="btn primary" id="clearApplicationBtn">Clear Application / Start Fresh</button><div class="status" id="clearApplicationStatus" style="margin-top:10px">Ready</div>`;
+  panel.appendChild(card);
+
+  const button=card.querySelector('#clearApplicationBtn');
+  const status=card.querySelector('#clearApplicationStatus');
+  button.onclick=()=>void clearApplication(button,status);
+}
+
 function boot(){
   const brand=document.querySelector('.brand small');
-  if(brand)brand.textContent='0.5.7 • Evidence Engine v4 + Cancellable MT4/MT5 Preview';
-  ensureArchiveCard();enhanceSourceRemoval();
-  const observer=new MutationObserver(()=>{
-    ensureArchiveCard();enhanceSourceRemoval();
-    if(document.getElementById('detail')?.classList.contains('open'))queueMicrotask(injectPreview);
+  if(brand)brand.textContent='0.5.8 • Evidence Engine v4 + Cancellable MT4/MT5 Preview';
+  ensureClearCard();
+  enhanceSourceRemoval();
+
+  const observer=new MutationObserver(mutations=>{
+    let detailNeedsCheck=false;
+    let sourcesNeedCheck=false;
+
+    for(const mutation of mutations){
+      const target=mutation.target;
+      if(target?.id==='detail'&&mutation.type==='attributes')detailNeedsCheck=true;
+      if(target?.id==='detailBody'&&mutation.type==='childList'){
+        const onlyOurPreview=[...mutation.addedNodes,...mutation.removedNodes].every(n=>n.nodeType!==1||n.id==='realMetaPreview'||n.closest?.('#realMetaPreview'));
+        if(!onlyOurPreview)detailNeedsCheck=true;
+      }
+      if(target?.id==='sources'||target?.closest?.('#sources'))sourcesNeedCheck=true;
+    }
+
+    if(detailNeedsCheck)queueMicrotask(injectPreview);
+    if(sourcesNeedCheck)queueMicrotask(enhanceSourceRemoval);
   });
+
   const root=document.getElementById('app');
   if(root)observer.observe(root,{subtree:true,childList:true,attributes:true,attributeFilter:['class']});
 }
 
-// Capture navigation/selection changes before the base UI swaps detail content.
 document.addEventListener('pointerdown',e=>{
   if(e.target.closest?.('#rows tr,#reviewRows tr'))invalidatePreview('new indicator selected');
   if(e.target.closest?.('#closeDetail'))invalidatePreview('detail closed');
-  if(e.target.closest?.('[data-view="settings"]'))void refreshSettingsStatus();
+  if(e.target.closest?.('[data-view="settings"]'))queueMicrotask(ensureClearCard);
+  if(e.target.closest?.('[data-view="scan"]'))queueMicrotask(enhanceSourceRemoval);
 },{capture:true});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')invalidatePreview('escape');});
 
