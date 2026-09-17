@@ -14,6 +14,12 @@
           "cmd": "binaries/mql-engine",
           "sidecar": true,
           "args": true
+        },
+        {
+          "name": "binaries/mql-preview",
+          "cmd": "binaries/mql-preview",
+          "sidecar": true,
+          "args": true
         }
       ]
     },
@@ -23,6 +29,12 @@
         {
           "name": "binaries/mql-engine",
           "cmd": "binaries/mql-engine",
+          "sidecar": true,
+          "args": true
+        },
+        {
+          "name": "binaries/mql-preview",
+          "cmd": "binaries/mql-preview",
           "sidecar": true,
           "args": true
         }
