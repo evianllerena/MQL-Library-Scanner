@@ -22,11 +22,9 @@ def emit(kind: str, **payload):
     text=json.dumps(obj, ensure_ascii=False, default=str) + '\n'
     data=text.encode('utf-8', errors='backslashreplace')
     try:
-        # Bypass TextIOWrapper so a legacy Windows code page can never abort a scan.
         sys.stdout.buffer.write(data)
         sys.stdout.buffer.flush()
     except Exception:
-        # Last-resort ASCII-safe protocol output.
         safe=(json.dumps(obj, ensure_ascii=True, default=str) + '\n').encode('ascii', errors='backslashreplace')
         try:
             sys.stdout.buffer.write(safe)
@@ -142,7 +140,7 @@ def save_analysis(conn,a:Analysis,mtime_ns:int):
 
 def unchanged(conn,p):
     st=p.stat(); row=conn.execute('SELECT size,mtime_ns,scan_status,classifier_version FROM indicators WHERE path=?',(display_path(p),)).fetchone()
-    return bool(row and row['scan_status']=='complete' and row['size']==st.st_size and row['mtime_ns']==st.st_mtime_ns and row['classifier_version']=='evidence-v3')
+    return bool(row and row['scan_status']=='complete' and row['size']==st.st_size and row['mtime_ns']==st.st_mtime_ns and row['classifier_version']=='evidence-v4')
 
 def empty_scan_message(diagnostics):
     parts=[]
@@ -184,13 +182,11 @@ def scan(db,sources,force=False):
             a=analyze(p); a.duplicate_of=sha_first.get(a.sha256)
             if a.sha256 not in sha_first: sha_first[a.sha256]=a.path
             save_analysis(conn,a,p.stat().st_mtime_ns); processed+=1; dirty+=1
-            # Keep WAL batching fast but limit crash exposure to at most 24 completed files.
             if dirty>=25:
                 conn.commit(); dirty=0
             emit('item',current=idx,total=total,processed=processed,skipped=skipped,failed=failed,filename=p.name,category=a.primary_category,status=a.classification_status,confidence=a.confidence)
         except Exception as exc:
             failed+=1
-            # Roll back only the active uncommitted batch if SQLite itself entered an error state.
             try:
                 if conn.in_transaction and isinstance(exc, sqlite3.Error):
                     conn.rollback(); dirty=0
@@ -206,7 +202,6 @@ def scan(db,sources,force=False):
 def stats(db):
     conn=connect(db); one=lambda sql,args=(): conn.execute(sql,args).fetchone()[0]
     result={'total':one('SELECT COUNT(*) FROM indicators'),'mq4':one("SELECT COUNT(*) FROM indicators WHERE platform='MQL4'"),'mq5':one("SELECT COUNT(*) FROM indicators WHERE platform='MQL5'"),'review':one("SELECT COUNT(*) FROM indicators WHERE human_verified=0 AND classification_status IN ('Needs Review','Unknown')"),'duplicates':one('SELECT COUNT(*) FROM indicators WHERE duplicate_of IS NOT NULL'),'favorites':one('SELECT COUNT(*) FROM indicators WHERE user_favorite=1'),'verified':one('SELECT COUNT(*) FROM indicators WHERE human_verified=1'),'sources':[dict(r) for r in conn.execute('SELECT path,enabled,last_scan_at FROM sources ORDER BY path')]}
-    # stats may include Unicode source paths too, so use the same safe protocol writer.
     text=json.dumps(result,ensure_ascii=False,default=str)+'\n'
     try:
         sys.stdout.buffer.write(text.encode('utf-8',errors='backslashreplace')); sys.stdout.buffer.flush()
