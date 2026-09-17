@@ -206,7 +206,7 @@ def render_mt4(src,out,t):
 
 def render_mt5(src,out,t):
     rt=clone_runtime(t,out,'MT5');mql=rt/'MQL5';scripts=mql/'Scripts';scripts.mkdir(parents=True,exist_ok=True);editor=rt/'metaeditor64.exe';terminal=rt/'terminal64.exe';sym=copy_mt5_history(Path(t['data_dir']),rt);job,staged,binary,meta=stage(src,mql,'MT5',editor);rel=f'MQLLibraryPreview\\{job}\\{binary.stem}';shot=f'MQLLibraryPreview_{job}.png';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq5';sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0'
-    cap.write_text(f'#property script_show_inputs\nvoid OnStart(){{int h=iCustom(_Symbol,_Period,"{rel}");if(h==INVALID_HANDLE){{TerminalClose(21);return;}}int w={win};if(w==1)w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);if(!ChartIndicatorAdd(0,w,h)){{TerminalClose(22);return;}}ChartRedraw();Sleep(3000);bool ok=ChartScreenShot(0,"{shot}",1200,720,ALIGN_RIGHT);Sleep(300);TerminalClose(ok?0:23);return;}}\n')
+    cap.write_text(f'void OnStart(){{int h=iCustom(_Symbol,_Period,"{rel}");if(h==INVALID_HANDLE){{TerminalClose(21);return;}}int w={win};if(w==1)w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);if(!ChartIndicatorAdd(0,w,h)){{TerminalClose(22);return;}}ChartRedraw();Sleep(3000);bool ok=ChartScreenShot(0,"{shot}",1200,720,ALIGN_RIGHT);Sleep(300);TerminalClose(ok?0:23);return;}}\n')
     built,_,log=compile_file(editor,cap,mql)
     if not built:raise RuntimeError('Could not compile MT5 capture script. '+log[-1600:])
     targets=[mql/'Files'/shot,rt/shot];[p.unlink(missing_ok=True) for p in targets]
