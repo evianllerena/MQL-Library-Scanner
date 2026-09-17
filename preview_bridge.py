@@ -5,9 +5,11 @@ from pathlib import Path
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
 SW_HIDE=0
 
+
 def emit(o):
     b=(json.dumps(o,ensure_ascii=False,default=str)+'\n').encode('utf-8','backslashreplace')
     sys.stdout.buffer.write(b); sys.stdout.buffer.flush()
+
 
 def read_text(p):
     if not p.exists(): return ''
@@ -15,6 +17,7 @@ def read_text(p):
         try:return p.read_text(encoding=enc,errors='ignore')
         except Exception:pass
     return ''
+
 
 def terminals():
     roots=[Path(os.environ[x]) for x in ('ProgramFiles','ProgramFiles(x86)','LOCALAPPDATA') if os.environ.get(x) and Path(os.environ[x]).exists()]
@@ -44,7 +47,9 @@ def terminals():
             if o and (ins in o or o in ins):t['data_dir']=str(d);break
     return out
 
+
 def detect():emit({'ok':True,'terminals':terminals()})
+
 
 def memory_stats(db):
     p=Path(db)
@@ -54,6 +59,7 @@ def memory_stats(db):
         one=lambda q:c.execute(q).fetchone()[0]
         emit({'ok':True,'corrections':one('select count(*) from classification_memory'),'verified':one('select count(*) from indicators where human_verified=1'),'families':one("select count(distinct family_fingerprint) from classification_memory where family_fingerprint is not null and family_fingerprint!=''"),'latest':[]})
     finally:c.close()
+
 
 def remove_source(db,source):
     p=Path(db); source=str(Path(source)); n=0
@@ -67,6 +73,7 @@ def remove_source(db,source):
             c.execute('delete from sources where path=?',(source,)); c.commit()
         finally:c.close()
     emit({'ok':True,'removed_indicators':n,'source':source})
+
 
 def archive_reset(db):
     p=Path(db); app=p.parent; dl=Path(os.environ.get('USERPROFILE',str(app)))/'Downloads'; out=dl if dl.exists() else app; out.mkdir(parents=True,exist_ok=True)
@@ -86,8 +93,10 @@ def archive_reset(db):
         if d.exists():shutil.rmtree(d,ignore_errors=True)
     emit({'ok':True,'archive':str(zpath),'app_dir':str(app)})
 
+
 def safe_name(src):
     s=re.sub(r'\s+','_',src.stem.strip()); s=re.sub(r'[^A-Za-z0-9_.()#-]+','_',s).strip(' ._') or 'indicator'; return s[:100]+src.suffix.lower()
+
 
 def compile_file(editor,src,mqlroot):
     expected=src.with_suffix('.ex5' if src.suffix.lower()=='.mq5' else '.ex4'); log=src.with_suffix('.log'); attempts=[]
@@ -95,18 +104,34 @@ def compile_file(editor,src,mqlroot):
         try:log.unlink(missing_ok=True)
         except Exception:pass
         target=src.name if rel else str(src); cmd=[str(editor),f'/compile:{target}',f'/inc:{mqlroot}','/log']; attempts.append(' '.join(cmd))
-        cp=subprocess.run(cmd,cwd=str(src.parent if rel else editor.parent),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,creationflags=CREATE_NO_WINDOW)
+        subprocess.run(cmd,cwd=str(src.parent if rel else editor.parent),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,creationflags=CREATE_NO_WINDOW)
         end=time.time()+10
         while time.time()<end:
             if expected.exists() and expected.stat().st_size: return expected,attempts,read_text(log)
             time.sleep(.2)
     return None,attempts,read_text(log)
 
+
 def existing_binary(src,ext):
     if src.suffix.lower()==ext and src.exists():return src
     p=src.with_suffix(ext)
     if p.exists() and p.stat().st_size:return p
     return None
+
+
+def seed_mql_runtime(t,rt,kind):
+    """Seed the isolated portable runtime from the already-initialized live terminal data tree."""
+    live=Path(t['data_dir']); src=live/kind; dst=rt/kind; marker=rt/f'.{kind.lower()}-seed-v2'
+    if marker.exists() or not src.exists():return False
+    transient={'logs','files','mqlibrarypreview'}
+    def ign(_d,names):return {n for n in names if n.lower() in transient}
+    dst.mkdir(parents=True,exist_ok=True)
+    shutil.copytree(src,dst,dirs_exist_ok=True,ignore=ign)
+    preview_dir=dst/'Indicators'/'MQLLibraryPreview'
+    if preview_dir.exists():shutil.rmtree(preview_dir,ignore_errors=True)
+    marker.write_text(f'{src}\n{int(time.time())}',encoding='utf-8')
+    return True
+
 
 def clone_runtime(t,out,kind):
     install=Path(t['install_dir']); token=hashlib.sha1(str(install).lower().encode()).hexdigest()[:10]; rt=out.parent/'preview-runtime'/f'{kind.lower()}-{token}'
@@ -115,18 +140,21 @@ def clone_runtime(t,out,kind):
         shutil.rmtree(rt,ignore_errors=True)
         def ign(_d,n):return {x for x in n if x.lower() in {'logs','bases','history','mql4','mql5','profiles','templates','tester'}}
         shutil.copytree(install,rt,ignore=ign); marker.write_text(stamp)
+    seed_mql_runtime(t,rt,kind)
     return rt
+
 
 def stage(src,mql,kind,editor):
     ext='.ex5' if kind=='MT5' else '.ex4'; job=hashlib.sha1(str(src.resolve()).lower().encode()).hexdigest()[:14]; d=mql/'Indicators'/'MQLLibraryPreview'/job;d.mkdir(parents=True,exist_ok=True)
     staged=d/safe_name(src); shutil.copy2(src,staged); binary=d/(staged.stem+ext); old=existing_binary(src,ext)
     if old:shutil.copy2(old,binary);return job,staged,binary,{'used_existing_binary':True,'existing_binary':str(old)}
-    if src.suffix.lower() not in ('.mq4','.mq5'):raise RuntimeError(f'{kind} executable could not be staged.')
+    if src.suffix.lower() not in ('.mq4','.mq5'):raise RuntimeError(f'Indicator compile failed — {kind} executable could not be staged.')
     built,cmds,log=compile_file(editor,staged,mql)
     if not built:
-        if log:raise RuntimeError(f'{kind} source did not compile and no existing {ext.upper()[1:]} was found.\n{log[-2200:]}')
-        raise RuntimeError(f'{kind} MetaEditor produced no executable. Staged={staged}; commands={cmds}')
+        if log:raise RuntimeError(f'Indicator compile failed — {kind} source produced no {ext.upper()[1:]}.\n{log[-2200:]}')
+        raise RuntimeError(f'Indicator compile failed — {kind} MetaEditor produced no executable. Staged={staged}; commands={cmds}')
     return job,staged,built,{'used_existing_binary':False}
+
 
 def copy_mt4_history(live,rt):
     files=[]; h=live/'history'
@@ -141,6 +169,7 @@ def copy_mt4_history(live,rt):
         except Exception:pass
     return sym
 
+
 def copy_mt5_history(live,rt):
     cand=[]; b=live/'bases'
     if b.exists():
@@ -154,9 +183,11 @@ def copy_mt5_history(live,rt):
     except Exception:pass
     return src.name
 
+
 def startupinfo():
     if os.name!='nt':return None
     si=subprocess.STARTUPINFO();si.dwFlags|=getattr(subprocess,'STARTF_USESHOWWINDOW',1);si.wShowWindow=SW_HIDE;return si
+
 
 def hide_pid(pid):
     if os.name!='nt':return
@@ -169,14 +200,50 @@ def hide_pid(pid):
     try:u.EnumWindows(cb,0)
     except Exception:pass
 
+
+def wait_quiet(root,proc=None,minimum=4,quiet=3,timeout=35):
+    start=time.time(); last_change=start; signature=None
+    while time.time()-start<timeout:
+        if proc is not None and proc.poll() is not None and time.time()-start<minimum:return False
+        rows=[]
+        if root.exists():
+            for p in root.rglob('*.log'):
+                try:rows.append((str(p),p.stat().st_size,p.stat().st_mtime_ns))
+                except Exception:pass
+        sig=tuple(sorted(rows))
+        if sig!=signature:signature=sig;last_change=time.time()
+        if time.time()-start>=minimum and time.time()-last_change>=quiet:return True
+        time.sleep(.5)
+    return False
+
+
+def prime_mt5_runtime(rt,terminal,symbol='EURUSD'):
+    marker=rt/'.mt5-preview-prime-v2'
+    if marker.exists():return
+    cfg=rt/'mql-prime.ini';cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={symbol}\nPeriod=H1\n',encoding='utf-8')
+    proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
+    settled=False
+    try:
+        settled=wait_quiet(rt/'logs',proc=proc)
+    finally:
+        if proc.poll() is None:
+            try:proc.terminate();proc.wait(timeout=8)
+            except Exception:
+                try:proc.kill()
+                except Exception:pass
+    if settled:marker.write_text(str(int(time.time())),encoding='utf-8')
+
+
 def wait_image(proc,paths,timeout=50):
     end=time.time()+timeout
     while time.time()<end:
         hide_pid(proc.pid)
         for p in paths:
             if p.exists() and p.stat().st_size:return p
+        if proc.poll() is not None:return None
         time.sleep(.25)
     return None
+
 
 def latest_logs(root):
     rows=[]
@@ -184,40 +251,85 @@ def latest_logs(root):
         for p in root.rglob('*.log'):
             try:rows.append((p.stat().st_mtime_ns,p))
             except Exception:pass
-    return '\n\n'.join(f'[{p}]\n{read_text(p)[-1600:]}' for _,p in sorted(rows,reverse=True)[:3])
+    return '\n\n'.join(f'[{p}]\n{read_text(p)[-2200:]}' for _,p in sorted(rows,reverse=True)[:4])
+
+
+def preview_trace(logs):
+    lines=[]
+    for line in logs.splitlines():
+        if 'MQLLIB_PREVIEW' in line:lines.append(line)
+    return '\n'.join(lines[-20:])
+
+
+def mt5_capture_source(rel,shot,win):
+    return (
+        'void OnStart(){\n'
+        ' Print("MQLLIB_PREVIEW stage=onstart");\n'
+        ' ResetLastError();\n'
+        f' Print("MQLLIB_PREVIEW stage=before_iCustom path={rel}");\n'
+        f' int h=iCustom(_Symbol,_Period,"{rel}");\n'
+        ' int err=GetLastError();\n'
+        ' PrintFormat("MQLLIB_PREVIEW stage=after_iCustom handle=%d err=%d",h,err);\n'
+        ' if(h==INVALID_HANDLE){TerminalClose(21);return;}\n'
+        f' int w={win};\n'
+        ' if(w==1)w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);\n'
+        ' ResetLastError();\n'
+        ' bool added=ChartIndicatorAdd(0,w,h);\n'
+        ' err=GetLastError();\n'
+        ' PrintFormat("MQLLIB_PREVIEW stage=chart_add added=%s err=%d",added?"true":"false",err);\n'
+        ' if(!added){IndicatorRelease(h);TerminalClose(22);return;}\n'
+        ' ChartRedraw();\n'
+        ' for(int i=0;i<20;i++){if(BarsCalculated(h)>=0)break;Sleep(250);}\n'
+        ' Sleep(1500);\n'
+        ' ResetLastError();\n'
+        f' bool ok=ChartScreenShot(0,"{shot}",1200,720,ALIGN_RIGHT);\n'
+        ' err=GetLastError();\n'
+        ' PrintFormat("MQLLIB_PREVIEW stage=screenshot ok=%s err=%d",ok?"true":"false",err);\n'
+        ' IndicatorRelease(h);\n'
+        ' Sleep(300);\n'
+        ' TerminalClose(ok?0:23);\n'
+        '}\n'
+    )
+
 
 def render_mt4(src,out,t):
     rt=clone_runtime(t,out,'MT4');mql=rt/'MQL4';scripts=mql/'Scripts';templates=rt/'templates';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,templates,files)]
     editor=rt/'metaeditor.exe';terminal=rt/'terminal.exe';sym=copy_mt4_history(Path(t['data_dir']),rt);job,staged,binary,meta=stage(src,mql,'MT4',editor);rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
     tplname=f'MQLLibraryPreview_{job}.tpl';tpl=templates/tplname;sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0';tpl.write_text(f'<chart>\nsymbol={sym}\nperiod=60\ngraph=1\ngrid=1\n<window>\nheight=420\n<indicator>\nname=main\n</indicator>\n<indicator>\nname=Custom Indicator\n<expert>\nname={rel}\nflags=339\nwindow_num={win}\n</expert>\nshow_data=1\n</indicator>\n</window>\n</chart>\n')
-    shot=f'MQLLibraryPreview_{job}.gif';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq4';cap.write_text(f'#property strict\nvoid OnStart(){{Sleep(3000);WindowRedraw();bool ok=WindowScreenShot("{shot}",1200,720);Print("MQLLIB_PREVIEW screenshot=",ok," err=",GetLastError());Sleep(300);TerminalClose(ok?0:23);return;}}\n')
+    shot=f'MQLLibraryPreview_{job}.gif';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq4';cap.write_text(f'#property strict\nvoid OnStart(){{Print("MQLLIB_PREVIEW stage=onstart");Sleep(3000);WindowRedraw();ResetLastError();bool ok=WindowScreenShot("{shot}",1200,720);Print("MQLLIB_PREVIEW stage=screenshot ok=",ok," err=",GetLastError());Sleep(300);TerminalClose(ok?0:23);return;}}\n')
     built,_,log=compile_file(editor,cap,mql)
-    if not built:raise RuntimeError('Could not compile MT4 capture script. '+log[-1600:])
+    if not built:raise RuntimeError('Preview renderer compile failed — could not compile MT4 capture script. '+log[-1600:])
     targets=[files/shot,rt/shot,mql/shot];[p.unlink(missing_ok=True) for p in targets]
     cfg=rt/'config'/'mql-preview.ini';cfg.parent.mkdir(parents=True,exist_ok=True);cfg.write_text(f'Symbol={sym}\nPeriod=H1\nTemplate={tplname}\nScript={cap.stem}\n')
-    # MT4 uses the config filename directly; /config: is MT5-only syntax.
     proc=subprocess.Popen([str(terminal),'/portable',str(cfg)],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo());img=wait_image(proc,targets)
     if not img:
-        logs=(latest_logs(rt/'logs')+'\n'+latest_logs(mql/'Logs'))[-3000:]
-        try:proc.terminate()
-        except Exception:pass
-        raise RuntimeError(f'MT4 isolated preview produced no screenshot. runtime={rt}; config={cfg}; symbol={sym}. Logs:\n{logs}')
+        logs=(latest_logs(rt/'logs')+'\n'+latest_logs(mql/'Logs'))[-5000:]; trace=preview_trace(logs); rc=proc.poll()
+        if proc.poll() is None:
+            try:proc.terminate()
+            except Exception:pass
+        raise RuntimeError(f'Preview renderer failed — MT4 produced no screenshot. exit={rc}; runtime={rt}; config={cfg}; symbol={sym}. Trace:\n{trace or "(no capture trace)"}\nLogs:\n{logs}')
     final=out/(hashlib.sha1(('MT4|'+str(src.resolve()).lower()).encode()).hexdigest()[:16]+'.gif');out.mkdir(parents=True,exist_ok=True);shutil.copy2(img,final);meta.update({'isolated_runtime':str(rt),'symbol':sym,'staged':str(staged),'binary':str(binary)});return final,meta
 
+
 def render_mt5(src,out,t):
-    rt=clone_runtime(t,out,'MT5');mql=rt/'MQL5';scripts=mql/'Scripts';scripts.mkdir(parents=True,exist_ok=True);editor=rt/'metaeditor64.exe';terminal=rt/'terminal64.exe';sym=copy_mt5_history(Path(t['data_dir']),rt);job,staged,binary,meta=stage(src,mql,'MT5',editor);rel=f'MQLLibraryPreview\\{job}\\{binary.stem}';shot=f'MQLLibraryPreview_{job}.png';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq5';sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0'
-    cap.write_text(f'void OnStart(){{int h=iCustom(_Symbol,_Period,"{rel}");if(h==INVALID_HANDLE){{TerminalClose(21);return;}}int w={win};if(w==1)w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);if(!ChartIndicatorAdd(0,w,h)){{TerminalClose(22);return;}}ChartRedraw();Sleep(3000);bool ok=ChartScreenShot(0,"{shot}",1200,720,ALIGN_RIGHT);Sleep(300);TerminalClose(ok?0:23);return;}}\n')
+    rt=clone_runtime(t,out,'MT5');mql=rt/'MQL5';scripts=mql/'Scripts';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,files)]
+    editor=rt/'metaeditor64.exe';terminal=rt/'terminal64.exe';sym=copy_mt5_history(Path(t['data_dir']),rt)
+    prime_mt5_runtime(rt,terminal,sym)
+    job,staged,binary,meta=stage(src,mql,'MT5',editor);rel=f'MQLLibraryPreview\\{job}\\{binary.stem}';shot=f'MQLLibraryPreview_{job}.png';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq5';sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0'
+    cap.write_text(mt5_capture_source(rel,shot,win),encoding='utf-8')
     built,_,log=compile_file(editor,cap,mql)
-    if not built:raise RuntimeError('Could not compile MT5 capture script. '+log[-1600:])
-    targets=[mql/'Files'/shot,rt/shot];[p.unlink(missing_ok=True) for p in targets]
+    if not built:raise RuntimeError('Preview renderer compile failed — could not compile MT5 capture script. '+log[-1600:])
+    targets=[files/shot,rt/shot];[p.unlink(missing_ok=True) for p in targets]
     cfg=rt/'mql-preview.ini';cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={sym}\nPeriod=H1\nScript={cap.stem}\nShutdownTerminal=1\n')
     proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo());img=wait_image(proc,targets)
     if not img:
-        logs=(latest_logs(rt/'logs')+'\n'+latest_logs(mql/'Logs'))[-3000:]
-        try:proc.terminate()
-        except Exception:pass
-        raise RuntimeError(f'MT5 isolated preview produced no screenshot. runtime={rt}; symbol={sym}. Logs:\n{logs}')
+        logs=(latest_logs(rt/'logs')+'\n'+latest_logs(mql/'Logs'))[-7000:]; trace=preview_trace(logs); rc=proc.poll()
+        if proc.poll() is None:
+            try:proc.terminate()
+            except Exception:pass
+        raise RuntimeError(f'Preview renderer failed — MT5 produced no screenshot. exit={rc}; runtime={rt}; symbol={sym}. Trace:\n{trace or "(no capture trace)"}\nLogs:\n{logs}')
     final=out/(hashlib.sha1(('MT5|'+str(src.resolve()).lower()).encode()).hexdigest()[:16]+'.png');out.mkdir(parents=True,exist_ok=True);shutil.copy2(img,final);meta.update({'isolated_runtime':str(rt),'symbol':sym,'staged':str(staged),'binary':str(binary)});return final,meta
+
 
 def render(source,out,terminal=None):
     src=Path(source);dest=Path(out);kind='MT5' if src.suffix.lower() in ('.mq5','.ex5') else 'MT4';ts=[x for x in terminals() if x['kind']==kind and x.get('editor') and x.get('data_dir')]
@@ -225,19 +337,36 @@ def render(source,out,terminal=None):
     if not ts:raise RuntimeError(f'{kind} + MetaEditor data directory were not detected.')
     image,meta=(render_mt5(src,dest,ts[0]) if kind=='MT5' else render_mt4(src,dest,ts[0]));emit({'ok':True,'image':str(image),'kind':kind,'cached':False,'terminal':ts[0],'meta':meta})
 
+
 def open_source(source):
     src=Path(source);kind='MT5' if src.suffix.lower() in ('.mq5','.ex5') else 'MT4';ts=[x for x in terminals() if x['kind']==kind]
     if not ts:raise RuntimeError(f'{kind} was not detected.')
     target=ts[0].get('editor') if src.suffix.lower() in ('.mq4','.mq5') else ts[0]['terminal'];subprocess.Popen([target,str(src)] if target.endswith('editor.exe') or target.endswith('editor64.exe') else [target]);emit({'ok':True,'opened':target,'kind':kind})
 
+
+def self_test():
+    src=mt5_capture_source('MQLLibraryPreview\\abc\\demo','shot.png','0')
+    checks={
+        'no_input_dialog':'script_show_inputs' not in src,
+        'trace_before_icustom':'stage=before_iCustom' in src,
+        'trace_after_icustom':'stage=after_iCustom' in src,
+        'trace_chart_add':'stage=chart_add' in src,
+        'trace_screenshot':'stage=screenshot' in src,
+    }
+    if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
+    emit({'ok':True,'checks':checks})
+
+
 def main():
-    a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True);s.add_parser('detect');p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p=s.add_parser('open-source');p.add_argument('--source',required=True);p=s.add_parser('memory-stats');p.add_argument('--db',required=True);p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True);p=s.add_parser('archive-reset');p.add_argument('--db',required=True);x=a.parse_args()
+    a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True);s.add_parser('detect');s.add_parser('self-test');p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p=s.add_parser('open-source');p.add_argument('--source',required=True);p=s.add_parser('memory-stats');p.add_argument('--db',required=True);p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True);p=s.add_parser('archive-reset');p.add_argument('--db',required=True);x=a.parse_args()
     if x.cmd=='detect':detect()
+    elif x.cmd=='self-test':self_test()
     elif x.cmd=='render':render(x.source,x.out,x.terminal)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)
     elif x.cmd=='archive-reset':archive_reset(x.db)
+
 
 if __name__=='__main__':
     try:main()
