@@ -10,9 +10,9 @@ on:
       - 'engine.py'
       - 'engine_core.py'
       - 'preview_bridge.py'
+      - 'preview_control.py'
       - 'main.js'
-      - 'v5.js'
-      - 'v54.js'
+      - 'v57.js'
       - 'index.html'
       - 'styles.css'
       - 'Cargo.toml'
@@ -41,7 +41,7 @@ jobs:
           if(-not $app){throw 'Baseline app folder missing'}
           "APP_DIR=$($app.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Apply 0.5.6 source
+      - name: Apply 0.5.7 source
         shell: pwsh
         run: |
           $r=$env:GITHUB_WORKSPACE
@@ -49,9 +49,9 @@ jobs:
           Copy-Item "$r/engine.py" 'engine/engine.py' -Force
           Copy-Item "$r/engine_core.py" 'engine/engine_core.py' -Force
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
+          Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
           Copy-Item "$r/main.js" 'ui/main.js' -Force
-          Copy-Item "$r/v5.js" 'ui/v5.js' -Force
-          Copy-Item "$r/v54.js" 'ui/v54.js' -Force
+          Copy-Item "$r/v57.js" 'ui/v57.js' -Force
           Copy-Item "$r/index.html" 'index.html' -Force
           Copy-Item "$r/styles.css" 'ui/styles.css' -Force
           Copy-Item "$r/Cargo.toml" 'src-tauri/Cargo.toml' -Force
@@ -75,12 +75,15 @@ jobs:
         shell: pwsh
         run: |
           Set-Location $env:APP_DIR
-          python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py
+          python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_control.py
           node --check ui/main.js
-          node --check ui/v5.js
-          node --check ui/v54.js
+          node --check ui/v57.js
           python engine/preview_bridge.py detect
           if($LASTEXITCODE -ne 0){throw 'Preview detector failed'}
+          python engine/preview_bridge.py self-test
+          if($LASTEXITCODE -ne 0){throw 'Preview self-test failed'}
+          python engine/preview_control.py self-test
+          if($LASTEXITCODE -ne 0){throw 'Preview control self-test failed'}
 
       - name: Build bundled engines
         shell: pwsh
@@ -90,9 +93,11 @@ jobs:
           python -m pip install -r engine/requirements-build.txt
           python -m PyInstaller --noconfirm --clean --onefile --name mql-engine --distpath build-sidecar --workpath build-pyinstaller-engine --specpath build-pyinstaller-engine engine/engine.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview --distpath build-sidecar --workpath build-pyinstaller-preview --specpath build-pyinstaller-preview engine/preview_bridge.py
+          python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-control --distpath build-sidecar --workpath build-pyinstaller-control --specpath build-pyinstaller-control engine/preview_control.py
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
           Copy-Item build-sidecar/mql-engine.exe src-tauri/binaries/mql-engine-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview.exe src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe -Force
+          Copy-Item build-sidecar/mql-preview-control.exe src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe -Force
 
       - name: Validate packaged engines
         shell: pwsh
@@ -101,6 +106,9 @@ jobs:
           $p=& 'build-sidecar/mql-preview.exe' detect 2>&1
           $p | ForEach-Object {Write-Host $_}
           if($LASTEXITCODE -ne 0 -or ($p -join "`n") -notmatch '"ok": true'){throw 'Packaged preview detector failed'}
+          $c=& 'build-sidecar/mql-preview-control.exe' self-test 2>&1
+          $c | ForEach-Object {Write-Host $_}
+          if($LASTEXITCODE -ne 0 -or ($c -join "`n") -notmatch '"ok": true'){throw 'Packaged preview control failed'}
           $sample=Join-Path $env:RUNNER_TEMP 'mql-unicode'
           New-Item -ItemType Directory -Force -Path $sample | Out-Null
           '#property indicator_chart_window`nint OnInit(){return(INIT_SUCCEEDED);}' | Set-Content "$sample/Unicode_测试_Δ_é.mq4" -Encoding utf8
@@ -167,12 +175,13 @@ jobs:
           $i=Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
           if(-not $i){throw 'Installer missing'}
           if(-not(Test-Path 'src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe')){throw 'Preview sidecar missing'}
+          if(-not(Test-Path 'src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe')){throw 'Preview control sidecar missing'}
           Write-Host "Installer $($i.FullName)"
 
       - name: Upload finished Setup.exe
         uses: actions/upload-artifact@v4
         with:
-          name: MQL-Indicator-Library-0.5.6-Windows-Setup
+          name: MQL-Indicator-Library-0.5.7-Windows-Setup
           path: ${{ env.APP_DIR }}/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 14
