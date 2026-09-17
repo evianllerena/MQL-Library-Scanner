@@ -27,12 +27,10 @@ function detailFilePath(){
 
 function closeDetail(){document.getElementById('detail')?.classList.remove('open');}
 
-// v5 UX: keep X, but also close the indicator drawer by clicking anywhere outside it.
 document.addEventListener('pointerdown',e=>{
   const detail=document.getElementById('detail');
   if(!detail?.classList.contains('open'))return;
   if(detail.contains(e.target))return;
-  // A row click is opening/replacing the detail view, so do not immediately close it.
   if(e.target.closest?.('#rows tr, #reviewRows tr'))return;
   closeDetail();
 },{capture:true});
@@ -58,7 +56,12 @@ async function openInMetaEditor(source,status,button){
 }
 
 function injectPreviewCard(){
-  const body=document.getElementById('detailBody'); if(!body||document.getElementById('v5RealPreview'))return;
+  const body=document.getElementById('detailBody'); if(!body)return;
+  for(const section of [...body.querySelectorAll('.section')]){
+    const label=section.querySelector('.label')?.textContent?.trim().toLowerCase()||'';
+    if(label.includes('structural preview')||label.includes('schematic preview'))section.remove();
+  }
+  if(document.getElementById('v5RealPreview'))return;
   const source=detailFilePath(); if(!source)return;
   const section=document.createElement('div'); section.className='section'; section.id='v5RealPreview';
   const mt5=/\.(mq5|ex5)$/i.test(source);
@@ -84,6 +87,7 @@ const appRoot=document.getElementById('app'); if(appRoot)observer.observe(appRoo
 
 async function enhanceSettings(){
   for(let i=0;i<50;i++){
+    const brand=document.querySelector('.brand small'); if(brand)brand.textContent='0.5.0 • Evidence Engine v4 + Learning Memory';
     const panel=document.querySelector('#settings .scan-panel');
     if(panel&&!document.getElementById('v5MetaTraderSettings')){
       const card=document.createElement('div'); card.className='diagnostic-card'; card.id='v5MetaTraderSettings';
