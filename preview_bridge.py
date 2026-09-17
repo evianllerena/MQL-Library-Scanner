@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, os, shutil, sqlite3, subprocess, sys, time
+import argparse, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, time
 from pathlib import Path
 
 
@@ -30,8 +30,7 @@ def candidates():
                 if p.exists():
                     key=str(p).lower()
                     if key in seen: continue
-                    seen.add(key)
-                    ed=d/editor
+                    seen.add(key); ed=d/editor
                     out.append({'kind':kind,'terminal':str(p),'editor':str(ed) if ed.exists() else None,'install_dir':str(d)})
     for root in roots[:2]:
         try:
@@ -52,12 +51,10 @@ def data_dirs():
     if not base.exists(): return out
     for d in base.iterdir():
         if not d.is_dir(): continue
-        origin=d/'origin.txt'
-        origin_text=''
+        origin=d/'origin.txt'; origin_text=''
         if origin.exists():
-            try: origin_text=origin.read_text(encoding='utf-16').strip()
-            except Exception:
-                try: origin_text=origin.read_text(encoding='utf-8',errors='ignore').strip()
+            for enc in ('utf-16','utf-8'):
+                try: origin_text=origin.read_text(encoding=enc,errors='ignore').strip(); break
                 except Exception: pass
         out.append({'path':str(d),'origin':origin_text})
     return out
@@ -66,8 +63,7 @@ def data_dirs():
 def enrich(terminals):
     dds=data_dirs()
     for t in terminals:
-        install=str(Path(t['terminal']).parent).lower().replace('/','\\')
-        match=None
+        install=str(Path(t['terminal']).parent).lower().replace('/','\\'); match=None
         for d in dds:
             o=d['origin'].lower().replace('/','\\')
             if o and (install in o or o in install): match=d['path']; break
@@ -76,40 +72,24 @@ def enrich(terminals):
 
 
 def detect():
-    terms=enrich(candidates())
-    emit({'ok':True,'terminals':terms})
-    return terms
+    terms=enrich(candidates()); emit({'ok':True,'terminals':terms}); return terms
 
 
 def memory_stats(db_s:str):
     db=Path(db_s)
-    if not db.exists():
-        emit({'ok':True,'corrections':0,'verified':0,'families':0,'latest':[]}); return
-    conn=sqlite3.connect(db)
-    one=lambda sql: conn.execute(sql).fetchone()[0]
-    latest=[]
+    if not db.exists(): emit({'ok':True,'corrections':0,'verified':0,'families':0,'latest':[]}); return
+    conn=sqlite3.connect(db); one=lambda sql: conn.execute(sql).fetchone()[0]; latest=[]
     try:
         for row in conn.execute("SELECT corrected_primary, original_primary, created_at FROM classification_memory ORDER BY id DESC LIMIT 8"):
             latest.append({'corrected_primary':row[0],'original_primary':row[1],'created_at':row[2]})
         result={'ok':True,'corrections':one('SELECT COUNT(*) FROM classification_memory'),'verified':one('SELECT COUNT(*) FROM indicators WHERE human_verified=1'),'families':one("SELECT COUNT(DISTINCT family_fingerprint) FROM classification_memory WHERE family_fingerprint IS NOT NULL AND family_fingerprint != ''"),'latest':latest}
-    finally:
-        conn.close()
+    finally: conn.close()
     emit(result)
 
 
-def safe_mql_string(s:str)->str:
-    return s.replace('\\','\\\\').replace('"','\\"')
+def safe_mql_string(s:str)->str: return s.replace('\\','\\\\').replace('"','\\"')
 
-
-def wait_for(path:Path,timeout=20):
-    end=time.time()+timeout
-    while time.time()<end:
-        if path.exists() and path.stat().st_size>0: return True
-        time.sleep(.25)
-    return False
-
-
-def wait_for_any(paths:list[Path],timeout=30):
+def wait_for_any(paths,timeout=35):
     end=time.time()+timeout
     while time.time()<end:
         for p in paths:
@@ -120,137 +100,154 @@ def wait_for_any(paths:list[Path],timeout=30):
     return None
 
 
+def read_compile_log(source:Path):
+    log=source.with_suffix('.log')
+    if not log.exists(): return ''
+    for enc in ('utf-16','utf-8','cp1252'):
+        try: return log.read_text(encoding=enc,errors='ignore')
+        except Exception: pass
+    return ''
+
+
 def compile_mql(editor:Path,source:Path,include_dir:Path|None=None):
     cmd=[str(editor),f'/compile:{source}','/log']
     if include_dir: cmd.append(f'/include:{include_dir}')
-    cp=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=45,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    log=source.with_suffix('.log')
-    log_text=''
-    if log.exists():
-        try: log_text=log.read_text(encoding='utf-16',errors='ignore')
-        except Exception:
-            try: log_text=log.read_text(encoding='utf-8',errors='ignore')
-            except Exception: pass
-    return cp.returncode,log_text
+    cp=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    return cp.returncode,read_compile_log(source)
 
 
-def source_is_separate(source:Path)->bool:
-    if source.suffix.lower() not in ('.mq4','.mq5'): return False
+def copy_local_includes(src:Path,dst:Path,root_src:Path,seen=None):
+    if seen is None: seen=set()
+    key=str(src.resolve()).lower()
+    if key in seen or not src.exists(): return
+    seen.add(key)
+    try: text=src.read_text(encoding='utf-8',errors='ignore')
+    except Exception: return
+    for inc in re.findall(r'#\s*include\s*["<]([^">]+)[">]',text,re.I):
+        rel=Path(inc.replace('\\',os.sep).replace('/',os.sep))
+        candidates=[src.parent/rel,root_src/rel]
+        for dep in candidates:
+            if dep.exists() and dep.is_file():
+                try:
+                    rel_out=dep.relative_to(root_src)
+                except Exception:
+                    rel_out=Path(dep.name)
+                out=dst.parent/rel_out
+                out.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(dep,out)
+                copy_local_includes(dep,out,root_src,seen)
+                break
+
+
+def stage_source(source:Path,mql_root:Path,kind:str):
+    ext='.ex5' if kind=='MT5' else '.ex4'
+    job=hashlib.sha1(str(source.resolve()).lower().encode('utf-8','ignore')).hexdigest()[:14]
+    stage_dir=mql_root/'Indicators'/'MQLLibraryPreview'/job
+    stage_dir.mkdir(parents=True,exist_ok=True)
+    staged=stage_dir/source.name
+    shutil.copy2(source,staged)
+    copy_local_includes(source,staged,source.parent)
+    existing=source.with_suffix(ext)
+    if existing.exists(): shutil.copy2(existing,staged.with_suffix(ext))
+    return job,stage_dir,staged
+
+
+def cached_preview(source:Path,out_dir:Path,kind:str):
+    out_dir.mkdir(parents=True,exist_ok=True)
+    token=hashlib.sha1((kind+'|'+str(source.resolve()).lower()).encode('utf-8','ignore')).hexdigest()[:16]
+    ext='.gif' if kind=='MT4' else '.png'
+    out=out_dir/f'{token}{ext}'
     try:
-        raw=source.read_bytes()
-        for enc in ('utf-8-sig','utf-8','cp1252','latin1'):
-            try:
-                text=raw.decode(enc); break
-            except UnicodeDecodeError: continue
-        else: text=raw.decode('latin1',errors='ignore')
-        return 'indicator_separate_window' in text.lower()
-    except Exception:
-        return False
+        if out.exists() and out.stat().st_mtime_ns>=source.stat().st_mtime_ns and out.stat().st_size>0: return out
+    except Exception: pass
+    return None
 
 
-def render_mt5(source:Path,out_dir:Path,terminal_info:dict):
-    terminal=Path(terminal_info['terminal']); editor=Path(terminal_info.get('editor') or '')
-    data=Path(terminal_info.get('data_dir') or '')
+def source_separate(source:Path):
+    try: return 'indicator_separate_window' in source.read_text(encoding='utf-8',errors='ignore').lower()
+    except Exception: return False
+
+
+def render_mt5(source:Path,out_dir:Path,t:dict):
+    cache=cached_preview(source,out_dir,'MT5')
+    if cache: return cache,True
+    terminal=Path(t['terminal']); editor=Path(t.get('editor') or ''); data=Path(t.get('data_dir') or '')
     if not editor.exists(): raise RuntimeError('MetaEditor 5 was not found beside the selected terminal.')
     if not data.exists(): raise RuntimeError('MetaTrader 5 data directory could not be mapped. Open MT5 once, then retry.')
-    mql5=data/'MQL5'; indicators=mql5/'Indicators'/'MQLLibraryPreview'; scripts=mql5/'Scripts'
-    indicators.mkdir(parents=True,exist_ok=True); scripts.mkdir(parents=True,exist_ok=True); out_dir.mkdir(parents=True,exist_ok=True)
-    compiled=source if source.suffix.lower()=='.ex5' else source.with_suffix('.ex5')
-    if source.suffix.lower()=='.mq5':
-        rc,log=compile_mql(editor,source,mql5)
-        if not compiled.exists():
-            raise RuntimeError('MetaEditor could not compile this MQ5 indicator. '+(log[-900:] if log else f'Compiler exit code {rc}.'))
-    if not compiled.exists(): raise RuntimeError(f'Compiled EX5 file was not found: {compiled}')
-    dest_ex5=indicators/compiled.name
-    shutil.copy2(compiled,dest_ex5)
-    indicator_rel='MQLLibraryPreview\\'+compiled.stem
-    separate=source_is_separate(source)
-    shot_name='MQLLibraryPreview.png'
-    renderer=scripts/'MQLLibraryPreviewRenderer.mq5'
-    renderer.write_text(f'''#property script_show_inputs\nvoid OnStart(){{\n string name="{safe_mql_string(indicator_rel)}";\n int h=iCustom(_Symbol,_Period,name);\n if(h==INVALID_HANDLE){{Print("MQLLIB_PREVIEW: iCustom failed ",GetLastError()); TerminalClose(21); return;}}\n int win={1 if separate else 0};\n if(win==1) win=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);\n if(!ChartIndicatorAdd(0,win,h)){{Print("MQLLIB_PREVIEW: ChartIndicatorAdd failed ",GetLastError()); IndicatorRelease(h); TerminalClose(22); return;}}\n ChartRedraw(); Sleep(3000);\n bool ok=ChartScreenShot(0,"{shot_name}",1200,720,ALIGN_RIGHT);\n Print("MQLLIB_PREVIEW: screenshot=",ok," err=",GetLastError());\n Sleep(500); IndicatorRelease(h); TerminalClose(ok?0:23);\n}}\n''',encoding='utf-8')
-    rc,log=compile_mql(editor,renderer,mql5)
-    renderer_ex5=renderer.with_suffix('.ex5')
-    if not renderer_ex5.exists(): raise RuntimeError('Could not compile the MT5 preview renderer. '+(log[-900:] if log else f'Exit code {rc}.'))
-    screenshot=mql5/'Files'/shot_name
-    try: screenshot.unlink(missing_ok=True)
-    except Exception: pass
-    config=out_dir/'mt5-preview.ini'
-    config.write_text('[StartUp]\nSymbol=EURUSD\nPeriod=H1\nScript=MQLLibraryPreviewRenderer\n',encoding='utf-8')
-    subprocess.Popen([str(terminal),f'/config:{config}'],cwd=str(terminal.parent),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    if not wait_for(screenshot,30): raise RuntimeError('MT5 opened but no preview screenshot was produced within 30 seconds. Check the MT5 Journal and whether EURUSD/history is available.')
-    final=out_dir/(source.stem+'_preview.png')
-    shutil.copy2(screenshot,final)
-    return final
-
-
-def mt4_template(indicator_name:str,separate:bool)->str:
-    main='''<window>\nheight=430\nfixed_height=0\n<indicator>\nname=main\n</indicator>\n'''
-    block=f'''<indicator>\nname=Custom Indicator\n<expert>\nname={indicator_name}\nflags=339\nwindow_num={1 if separate else 0}\n</expert>\nshow_data=1\n</indicator>\n'''
-    if separate:
-        windows=main+'</window>\n<window>\nheight=210\nfixed_height=0\n'+block+'</window>\n'
-    else:
-        windows=main+block+'</window>\n'
-    return f'''<chart>\nsymbol=EURUSD\nperiod=60\ndigits=5\nleftpos=1000\nscale=2\ngraph=1\nfore=0\ngrid=0\nvolume=0\nohlc=0\naskline=0\ndays=0\ndescriptions=1\nscroll=1\nshift=1\nshift_size=10\nfixed_pos=620\nwindow_left=0\nwindow_top=0\nwindow_right=1200\nwindow_bottom=720\nwindow_type=3\nbackground_color=16777215\nforeground_color=0\nbarup_color=32768\nbardown_color=255\nbullcandle_color=16777215\nbearcandle_color=255\nchartline_color=0\nvolumes_color=8421504\ngrid_color=12632256\naskline_color=255\nstops_color=255\n{windows}</chart>\n'''
-
-
-def render_mt4(source:Path,out_dir:Path,terminal_info:dict):
-    terminal=Path(terminal_info['terminal']); editor=Path(terminal_info.get('editor') or '')
-    data=Path(terminal_info.get('data_dir') or '')
-    if not editor.exists(): raise RuntimeError('MetaEditor 4 was not found beside the selected MT4 terminal.')
-    if not data.exists(): raise RuntimeError('MetaTrader 4 data directory could not be mapped. Open MT4 once, then retry.')
-    mql4=data/'MQL4'; indicators=mql4/'Indicators'/'MQLLibraryPreview'; scripts=mql4/'Scripts'; templates=data/'templates'
-    indicators.mkdir(parents=True,exist_ok=True); scripts.mkdir(parents=True,exist_ok=True); templates.mkdir(parents=True,exist_ok=True); out_dir.mkdir(parents=True,exist_ok=True)
-    compiled=source if source.suffix.lower()=='.ex4' else source.with_suffix('.ex4')
-    if source.suffix.lower()=='.mq4':
-        rc,log=compile_mql(editor,source,mql4)
-        if not compiled.exists():
-            raise RuntimeError('MetaEditor could not compile this MQ4 indicator. '+(log[-900:] if log else f'Compiler exit code {rc}.'))
-    if not compiled.exists(): raise RuntimeError(f'Compiled EX4 file was not found: {compiled}')
-    dest_ex4=indicators/compiled.name
-    shutil.copy2(compiled,dest_ex4)
-    indicator_rel='MQLLibraryPreview\\'+compiled.stem
-    separate=source_is_separate(source)
-
-    template_name='MQLLibraryPreview.tpl'
-    template_path=templates/template_name
-    template_path.write_text(mt4_template(indicator_rel,separate),encoding='utf-8')
-
-    capture=scripts/'MQLLibraryPreviewCapture.mq4'
-    capture.write_text('''#property strict\nvoid OnStart(){\n Sleep(4500);\n ChartRedraw();\n ResetLastError();\n bool ok=WindowScreenShot("MQLLibraryPreview.gif",1200,720,-1,2,1);\n Print("MQLLIB_PREVIEW: screenshot=",ok," err=",GetLastError());\n Sleep(750);\n ChartClose(0);\n}\n''',encoding='utf-8')
-    rc,log=compile_mql(editor,capture,mql4)
-    capture_ex4=capture.with_suffix('.ex4')
-    if not capture_ex4.exists(): raise RuntimeError('Could not compile the MT4 preview capture script. '+(log[-900:] if log else f'Exit code {rc}.'))
-
-    screenshot_candidates=[mql4/'Files'/'MQLLibraryPreview.gif',data/'experts'/'files'/'MQLLibraryPreview.gif']
-    for shot in screenshot_candidates:
-        try: shot.unlink(missing_ok=True)
+    mql=data/'MQL5'; scripts=mql/'Scripts'; scripts.mkdir(parents=True,exist_ok=True)
+    job,stage_dir,staged=stage_source(source,mql,'MT5'); compiled=staged.with_suffix('.ex5')
+    if not compiled.exists():
+        rc,log=compile_mql(editor,staged,mql)
+        if not compiled.exists(): raise RuntimeError('MT5 staging compile did not produce EX5. '+(log[-1600:] if log else f'MetaEditor exit code {rc}. Staged source: {staged}'))
+    rel=f'MQLLibraryPreview\\{job}\\{compiled.stem}'; shot=f'MQLLibraryPreview_{job}.png'; renderer=scripts/f'MQLLibraryPreview_{job}.mq5'
+    sep=source_separate(source)
+    renderer.write_text(f'''#property script_show_inputs\nvoid OnStart(){{\n int h=iCustom(_Symbol,_Period,"{safe_mql_string(rel)}");\n if(h==INVALID_HANDLE){{Print("MQLLIB_PREVIEW iCustom failed ",GetLastError()); return;}}\n int win={1 if sep else 0}; if(win==1) win=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);\n if(!ChartIndicatorAdd(0,win,h)){{Print("MQLLIB_PREVIEW add failed ",GetLastError()); return;}}\n ChartRedraw(); Sleep(3500);\n bool ok=ChartScreenShot(0,"{shot}",1200,720,ALIGN_RIGHT); Print("MQLLIB_PREVIEW screenshot=",ok," err=",GetLastError());\n Sleep(500); ChartClose(0);\n}}\n''',encoding='utf-8')
+    rc,log=compile_mql(editor,renderer,mql)
+    if not renderer.with_suffix('.ex5').exists(): raise RuntimeError('Could not compile MT5 preview capture script. '+(log[-1200:] if log else f'Exit code {rc}.'))
+    screenshots=[mql/'Files'/shot,data/shot]
+    for p in screenshots:
+        try: p.unlink(missing_ok=True)
         except Exception: pass
-    config=out_dir/'mt4-preview.ini'
-    config.write_text('Symbol=EURUSD\nPeriod=H1\nTemplate=MQLLibraryPreview.tpl\nScript=MQLLibraryPreviewCapture\n',encoding='utf-8')
-    subprocess.Popen([str(terminal),str(config)],cwd=str(terminal.parent),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    shot=wait_for_any(screenshot_candidates,35)
-    if not shot:
-        raise RuntimeError('MT4 opened but no preview screenshot was produced within 35 seconds. Check the MT4 Experts/Journal tabs, confirm EURUSD is available, and export Diagnostics so the preview failure can be inspected.')
-    final=out_dir/(source.stem+'_preview.gif')
-    shutil.copy2(shot,final)
-    return final
+    config=out_dir/f'mt5-preview-{job}.ini'; config.write_text(f'[StartUp]\nSymbol=EURUSD\nPeriod=H1\nScript={renderer.stem}\n',encoding='utf-8')
+    subprocess.Popen([str(terminal),f'/config:{config}'],cwd=str(terminal.parent),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    found=wait_for_any(screenshots,40)
+    if not found: raise RuntimeError(f'MT5 opened but no screenshot was produced. Renderer={renderer.stem}; staged={staged}. The terminal may already be running or EURUSD/history may be unavailable.')
+    final=cached_preview_path(source,out_dir,'MT5'); shutil.copy2(found,final); return final,False
+
+
+def cached_preview_path(source:Path,out_dir:Path,kind:str):
+    token=hashlib.sha1((kind+'|'+str(source.resolve()).lower()).encode('utf-8','ignore')).hexdigest()[:16]
+    return out_dir/f'{token}{".gif" if kind=="MT4" else ".png"}'
+
+
+def mt4_template(indicator_name:str,separate:bool):
+    main='''<window>\nheight=420\n<indicator>\nname=main\n</indicator>\n'''
+    block=f'''<indicator>\nname=Custom Indicator\n<expert>\nname={indicator_name}\nflags=339\nwindow_num={1 if separate else 0}\n</expert>\nshow_data=1\n</indicator>\n'''
+    if separate: return '<chart>\nsymbol=EURUSD\nperiod=60\ngraph=1\ngrid=1\nshift=1\n'+main+'</window>\n<window>\nheight=180\n'+block+'</window>\n</chart>\n'
+    return '<chart>\nsymbol=EURUSD\nperiod=60\ngraph=1\ngrid=1\nshift=1\n'+main+block+'</window>\n</chart>\n'
+
+
+def render_mt4(source:Path,out_dir:Path,t:dict):
+    cache=cached_preview(source,out_dir,'MT4')
+    if cache: return cache,True
+    terminal=Path(t['terminal']); editor=Path(t.get('editor') or ''); data=Path(t.get('data_dir') or '')
+    if not editor.exists(): raise RuntimeError('MetaEditor 4 was not found beside the selected terminal.')
+    if not data.exists(): raise RuntimeError('MetaTrader 4 data directory could not be mapped. Open MT4 once, then retry.')
+    mql=data/'MQL4'; scripts=mql/'Scripts'; templates=data/'profiles'/'templates'; files=mql/'Files'
+    scripts.mkdir(parents=True,exist_ok=True); templates.mkdir(parents=True,exist_ok=True); files.mkdir(parents=True,exist_ok=True)
+    job,stage_dir,staged=stage_source(source,mql,'MT4'); compiled=staged.with_suffix('.ex4')
+    if not compiled.exists():
+        rc,log=compile_mql(editor,staged,mql)
+        if not compiled.exists(): raise RuntimeError('MT4 staging compile did not produce EX4. '+(log[-1600:] if log else f'MetaEditor exit code {rc}. Staged source: {staged}'))
+    rel=f'MQLLibraryPreview\\{job}\\{compiled.stem}'; template_name=f'MQLLibraryPreview_{job}'; tpl=templates/f'{template_name}.tpl'
+    tpl.write_text(mt4_template(rel,source_separate(source)),encoding='utf-8')
+    shot=f'MQLLibraryPreview_{job}.gif'; capture=scripts/f'MQLLibraryPreviewCapture_{job}.mq4'
+    capture.write_text(f'''#property strict\nvoid OnStart(){{ Sleep(3500); WindowRedraw(); bool ok=WindowScreenShot("{shot}",1200,720); Print("MQLLIB_PREVIEW screenshot=",ok," err=",GetLastError()); Sleep(500); ChartClose(0); }}\n''',encoding='utf-8')
+    rc,log=compile_mql(editor,capture,mql)
+    if not capture.with_suffix('.ex4').exists(): raise RuntimeError('Could not compile MT4 preview capture script. '+(log[-1200:] if log else f'Exit code {rc}.'))
+    screenshots=[files/shot,data/shot,mql/shot]
+    for p in screenshots:
+        try: p.unlink(missing_ok=True)
+        except Exception: pass
+    config=out_dir/f'mt4-preview-{job}.ini'; config.write_text(f'[StartUp]\nSymbol=EURUSD\nPeriod=H1\nTemplate={template_name}\nScript={capture.stem}\n',encoding='utf-8')
+    subprocess.Popen([str(terminal),f'/config:{config}'],cwd=str(terminal.parent),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    found=wait_for_any(screenshots,40)
+    if not found: raise RuntimeError(f'MT4 opened but no screenshot was produced. Template={template_name}; script={capture.stem}; staged={staged}. The terminal may already be running or EURUSD/history may be unavailable.')
+    final=cached_preview_path(source,out_dir,'MT4'); shutil.copy2(found,final); return final,False
 
 
 def render(source_s:str,out_s:str,terminal_s:str|None=None):
     source=Path(source_s); out=Path(out_s)
     if not source.exists(): raise RuntimeError(f'Source file does not exist: {source}')
-    ext=source.suffix.lower()
-    if ext not in ('.mq4','.ex4','.mq5','.ex5'): raise RuntimeError(f'Unsupported preview file type: {ext}')
-    kind='MT5' if ext in ('.mq5','.ex5') else 'MT4'
-    terms=enrich(candidates())
-    eligible=[t for t in terms if t['kind']==kind and t.get('editor')]
-    if terminal_s:
-        exact=[t for t in eligible if t['terminal'].lower()==terminal_s.lower()]
-        if exact: eligible=exact
-    if not eligible: raise RuntimeError(f'{kind} + MetaEditor were not detected. Install/open {kind} once, then retry.')
-    if kind=='MT5': result=render_mt5(source,out,eligible[0])
-    else: result=render_mt4(source,out,eligible[0])
-    emit({'ok':True,'image':str(result),'terminal':eligible[0],'renderer':kind})
+    suffix=source.suffix.lower(); kind='MT5' if suffix in ('.mq5','.ex5') else 'MT4' if suffix in ('.mq4','.ex4') else None
+    if not kind: raise RuntimeError(f'Unsupported indicator extension: {source.suffix}')
+    terms=enrich(candidates()); eligible=[t for t in terms if t['kind']==kind and t.get('editor')]
+    if terminal_s: eligible=[t for t in eligible if t['terminal'].lower()==terminal_s.lower()] or eligible
+    if not eligible: raise RuntimeError(f'{kind} + MetaEditor were not detected. Install/open {kind} once first.')
+    if suffix in ('.ex4','.ex5') and not source.with_suffix('.mq4' if kind=='MT4' else '.mq5').exists():
+        raise RuntimeError(f'Compiled-only {source.suffix.upper()} preview needs matching source in this build so the renderer can determine dependencies and window type.')
+    actual=source.with_suffix('.mq4' if kind=='MT4' else '.mq5') if suffix.startswith('.ex') else source
+    started=time.time(); result,cached=(render_mt5(actual,out,eligible[0]) if kind=='MT5' else render_mt4(actual,out,eligible[0]))
+    emit({'ok':True,'image':str(result),'terminal':eligible[0],'kind':kind,'cached':cached,'elapsed_ms':round((time.time()-started)*1000)})
 
 
 def open_source(source_s:str):
@@ -258,11 +255,17 @@ def open_source(source_s:str):
     matches=[t for t in terms if t['kind']==kind]
     if not matches: raise RuntimeError(f'{kind} was not detected.')
     editor=matches[0].get('editor')
-    if editor and source.suffix.lower() in ('.mq4','.mq5'):
-        subprocess.Popen([editor,str(source)])
-    else:
-        subprocess.Popen([matches[0]['terminal']])
+    if editor and source.suffix.lower() in ('.mq4','.mq5'): subprocess.Popen([editor,str(source)])
+    else: subprocess.Popen([matches[0]['terminal']])
     emit({'ok':True,'opened':editor or matches[0]['terminal'],'kind':kind})
+
+
+def template_smoke(kind:str='MT4'):
+    if kind.upper()!='MT4': raise RuntimeError('Only MT4 template smoke is defined.')
+    text=mt4_template('MQLLibraryPreview\\sample\\SampleIndicator',True)
+    ok='<indicator>' in text and 'name=Custom Indicator' in text and 'window_num=1' in text and 'SampleIndicator' in text
+    emit({'ok':ok,'kind':'MT4','template':text})
+    if not ok: raise RuntimeError('MT4 template smoke test failed.')
 
 
 def main():
@@ -271,11 +274,13 @@ def main():
     p=sub.add_parser('render'); p.add_argument('--source',required=True); p.add_argument('--out',required=True); p.add_argument('--terminal')
     p=sub.add_parser('open-source'); p.add_argument('--source',required=True)
     p=sub.add_parser('memory-stats'); p.add_argument('--db',required=True)
+    p=sub.add_parser('template-smoke'); p.add_argument('--kind',default='MT4')
     a=ap.parse_args()
     if a.cmd=='detect': detect()
     elif a.cmd=='render': render(a.source,a.out,a.terminal)
     elif a.cmd=='open-source': open_source(a.source)
     elif a.cmd=='memory-stats': memory_stats(a.db)
+    elif a.cmd=='template-smoke': template_smoke(a.kind)
 
 if __name__=='__main__':
     try: main()
