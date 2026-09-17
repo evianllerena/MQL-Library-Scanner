@@ -109,6 +109,17 @@ def wait_for(path:Path,timeout=20):
     return False
 
 
+def wait_for_any(paths:list[Path],timeout=30):
+    end=time.time()+timeout
+    while time.time()<end:
+        for p in paths:
+            try:
+                if p.exists() and p.stat().st_size>0: return p
+            except Exception: pass
+        time.sleep(.25)
+    return None
+
+
 def compile_mql(editor:Path,source:Path,include_dir:Path|None=None):
     cmd=[str(editor),f'/compile:{source}','/log']
     if include_dir: cmd.append(f'/include:{include_dir}')
@@ -123,6 +134,20 @@ def compile_mql(editor:Path,source:Path,include_dir:Path|None=None):
     return cp.returncode,log_text
 
 
+def source_is_separate(source:Path)->bool:
+    if source.suffix.lower() not in ('.mq4','.mq5'): return False
+    try:
+        raw=source.read_bytes()
+        for enc in ('utf-8-sig','utf-8','cp1252','latin1'):
+            try:
+                text=raw.decode(enc); break
+            except UnicodeDecodeError: continue
+        else: text=raw.decode('latin1',errors='ignore')
+        return 'indicator_separate_window' in text.lower()
+    except Exception:
+        return False
+
+
 def render_mt5(source:Path,out_dir:Path,terminal_info:dict):
     terminal=Path(terminal_info['terminal']); editor=Path(terminal_info.get('editor') or '')
     data=Path(terminal_info.get('data_dir') or '')
@@ -130,19 +155,16 @@ def render_mt5(source:Path,out_dir:Path,terminal_info:dict):
     if not data.exists(): raise RuntimeError('MetaTrader 5 data directory could not be mapped. Open MT5 once, then retry.')
     mql5=data/'MQL5'; indicators=mql5/'Indicators'/'MQLLibraryPreview'; scripts=mql5/'Scripts'
     indicators.mkdir(parents=True,exist_ok=True); scripts.mkdir(parents=True,exist_ok=True); out_dir.mkdir(parents=True,exist_ok=True)
-    compiled=source.with_suffix('.ex5')
-    if not compiled.exists():
+    compiled=source if source.suffix.lower()=='.ex5' else source.with_suffix('.ex5')
+    if source.suffix.lower()=='.mq5':
         rc,log=compile_mql(editor,source,mql5)
         if not compiled.exists():
             raise RuntimeError('MetaEditor could not compile this MQ5 indicator. '+(log[-900:] if log else f'Compiler exit code {rc}.'))
+    if not compiled.exists(): raise RuntimeError(f'Compiled EX5 file was not found: {compiled}')
     dest_ex5=indicators/compiled.name
     shutil.copy2(compiled,dest_ex5)
     indicator_rel='MQLLibraryPreview\\'+compiled.stem
-    separate=False
-    try:
-        text=source.read_text(encoding='utf-8',errors='ignore')
-        separate='indicator_separate_window' in text.lower()
-    except Exception: pass
+    separate=source_is_separate(source)
     shot_name='MQLLibraryPreview.png'
     renderer=scripts/'MQLLibraryPreviewRenderer.mq5'
     renderer.write_text(f'''#property script_show_inputs\nvoid OnStart(){{\n string name="{safe_mql_string(indicator_rel)}";\n int h=iCustom(_Symbol,_Period,name);\n if(h==INVALID_HANDLE){{Print("MQLLIB_PREVIEW: iCustom failed ",GetLastError()); TerminalClose(21); return;}}\n int win={1 if separate else 0};\n if(win==1) win=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);\n if(!ChartIndicatorAdd(0,win,h)){{Print("MQLLIB_PREVIEW: ChartIndicatorAdd failed ",GetLastError()); IndicatorRelease(h); TerminalClose(22); return;}}\n ChartRedraw(); Sleep(3000);\n bool ok=ChartScreenShot(0,"{shot_name}",1200,720,ALIGN_RIGHT);\n Print("MQLLIB_PREVIEW: screenshot=",ok," err=",GetLastError());\n Sleep(500); IndicatorRelease(h); TerminalClose(ok?0:23);\n}}\n''',encoding='utf-8')
@@ -161,19 +183,74 @@ def render_mt5(source:Path,out_dir:Path,terminal_info:dict):
     return final
 
 
+def mt4_template(indicator_name:str,separate:bool)->str:
+    main='''<window>\nheight=430\nfixed_height=0\n<indicator>\nname=main\n</indicator>\n'''
+    block=f'''<indicator>\nname=Custom Indicator\n<expert>\nname={indicator_name}\nflags=339\nwindow_num={1 if separate else 0}\n</expert>\nshow_data=1\n</indicator>\n'''
+    if separate:
+        windows=main+'</window>\n<window>\nheight=210\nfixed_height=0\n'+block+'</window>\n'
+    else:
+        windows=main+block+'</window>\n'
+    return f'''<chart>\nsymbol=EURUSD\nperiod=60\ndigits=5\nleftpos=1000\nscale=2\ngraph=1\nfore=0\ngrid=0\nvolume=0\nohlc=0\naskline=0\ndays=0\ndescriptions=1\nscroll=1\nshift=1\nshift_size=10\nfixed_pos=620\nwindow_left=0\nwindow_top=0\nwindow_right=1200\nwindow_bottom=720\nwindow_type=3\nbackground_color=16777215\nforeground_color=0\nbarup_color=32768\nbardown_color=255\nbullcandle_color=16777215\nbearcandle_color=255\nchartline_color=0\nvolumes_color=8421504\ngrid_color=12632256\naskline_color=255\nstops_color=255\n{windows}</chart>\n'''
+
+
+def render_mt4(source:Path,out_dir:Path,terminal_info:dict):
+    terminal=Path(terminal_info['terminal']); editor=Path(terminal_info.get('editor') or '')
+    data=Path(terminal_info.get('data_dir') or '')
+    if not editor.exists(): raise RuntimeError('MetaEditor 4 was not found beside the selected MT4 terminal.')
+    if not data.exists(): raise RuntimeError('MetaTrader 4 data directory could not be mapped. Open MT4 once, then retry.')
+    mql4=data/'MQL4'; indicators=mql4/'Indicators'/'MQLLibraryPreview'; scripts=mql4/'Scripts'; templates=data/'templates'
+    indicators.mkdir(parents=True,exist_ok=True); scripts.mkdir(parents=True,exist_ok=True); templates.mkdir(parents=True,exist_ok=True); out_dir.mkdir(parents=True,exist_ok=True)
+    compiled=source if source.suffix.lower()=='.ex4' else source.with_suffix('.ex4')
+    if source.suffix.lower()=='.mq4':
+        rc,log=compile_mql(editor,source,mql4)
+        if not compiled.exists():
+            raise RuntimeError('MetaEditor could not compile this MQ4 indicator. '+(log[-900:] if log else f'Compiler exit code {rc}.'))
+    if not compiled.exists(): raise RuntimeError(f'Compiled EX4 file was not found: {compiled}')
+    dest_ex4=indicators/compiled.name
+    shutil.copy2(compiled,dest_ex4)
+    indicator_rel='MQLLibraryPreview\\'+compiled.stem
+    separate=source_is_separate(source)
+
+    template_name='MQLLibraryPreview.tpl'
+    template_path=templates/template_name
+    template_path.write_text(mt4_template(indicator_rel,separate),encoding='utf-8')
+
+    capture=scripts/'MQLLibraryPreviewCapture.mq4'
+    capture.write_text('''#property strict\nvoid OnStart(){\n Sleep(4500);\n ChartRedraw();\n ResetLastError();\n bool ok=WindowScreenShot("MQLLibraryPreview.gif",1200,720,-1,2,1);\n Print("MQLLIB_PREVIEW: screenshot=",ok," err=",GetLastError());\n Sleep(750);\n ChartClose(0);\n}\n''',encoding='utf-8')
+    rc,log=compile_mql(editor,capture,mql4)
+    capture_ex4=capture.with_suffix('.ex4')
+    if not capture_ex4.exists(): raise RuntimeError('Could not compile the MT4 preview capture script. '+(log[-900:] if log else f'Exit code {rc}.'))
+
+    screenshot_candidates=[mql4/'Files'/'MQLLibraryPreview.gif',data/'experts'/'files'/'MQLLibraryPreview.gif']
+    for shot in screenshot_candidates:
+        try: shot.unlink(missing_ok=True)
+        except Exception: pass
+    config=out_dir/'mt4-preview.ini'
+    config.write_text('Symbol=EURUSD\nPeriod=H1\nTemplate=MQLLibraryPreview.tpl\nScript=MQLLibraryPreviewCapture\n',encoding='utf-8')
+    subprocess.Popen([str(terminal),str(config)],cwd=str(terminal.parent),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    shot=wait_for_any(screenshot_candidates,35)
+    if not shot:
+        raise RuntimeError('MT4 opened but no preview screenshot was produced within 35 seconds. Check the MT4 Experts/Journal tabs, confirm EURUSD is available, and export Diagnostics so the preview failure can be inspected.')
+    final=out_dir/(source.stem+'_preview.gif')
+    shutil.copy2(shot,final)
+    return final
+
+
 def render(source_s:str,out_s:str,terminal_s:str|None=None):
     source=Path(source_s); out=Path(out_s)
     if not source.exists(): raise RuntimeError(f'Source file does not exist: {source}')
+    ext=source.suffix.lower()
+    if ext not in ('.mq4','.ex4','.mq5','.ex5'): raise RuntimeError(f'Unsupported preview file type: {ext}')
+    kind='MT5' if ext in ('.mq5','.ex5') else 'MT4'
     terms=enrich(candidates())
-    if source.suffix.lower() not in ('.mq5','.ex5'):
-        mt4=[t for t in terms if t['kind']=='MT4']
-        raise RuntimeError('Automated real-chart rendering currently supports MQ5/EX5 through MT5. MT4 was detected.' if mt4 else 'This is an MQ4/EX4 indicator and no supported MT5 source is available for automated rendering yet.')
-    eligible=[t for t in terms if t['kind']=='MT5' and t.get('editor')]
+    eligible=[t for t in terms if t['kind']==kind and t.get('editor')]
     if terminal_s:
-        eligible=[t for t in eligible if t['terminal'].lower()==terminal_s.lower()] or eligible
-    if not eligible: raise RuntimeError('MetaTrader 5 + MetaEditor 5 were not detected. Install/open MT5 first.')
-    result=render_mt5(source,out,eligible[0])
-    emit({'ok':True,'image':str(result),'terminal':eligible[0]})
+        exact=[t for t in eligible if t['terminal'].lower()==terminal_s.lower()]
+        if exact: eligible=exact
+    if not eligible: raise RuntimeError(f'{kind} + MetaEditor were not detected. Install/open {kind} once, then retry.')
+    if kind=='MT5': result=render_mt5(source,out,eligible[0])
+    else: result=render_mt4(source,out,eligible[0])
+    emit({'ok':True,'image':str(result),'terminal':eligible[0],'renderer':kind})
 
 
 def open_source(source_s:str):
