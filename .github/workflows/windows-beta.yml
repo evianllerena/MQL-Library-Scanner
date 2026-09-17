@@ -12,7 +12,7 @@ on:
       - 'preview_bridge.py'
       - 'preview_control.py'
       - 'main.js'
-      - 'v57.js'
+      - 'preview_ui.js'
       - 'index.html'
       - 'styles.css'
       - 'Cargo.toml'
@@ -51,7 +51,7 @@ jobs:
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
           Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
           Copy-Item "$r/main.js" 'ui/main.js' -Force
-          Copy-Item "$r/v57.js" 'ui/v57.js' -Force
+          Copy-Item "$r/preview_ui.js" 'ui/preview_ui.js' -Force
           Copy-Item "$r/index.html" 'index.html' -Force
           Copy-Item "$r/styles.css" 'ui/styles.css' -Force
           Copy-Item "$r/Cargo.toml" 'src-tauri/Cargo.toml' -Force
@@ -77,7 +77,8 @@ jobs:
           Set-Location $env:APP_DIR
           python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_control.py
           node --check ui/main.js
-          node --check ui/v57.js
+          node --check ui/preview_ui.js
+          if((Get-Content ui/preview_ui.js -Raw) -notmatch 'Create Archive Backup'){throw 'Archive button source missing'}
           python engine/preview_bridge.py detect
           if($LASTEXITCODE -ne 0){throw 'Preview detector failed'}
           python engine/preview_bridge.py self-test
@@ -137,6 +138,9 @@ jobs:
         run: |
           Set-Location $env:APP_DIR
           npm run tauri build
+          $bundle=(Get-ChildItem dist/assets -Filter '*.js' | Get-Content -Raw) -join "`n"
+          if($bundle -notmatch 'Create Archive Backup'){throw 'Archive button was not bundled into frontend'}
+          if($bundle -notmatch 'mql-preview-control'){throw 'Preview cancellation controller was not bundled into frontend'}
 
       - name: Frontend readiness smoke test
         shell: pwsh
@@ -174,6 +178,7 @@ jobs:
           Set-Location $env:APP_DIR
           $i=Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
           if(-not $i){throw 'Installer missing'}
+          if($i.Name -notmatch '0.5.7'){throw "Wrong installer version: $($i.Name)"}
           if(-not(Test-Path 'src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe')){throw 'Preview sidecar missing'}
           if(-not(Test-Path 'src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe')){throw 'Preview control sidecar missing'}
           Write-Host "Installer $($i.FullName)"
