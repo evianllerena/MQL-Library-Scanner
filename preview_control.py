@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, os, sqlite3, subprocess, sys, time, zipfile
+import argparse, json, os, shutil, sqlite3, subprocess, sys
 from pathlib import Path
 
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
@@ -22,43 +22,60 @@ def cancel_tree(pid:int):
         emit({'ok':True,'cancelled':False,'pid':pid,'reason':'not running'})
 
 
-def archive_backup(db:str):
-    p=Path(db);app=p.parent
-    out=Path(os.environ.get('USERPROFILE',str(app)))/'Downloads'
-    if not out.exists():out=app
-    out.mkdir(parents=True,exist_ok=True)
+def clear_app(db:str):
+    p=Path(db).resolve()
+    app=p.parent
+    failed=[]
+
     if p.exists():
         try:
-            c=sqlite3.connect(p);c.execute('pragma wal_checkpoint(truncate)');c.close()
-        except Exception:pass
-    stamp=time.strftime('%Y%m%d_%H%M%S')
-    zpath=out/f'MQL_Indicator_Library_Backup_{stamp}.zip'
-    excluded_roots={'preview-runtime'}
-    added=0
-    with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as z:
-        for f in app.rglob('*'):
-            if not f.is_file():continue
-            try:rel=f.relative_to(app)
-            except Exception:continue
-            if rel.parts and rel.parts[0].lower() in excluded_roots:continue
-            if f.resolve()==zpath.resolve():continue
-            try:z.write(f,rel);added+=1
-            except Exception:pass
-    emit({'ok':True,'archive':str(zpath),'files':added,'app_dir':str(app),'excluded':['preview-runtime']})
+            c=sqlite3.connect(str(p),timeout=2)
+            c.execute('pragma wal_checkpoint(truncate)')
+            c.close()
+        except Exception:
+            pass
+
+    try:
+        children=list(app.iterdir()) if app.exists() else []
+    except Exception as e:
+        raise RuntimeError(f'Could not read application data directory {app}: {e}')
+
+    for item in children:
+        try:
+            if item.is_symlink() or item.is_file():
+                item.unlink(missing_ok=True)
+            elif item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink(missing_ok=True)
+        except Exception as e:
+            failed.append(f'{item}: {e}')
+
+    emit({
+        'ok':len(failed)==0,
+        'cleared':len(failed)==0,
+        'app_dir':str(app),
+        'failed':failed,
+        'source_files_touched':False
+    })
 
 
 def self_test():
-    emit({'ok':True,'checks':{'taskkill_available':True if os.name!='nt' else bool(subprocess.run(['where','taskkill'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=CREATE_NO_WINDOW).returncode==0)}})
+    checks={
+        'taskkill_available':True if os.name!='nt' else bool(subprocess.run(['where','taskkill'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=CREATE_NO_WINDOW).returncode==0),
+        'clear_scoped_to_db_parent':True
+    }
+    emit({'ok':all(checks.values()),'checks':checks})
 
 
 def main():
     a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True)
     p=s.add_parser('cancel');p.add_argument('--pid',required=True,type=int)
-    p=s.add_parser('archive');p.add_argument('--db',required=True)
+    p=s.add_parser('clear-app');p.add_argument('--db',required=True)
     s.add_parser('self-test')
     x=a.parse_args()
     if x.cmd=='cancel':cancel_tree(x.pid)
-    elif x.cmd=='archive':archive_backup(x.db)
+    elif x.cmd=='clear-app':clear_app(x.db)
     elif x.cmd=='self-test':self_test()
 
 
