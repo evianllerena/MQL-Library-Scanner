@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, os, shutil, sqlite3, subprocess, sys
+import argparse, gc, json, os, shutil, sqlite3, subprocess, sys, time
 from pathlib import Path
 
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
@@ -22,25 +22,9 @@ def cancel_tree(pid:int):
         emit({'ok':True,'cancelled':False,'pid':pid,'reason':'not running'})
 
 
-def clear_app(db:str):
-    p=Path(db).resolve()
-    app=p.parent
-    failed=[]
-
-    if p.exists():
-        try:
-            c=sqlite3.connect(str(p),timeout=2)
-            c.execute('pragma wal_checkpoint(truncate)')
-            c.close()
-        except Exception:
-            pass
-
-    try:
-        children=list(app.iterdir()) if app.exists() else []
-    except Exception as e:
-        raise RuntimeError(f'Could not read application data directory {app}: {e}')
-
-    for item in children:
+def remove_item(item:Path):
+    last=None
+    for attempt in range(5):
         try:
             if item.is_symlink() or item.is_file():
                 item.unlink(missing_ok=True)
@@ -48,8 +32,44 @@ def clear_app(db:str):
                 shutil.rmtree(item)
             else:
                 item.unlink(missing_ok=True)
+            return None
+        except FileNotFoundError:
+            return None
         except Exception as e:
-            failed.append(f'{item}: {e}')
+            last=e
+            gc.collect()
+            time.sleep(0.12*(attempt+1))
+    return last
+
+
+def clear_app(db:str):
+    p=Path(db).resolve()
+    app=p.parent
+    failed=[]
+
+    conn=None
+    if p.exists():
+        try:
+            conn=sqlite3.connect(str(p),timeout=2)
+            conn.execute('pragma wal_checkpoint(truncate)')
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                try:conn.close()
+                except Exception:pass
+            conn=None
+            gc.collect()
+
+    try:
+        children=list(app.iterdir()) if app.exists() else []
+    except Exception as e:
+        raise RuntimeError(f'Could not read application data directory {app}: {e}')
+
+    for item in children:
+        err=remove_item(item)
+        if err is not None:
+            failed.append(f'{item}: {err}')
 
     emit({
         'ok':len(failed)==0,
