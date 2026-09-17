@@ -41,7 +41,7 @@ jobs:
           if(-not $app){throw 'Baseline app folder missing'}
           "APP_DIR=$($app.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Apply 0.5.7 source
+      - name: Apply 0.5.8 source
         shell: pwsh
         run: |
           $r=$env:GITHUB_WORKSPACE
@@ -78,7 +78,11 @@ jobs:
           python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_control.py
           node --check ui/main.js
           node --check ui/preview_ui.js
-          if((Get-Content ui/preview_ui.js -Raw) -notmatch 'Create Archive Backup'){throw 'Archive button source missing'}
+          $ui=Get-Content ui/preview_ui.js -Raw
+          if($ui -notmatch 'Clear Application / Start Fresh'){throw 'Clear application control source missing'}
+          if($ui -match 'Create Archive Backup'){throw 'Archive UI must not ship'}
+          if($ui -match '\bconfirm\s*\('){throw 'Native confirm dialog remains in preview UI'}
+          if($ui -notmatch 'existing\?\.dataset\.source===source'){throw 'Preview reinjection guard missing'}
           python engine/preview_bridge.py detect
           if($LASTEXITCODE -ne 0){throw 'Preview detector failed'}
           python engine/preview_bridge.py self-test
@@ -110,12 +114,27 @@ jobs:
           $c=& 'build-sidecar/mql-preview-control.exe' self-test 2>&1
           $c | ForEach-Object {Write-Host $_}
           if($LASTEXITCODE -ne 0 -or ($c -join "`n") -notmatch '"ok": true'){throw 'Packaged preview control failed'}
+
           $sample=Join-Path $env:RUNNER_TEMP 'mql-unicode'
           New-Item -ItemType Directory -Force -Path $sample | Out-Null
           '#property indicator_chart_window`nint OnInit(){return(INIT_SUCCEEDED);}' | Set-Content "$sample/Unicode_测试_Δ_é.mq4" -Encoding utf8
           $s=& 'build-sidecar/mql-engine.exe' scan --db "$sample/test.sqlite3" --source $sample 2>&1
           $s | ForEach-Object {Write-Host $_}
           if($LASTEXITCODE -ne 0 -or ($s -join "`n") -notmatch 'scan_complete'){throw 'Packaged scanner validation failed'}
+
+          $clearRoot=Join-Path $env:RUNNER_TEMP 'mql-clear-test'
+          $outside=Join-Path $env:RUNNER_TEMP 'source-file-must-survive.mq5'
+          Remove-Item $clearRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $outside -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$clearRoot/diagnostics" | Out-Null
+          '' | Set-Content "$clearRoot/library.sqlite3"
+          'diagnostic' | Set-Content "$clearRoot/diagnostics/test.log"
+          'source' | Set-Content $outside
+          $clear=& 'build-sidecar/mql-preview-control.exe' clear-app --db "$clearRoot/library.sqlite3" 2>&1
+          $clear | ForEach-Object {Write-Host $_}
+          if($LASTEXITCODE -ne 0 -or ($clear -join "`n") -notmatch '"ok": true'){throw 'Clear application control failed'}
+          if((Get-ChildItem $clearRoot -Force | Measure-Object).Count -ne 0){throw 'Clear application left app data behind'}
+          if(-not(Test-Path $outside)){throw 'Clear application touched a source file outside app data'}
 
       - name: Install frontend dependencies
         shell: pwsh
@@ -139,8 +158,9 @@ jobs:
           Set-Location $env:APP_DIR
           npm run tauri build
           $bundle=(Get-ChildItem dist/assets -Filter '*.js' | Get-Content -Raw) -join "`n"
-          if($bundle -notmatch 'Create Archive Backup'){throw 'Archive button was not bundled into frontend'}
-          if($bundle -notmatch 'mql-preview-control'){throw 'Preview cancellation controller was not bundled into frontend'}
+          if($bundle -notmatch 'Clear Application / Start Fresh'){throw 'Clear application control was not bundled into frontend'}
+          if($bundle -match 'Create Archive Backup'){throw 'Archive UI was bundled unexpectedly'}
+          if($bundle -notmatch 'mql-preview-control'){throw 'Preview control sidecar was not bundled into frontend'}
 
       - name: Frontend readiness smoke test
         shell: pwsh
@@ -178,7 +198,7 @@ jobs:
           Set-Location $env:APP_DIR
           $i=Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
           if(-not $i){throw 'Installer missing'}
-          if($i.Name -notmatch '0.5.7'){throw "Wrong installer version: $($i.Name)"}
+          if($i.Name -notmatch '0.5.8'){throw "Wrong installer version: $($i.Name)"}
           if(-not(Test-Path 'src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe')){throw 'Preview sidecar missing'}
           if(-not(Test-Path 'src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe')){throw 'Preview control sidecar missing'}
           Write-Host "Installer $($i.FullName)"
@@ -186,7 +206,7 @@ jobs:
       - name: Upload finished Setup.exe
         uses: actions/upload-artifact@v4
         with:
-          name: MQL-Indicator-Library-0.5.7-Windows-Setup
+          name: MQL-Indicator-Library-0.5.8-Windows-Setup
           path: ${{ env.APP_DIR }}/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 14
