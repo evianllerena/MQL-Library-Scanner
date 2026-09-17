@@ -1,6 +1,6 @@
 [package]
 name = "mql-indicator-library"
-version = "0.5.7"
+version = "0.5.8"
 description = "Local MQ4/MQ5 indicator library and truthful evidence-based classification manager"
 authors = ["MQL Indicator Library"]
 edition = "2021"
