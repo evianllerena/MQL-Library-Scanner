@@ -48,12 +48,11 @@ class Analysis:
     evidence: list[dict] = field(default_factory=list)
     classification_status: str = 'Unknown'
     review_reason: str = ''
-    classifier_version: str = 'evidence-v3'
+    classifier_version: str = 'evidence-v4'
     confidence: int = 0
     warnings: list[str] = field(default_factory=list)
     duplicate_of: str | None = None
     family_fingerprint: str = ''
-
 
 def read_text(path: Path) -> str:
     raw = path.read_bytes()
@@ -64,16 +63,13 @@ def read_text(path: Path) -> str:
             pass
     return raw.decode('latin1', errors='replace')
 
-
 def strip_comments(text: str) -> str:
     text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
     text = re.sub(r'//[^\r\n]*', ' ', text)
     return text
 
-
 def normalize_newlines(text: str) -> str:
     return text.replace('\r\n','\n').replace('\r','\n').replace('\x00','')
-
 
 def function_spans(code: str) -> list[tuple[str,int,int]]:
     pat = re.compile(r'(?m)^\s*(?:[\w:<>&*\[\]]+\s+)+(?P<name>[A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{')
@@ -90,7 +86,6 @@ def function_spans(code: str) -> list[tuple[str,int,int]]:
             spans.append((m.group('name'), m.start(), end))
     return spans
 
-
 def logic_code(code: str) -> tuple[str,bool]:
     spans=function_spans(code)
     compat_names={name for name,_,_ in spans if name.startswith('MQL4_') or name.startswith('__mql4_')}
@@ -103,17 +98,14 @@ def logic_code(code: str) -> tuple[str,bool]:
     parts.append(code[pos:])
     return '\n'.join(parts), True
 
-
 def count_actual_calls(code: str, name: str) -> int:
     total=len(re.findall(r'\b'+re.escape(name)+r'\s*\(', code))
     defs=len(re.findall(r'(?m)^\s*(?:[\w:<>&*\[\]]+\s+)+'+re.escape(name)+r'\s*\([^;{}]*\)\s*\{', code))
     return max(0,total-defs)
 
-
 def extract_int_property(code: str, prop: str) -> int:
     m=re.search(r'#property\s+'+re.escape(prop)+r'\s+(\d+)', code, re.I)
     return int(m.group(1)) if m else 0
-
 
 def infer_visual(a: Analysis) -> str:
     has_line=a.line_plots>0; has_hist=a.histogram_plots>0; has_arrow=a.arrow_plots>0; has_fill=a.filling_plots>0
@@ -127,13 +119,11 @@ def infer_visual(a: Analysis) -> str:
     if a.object_usage: return 'Objects'
     return 'Unknown'
 
-
 def add_evidence(evidence: list[dict], scores: dict[str,float], category: str, weight: float, kind: str, detail: str, technique: str | None = None):
     scores[category] = scores.get(category, 0.0) + weight
     item={'category':category,'weight':round(weight,2),'kind':kind,'detail':detail}
     if technique: item['technique']=technique
     evidence.append(item)
-
 
 def structural_fingerprint(logic: str) -> str:
     normalized = re.sub(r'"(?:\\.|[^"\\])*"', '"STR"', logic)
@@ -142,6 +132,8 @@ def structural_fingerprint(logic: str) -> str:
     tokens = re.findall(r'[a-z_][a-z0-9_]*|[+\-*/<>=!&|]+', normalized)
     return hashlib.sha256(' '.join(tokens[:12000]).encode('utf-8', errors='ignore')).hexdigest()
 
+def _has(logic: str, pattern: str, flags=re.I) -> bool:
+    return bool(re.search(pattern, logic, flags))
 
 def classify(filename: str, logic: str, stds: list[str], a: Analysis):
     scores={k:0.0 for k in CATEGORIES if k not in ('Unknown','Custom / Specialized','Composite / Multi-Purpose')}
@@ -161,35 +153,73 @@ def classify(filename: str, logic: str, stds: list[str], a: Analysis):
             add_evidence(evidence,scores,'Support/Resistance',14,'derived_behavior','Fractals identify local extrema')
             add_evidence(evidence,scores,'Signal',8,'derived_behavior','Fractal events may be used as signals')
 
-    if re.search(r'\b(?:Volume|tick_volume|real_volume)\b', logic, re.I):
-        add_evidence(evidence,scores,'Volume',14,'data_dependency','Uses volume/tick-volume data'); techniques.append('Volume analysis')
-    if re.search(r'\b(?:MathSqrt|MathPow|StdDev|variance|deviation|correlation|regression)\b', logic, re.I):
+    if _has(logic, r'\b(?:MODE_SMA|MODE_EMA|MODE_SMMA|MODE_LWMA|ExponentialMA|SimpleMA|LinearWeightedMA|MovingAverage)\b'):
+        add_evidence(evidence,scores,'Trend',18,'formula','Moving-average/smoothing formula or mode detected'); techniques.append('Moving-average / smoothing')
+    if _has(logic, r'\b(?:ema|sma|smma|lwma|moving\s*average|mafast|maslow|fastma|slowma)\b') and _has(logic, r'\[[^\]]+\]'):
+        add_evidence(evidence,scores,'Trend',10,'formula','Custom moving-average style series logic detected')
+    if _has(logic, r'\b(?:slope|linearregression|linreg|least\s*squares)\b'):
+        add_evidence(evidence,scores,'Trend',12,'formula','Slope/regression trend logic detected'); techniques.append('Slope / regression')
+    if _has(logic, r'\b(?:MathSqrt|MathPow|StdDev|variance|deviation|correlation|regression)\b'):
         add_evidence(evidence,scores,'Statistical',16,'formula','Statistical/deviation mathematics detected'); techniques.append('Statistical calculation')
-    if re.search(r'\b(?:iHighest|iLowest)\s*\(|\bHigh\s*\[.*?\].*?\bLow\s*\[', logic, re.I|re.S):
+    if _has(logic, r'\b(?:High|high)\s*\[[^\]]+\]\s*-\s*(?:Low|low)\s*\[[^\]]+\]') or _has(logic, r'\b(?:true\s*range|truerange|rangebuffer)\b'):
+        add_evidence(evidence,scores,'Volatility',14,'formula','Price-range / true-range style formula detected'); techniques.append('Range / volatility')
+    if _has(logic, r'\b(?:upperband|lowerband|upper_band|lower_band|channel|envelope)\b'):
+        add_evidence(evidence,scores,'Volatility',10,'structure','Upper/lower band or channel structure detected')
+        add_evidence(evidence,scores,'Support/Resistance',6,'structure','Band/channel boundaries may act as dynamic levels')
+    if _has(logic, r'\b(?:Volume|tick_volume|real_volume)\b'):
+        add_evidence(evidence,scores,'Volume',14,'data_dependency','Uses volume/tick-volume data'); techniques.append('Volume analysis')
+    if _has(logic, r'\b(?:iHighest|iLowest)\s*\(|\bHigh\s*\[.*?\].*?\bLow\s*\[', re.I|re.S):
         add_evidence(evidence,scores,'Support/Resistance',12,'price_structure','High/low extrema logic detected'); techniques.append('Extrema / levels')
-    if re.search(r'\b(?:swing|bos|choch|break\s*of\s*structure|market\s*structure)\b', logic, re.I):
-        add_evidence(evidence,scores,'Market Structure',22,'behavior','Market-structure terminology/logic detected'); techniques.append('Market structure')
-    if re.search(r'\b(?:Open|High|Low|Close)\s*\[[^\]]+\].*\b(?:Open|High|Low|Close)\s*\[', logic, re.I|re.S):
+    if _has(logic, r'\b(?:pivot|support|resistance|fib(?:o|onacci)?|retracement)\b'):
+        add_evidence(evidence,scores,'Support/Resistance',16,'price_structure','Pivot/support/resistance/Fibonacci logic detected'); techniques.append('Levels / pivots')
+    if _has(logic, r'\b(?:swing|bos|choch|break\s*of\s*structure|market\s*structure|higher\s*high|lower\s*low)\b'):
+        add_evidence(evidence,scores,'Market Structure',22,'behavior','Market-structure logic detected'); techniques.append('Market structure')
+    if _has(logic, r'\b(?:Open|High|Low|Close)\s*\[[^\]]+\].*\b(?:Open|High|Low|Close)\s*\[', re.I|re.S):
         add_evidence(evidence,scores,'Price Action',8,'price_dependency','Direct multi-price-bar calculations detected')
-    if re.search(r'\b(?:Heiken|haOpen|haClose|haHigh|haLow)\b', logic, re.I):
+    if _has(logic, r'\b(?:bullish|bearish|engulf|doji|pinbar|pin\s*bar|inside\s*bar|outside\s*bar)\b'):
+        add_evidence(evidence,scores,'Price Action',16,'pattern','Candlestick/price-action pattern logic detected'); techniques.append('Candlestick pattern')
+    if _has(logic, r'\b(?:Heiken|haOpen|haClose|haHigh|haLow)\b'):
         add_evidence(evidence,scores,'Price Action',24,'formula','Heiken Ashi-style calculation detected','Heiken Ashi'); techniques.append('Heiken Ashi')
-    if re.search(r'\b(?:cross|crossover|crossunder)\b', logic, re.I) or re.search(r'\[[^\]]*\]\s*[<>]\s*[^;\n]+\[[^\]]*\]',logic):
+    if _has(logic, r'\b(?:cross|crossover|crossunder)\b') or _has(logic, r'\[[^\]]*\]\s*[<>]\s*[^;\n]+\[[^\]]*\]'):
         add_evidence(evidence,scores,'Signal',10,'behavior','Cross/comparison signal logic detected'); tags.append('Crossover / comparative signal')
-    if re.search(r'\b(?:divergen|bullish divergence|bearish divergence)\b', logic, re.I):
+    if _has(logic, r'\b(?:divergen|bullish divergence|bearish divergence)\b'):
         add_evidence(evidence,scores,'Signal',20,'behavior','Divergence logic detected'); tags.append('Divergence')
-    if re.search(r'\b(?:breakout|break\s+above|break\s+below)\b', logic, re.I):
+    if _has(logic, r'\b(?:breakout|break\s+above|break\s+below)\b'):
         add_evidence(evidence,scores,'Signal',12,'behavior','Breakout logic detected'); add_evidence(evidence,scores,'Support/Resistance',8,'behavior','Breakout references price boundaries'); tags.append('Breakout')
-    if re.search(r'\b(?:70|80)\b.*\b(?:30|20)\b|\boverbought\b|\boversold\b', logic, re.I|re.S):
+    if _has(logic, r'\b(?:70|80)\b.*\b(?:30|20)\b|\boverbought\b|\boversold\b', re.I|re.S):
         add_evidence(evidence,scores,'Oscillator',12,'threshold','Overbought/oversold threshold behavior detected'); tags.append('Overbought/Oversold')
-    if re.search(r'\b(?:Alert|SendNotification|SendMail)\s*\(', logic, re.I):
+    if _has(logic, r'\b(?:SetLevelValue|indicator_level\d+|indicator_minimum|indicator_maximum)\b'):
+        add_evidence(evidence,scores,'Oscillator',10,'visual_structure','Separate-window level/boundary metadata detected')
+    if a.display_location=='Separate Window' and (a.histogram_plots>0 or a.line_plots>0):
+        add_evidence(evidence,scores,'Oscillator',6,'visual_structure','Separate-window plotted series supports oscillator-style behavior')
+    if _has(logic, r'\b(?:Alert|SendNotification|SendMail)\s*\('):
         add_evidence(evidence,scores,'Signal',8,'output','Alert/notification output detected'); tags.append('Alerts')
     if a.arrow_plots:
         add_evidence(evidence,scores,'Signal',14,'visual_output','Arrow/icon plot output detected'); tags.append('Event markers')
-    if a.object_usage: add_evidence(evidence,scores,'Support/Resistance',6,'visual_output','Chart-object drawing detected')
-    if re.search(r'\b(?:OBJ_HLINE|OBJ_TREND|OBJ_RECTANGLE|OBJ_FIBO)\b', logic, re.I):
+    if a.histogram_plots and a.display_location=='Separate Window':
+        add_evidence(evidence,scores,'Oscillator',6,'visual_output','Separate-window histogram detected')
+    if a.filling_plots:
+        add_evidence(evidence,scores,'Volatility',6,'visual_output','Filled band/zone plot detected')
+    if a.object_usage:
+        add_evidence(evidence,scores,'Support/Resistance',6,'visual_output','Chart-object drawing detected')
+    if _has(logic, r'\b(?:OBJ_HLINE|OBJ_TREND|OBJ_RECTANGLE|OBJ_FIBO)\b'):
         add_evidence(evidence,scores,'Support/Resistance',12,'visual_output','Support/resistance-style chart objects detected')
-    if re.search(r'\b(?:ObjectCreate|Comment|Print)\s*\(', logic, re.I) and not stds:
-        add_evidence(evidence,scores,'Utility',6,'utility_behavior','Utility/display behavior detected without strong indicator dependency')
+    if _has(logic, r'\b(?:ObjectCreate|Comment|Print)\s*\(') and not stds and not (a.line_plots or a.histogram_plots or a.arrow_plots or a.filling_plots):
+        add_evidence(evidence,scores,'Utility',12,'utility_behavior','Object/text utility behavior detected without numeric plots')
+
+    fname=filename.lower()
+    filename_hints=[
+        ('Trend', r'\b(?:trend|supertrend|ma|ema|sma|hull|tema|dema)\b'),
+        ('Oscillator', r'\b(?:osc|rsi|stoch|cci|wpr|macd)\b'),
+        ('Volatility', r'\b(?:atr|volatility|band|channel)\b'),
+        ('Support/Resistance', r'\b(?:support|resistance|pivot|fibo|sr)\b'),
+        ('Signal', r'\b(?:signal|arrow|alert|entry|exit)\b'),
+        ('Volume', r'\b(?:volume|obv|mfi)\b'),
+        ('Price Action', r'\b(?:candle|price\s*action|heiken|engulf|pinbar)\b'),
+    ]
+    for cat,pat in filename_hints:
+        if scores.get(cat,0)>=8 and re.search(pat, fname, re.I):
+            add_evidence(evidence,scores,cat,4,'filename_support','Filename agrees with source-derived evidence; used only as a weak reinforcement')
 
     ranked=sorted(scores.items(), key=lambda kv:kv[1], reverse=True)
     positive=[(c,s) for c,s in ranked if s>0]
@@ -197,23 +227,26 @@ def classify(filename: str, logic: str, stds: list[str], a: Analysis):
         return 'Unknown', [], sorted(set(tags)), sorted(set(techniques)), evidence, 20, 'Unknown', 'No reliable functional evidence detected'
 
     best,bestscore=positive[0]; secondscore=positive[1][1] if len(positive)>1 else 0
+    best_evidence=[e for e in evidence if e['category']==best]
+    source_kinds={e['kind'] for e in best_evidence if e['kind']!='filename_support'}
     independent=[c for c,s in positive if s>=max(14,bestscore*0.55)]
     if len(independent)>=2 and secondscore>=18 and secondscore/bestscore>=0.60:
         primary='Composite / Multi-Purpose'; secondary=independent[:5]
         confidence=min(92,int(55+min(25,bestscore/2)+min(12,secondscore/3)))
-        status='High Confidence' if confidence>=85 else 'Probable'; reason='Multiple independent functional families have strong evidence'
-    elif bestscore>=24:
-        primary=best; secondary=[c for c,s in positive[1:] if s>=max(12,bestscore*0.45)][:5]
-        evidence_count=sum(1 for e in evidence if e['category']==best); margin=max(0,bestscore-secondscore)
-        confidence=min(97,int(58+min(22,bestscore/2)+min(10,margin/3)+min(7,evidence_count*2)))
+        status='High Confidence' if confidence>=85 else 'Probable'; reason='Multiple independent functional families have strong source evidence'
+    elif bestscore>=20 and (len(source_kinds)>=2 or any(e['kind']=='active_builtin' for e in best_evidence)):
+        primary=best; secondary=[c for c,s in positive[1:] if s>=max(10,bestscore*0.42)][:5]
+        evidence_count=len(best_evidence); margin=max(0,bestscore-secondscore)
+        confidence=min(97,int(60+min(20,bestscore/2)+min(9,margin/3)+min(8,evidence_count*2)))
         status='High Confidence' if confidence>=85 else ('Probable' if confidence>=70 else 'Needs Review')
-        reason='' if status!='Needs Review' else 'Evidence is present but not strong enough for automatic trust'
+        reason='' if status!='Needs Review' else 'Evidence is coherent but still below the automatic-trust threshold'
     else:
         primary='Custom / Specialized' if (a.custom_dependencies or len(evidence)>=2) else 'Unknown'
-        secondary=[c for c,s in positive if s>=8][:5]; confidence=min(69,int(35+bestscore)); status='Needs Review'
+        secondary=[c for c,s in positive if s>=8][:5]
+        confidence=min(69,int(35+bestscore))
+        status='Needs Review'
         reason='Some functional evidence exists, but it is insufficient for a definitive standard category'
     return primary,secondary,sorted(set(tags)),sorted(set(techniques)),evidence,confidence,status,reason
-
 
 def analyze(path: Path) -> Analysis:
     text=normalize_newlines(read_text(path)); code=strip_comments(text)
