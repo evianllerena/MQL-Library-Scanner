@@ -82,6 +82,13 @@ def emit(o):
     sys.stdout.buffer.write(b); sys.stdout.buffer.flush()
 
 
+def emit_stage(job_id,name,message=None,**details):
+    payload={'type':'stage','job_id':job_id,'stage':name}
+    if message:payload['message']=message
+    payload.update(details)
+    emit(payload)
+
+
 def read_text(p):
     if not p.exists(): return ''
     for enc in ('utf-16','utf-8','cp1252','latin1'):
@@ -295,17 +302,83 @@ def wait_quiet(root,proc=None,minimum=4,quiet=3,timeout=35):
     return False
 
 
-def prime_mt5_runtime(rt,terminal,symbol='EURUSD'):
-    marker=rt/'.mt5-preview-prime-v2'
-    if marker.exists():return
-    cfg=rt/'mql-prime.ini';cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={symbol}\nPeriod=H1\n',encoding='utf-8')
+def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
+    marker=rt/'.mt5-preview-prime-v3'
+    if marker.exists():
+        emit_stage(job_id,'mt5_prime_cached','MT5 preview runtime is already initialized.')
+        return
+
+    cfg=rt/f'mql-prime-{safe_job_id(job_id)}.ini'
+    cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={symbol}\nPeriod=H1\n',encoding='utf-8')
+    emit_stage(job_id,'mt5_prime_start','Initializing isolated MT5 runtime. First use can take longer while MetaTrader prepares its MQL5 files.')
     proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
+
+    start=time.monotonic()
+    last_any_change=start
+    last_meta_change=start
+    last_all_sig=None
+    last_meta_sig=None
+    saw_recompile=False
+    saw_meta_activity_after_recompile=False
     settled=False
+    announced_recompile=False
+
     try:
-        settled=wait_quiet(rt/'logs',proc=proc)
+        while time.monotonic()-start<120:
+            now=time.monotonic()
+            if proc.poll() is not None and now-start<5:
+                break
+
+            rows=[]
+            log_root=rt/'logs'
+            if log_root.exists():
+                for p in log_root.rglob('*.log'):
+                    try:rows.append((str(p),p.stat().st_size,p.stat().st_mtime_ns))
+                    except Exception:pass
+            all_sig=tuple(sorted(rows))
+            if all_sig!=last_all_sig:
+                last_all_sig=all_sig
+                last_any_change=now
+
+            meta=log_root/'metaeditor.log'
+            try:meta_sig=(meta.stat().st_size,meta.stat().st_mtime_ns)
+            except Exception:meta_sig=None
+            if meta_sig!=last_meta_sig:
+                if saw_recompile and last_meta_sig is not None:
+                    saw_meta_activity_after_recompile=True
+                last_meta_sig=meta_sig
+                last_meta_change=now
+
+            tails=latest_logs(log_root)
+            if not saw_recompile and 'full recompilation has been started' in tails.lower():
+                saw_recompile=True
+                last_meta_change=now
+                if not announced_recompile:
+                    emit_stage(job_id,'mt5_full_recompile','MetaTrader is performing its one-time MQL5 runtime compilation. Waiting for it to finish before rendering.')
+                    announced_recompile=True
+
+            elapsed=now-start
+            if saw_recompile:
+                if saw_meta_activity_after_recompile and elapsed>=8 and now-last_meta_change>=5:
+                    settled=True
+                    break
+            elif elapsed>=8 and now-last_any_change>=5:
+                settled=True
+                break
+
+            if int(elapsed)%15==0 and elapsed>=15:
+                time.sleep(.55)
+            else:
+                time.sleep(.5)
     finally:
         terminate_tree(proc)
-    if settled:marker.write_text(str(int(time.time())),encoding='utf-8')
+
+    if not settled:
+        emit_stage(job_id,'mt5_prime_timeout','MT5 runtime initialization did not reach a verified idle state.',elapsed_ms=round((time.monotonic()-start)*1000))
+        raise RuntimeError('MT5 preview runtime initialization timed out before MetaTrader became idle.')
+
+    marker.write_text(f'ready-v3\n{int(time.time())}',encoding='utf-8')
+    emit_stage(job_id,'mt5_prime_ready','MT5 preview runtime initialization completed.',elapsed_ms=round((time.monotonic()-start)*1000))
 
 
 def wait_image(proc,paths,timeout=50):
@@ -367,37 +440,52 @@ def mt5_capture_source(rel,shot,win):
 
 
 def render_mt4(src,out,t,job_id):
+    emit_stage(job_id,'runtime_clone','Preparing isolated MT4 runtime.')
     rt=clone_runtime(t,out,'MT4');mql=rt/'MQL4';scripts=mql/'Scripts';templates=rt/'templates';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,templates,files)]
-    editor=rt/'metaeditor.exe';terminal=rt/'terminal.exe';sym=copy_mt4_history(Path(t['data_dir']),rt);job,staged,binary,meta=stage(src,mql,'MT4',editor);rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
+    editor=rt/'metaeditor.exe';terminal=rt/'terminal.exe';sym=copy_mt4_history(Path(t['data_dir']),rt)
+    emit_stage(job_id,'indicator_compile','Compiling/staging the selected MT4 indicator.')
+    job,staged,binary,meta=stage(src,mql,'MT4',editor);rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
     tplname=f'MQLLibraryPreview_{job}.tpl';tpl=templates/tplname;sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0';tpl.write_text(f'<chart>\nsymbol={sym}\nperiod=60\ngraph=1\ngrid=1\n<window>\nheight=420\n<indicator>\nname=main\n</indicator>\n<indicator>\nname=Custom Indicator\n<expert>\nname={rel}\nflags=339\nwindow_num={win}\n</expert>\nshow_data=1\n</indicator>\n</window>\n</chart>\n')
     shot=f'MQLLibraryPreview_{job}.gif';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq4';cap.write_text(f'#property strict\nvoid OnStart(){{Print("MQLLIB_PREVIEW stage=onstart");Sleep(3000);WindowRedraw();ResetLastError();bool ok=WindowScreenShot("{shot}",1200,720);Print("MQLLIB_PREVIEW stage=screenshot ok=",ok," err=",GetLastError());Sleep(300);TerminalClose(ok?0:23);return;}}\n')
+    emit_stage(job_id,'capture_compile','Compiling MT4 capture script.')
     built,_,log=compile_file(editor,cap,mql)
     if not built:raise RuntimeError('Preview renderer compile failed — could not compile MT4 capture script. '+log[-1600:])
     targets=[files/shot,rt/shot,mql/shot];[p.unlink(missing_ok=True) for p in targets]
     cfg=rt/'config'/f'mql-preview-{job_id}.ini';cfg.parent.mkdir(parents=True,exist_ok=True);cfg.write_text(f'Symbol={sym}\nPeriod=H1\nTemplate={tplname}\nScript={cap.stem}\n')
-    proc=subprocess.Popen([str(terminal),'/portable',str(cfg)],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo());img=wait_image(proc,targets)
+    emit_stage(job_id,'terminal_launch','Launching isolated MT4 terminal for screenshot capture.')
+    proc=subprocess.Popen([str(terminal),'/portable',str(cfg)],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
+    emit_stage(job_id,'screenshot_wait','Waiting for MT4 chart screenshot.')
+    img=wait_image(proc,targets)
     if not img:
         logs=(latest_logs(rt/'logs')+'\n'+latest_logs(mql/'Logs'))[-5000:]; trace=preview_trace(logs); rc=proc.poll()
         terminate_tree(proc)
         raise RuntimeError(f'Preview renderer failed — MT4 produced no screenshot. exit={rc}; runtime={rt}; config={cfg}; symbol={sym}. Trace:\n{trace or "(no capture trace)"}\nLogs:\n{logs}')
+    emit_stage(job_id,'screenshot_ready','MT4 screenshot captured.')
     final=out/(hashlib.sha1(('MT4|'+str(src.resolve()).lower()).encode()).hexdigest()[:16]+'.gif');out.mkdir(parents=True,exist_ok=True);shutil.copy2(img,final);meta.update({'isolated_runtime':str(rt),'symbol':sym,'staged':str(staged),'binary':str(binary),'job_id':job_id,'config':str(cfg)});return final,meta
 
 
 def render_mt5(src,out,t,job_id):
+    emit_stage(job_id,'runtime_clone','Preparing isolated MT5 runtime.')
     rt=clone_runtime(t,out,'MT5');mql=rt/'MQL5';scripts=mql/'Scripts';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,files)]
     editor=rt/'metaeditor64.exe';terminal=rt/'terminal64.exe';sym=copy_mt5_history(Path(t['data_dir']),rt)
-    prime_mt5_runtime(rt,terminal,sym)
+    prime_mt5_runtime(rt,terminal,sym,job_id)
+    emit_stage(job_id,'indicator_compile','Compiling/staging the selected MT5 indicator.')
     job,staged,binary,meta=stage(src,mql,'MT5',editor);rel=f'MQLLibraryPreview\\{job}\\{binary.stem}';shot=f'MQLLibraryPreview_{job}.png';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq5';sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0'
     cap.write_text(mt5_capture_source(rel,shot,win),encoding='utf-8')
+    emit_stage(job_id,'capture_compile','Compiling MT5 capture script.')
     built,_,log=compile_file(editor,cap,mql)
     if not built:raise RuntimeError('Preview renderer compile failed — could not compile MT5 capture script. '+log[-1600:])
     targets=[files/shot,rt/shot];[p.unlink(missing_ok=True) for p in targets]
-    cfg=rt/f'mql-preview-{job_id}.ini';cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={sym}\nPeriod=H1\nScript={cap.stem}\nShutdownTerminal=1\n')
-    proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo());img=wait_image(proc,targets)
+    cfg=rt/f'mql-preview-{job_id}.ini';cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={sym}\nPeriod=H1\nScript={cap.stem}\nShutdownTerminal=Yes\n')
+    emit_stage(job_id,'terminal_launch','Launching isolated MT5 terminal for screenshot capture.')
+    proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
+    emit_stage(job_id,'screenshot_wait','Waiting for MT5 chart screenshot.')
+    img=wait_image(proc,targets)
     if not img:
         logs=(latest_logs(rt/'logs')+'\n'+latest_logs(mql/'Logs'))[-7000:]; trace=preview_trace(logs); rc=proc.poll()
         terminate_tree(proc)
         raise RuntimeError(f'Preview renderer failed — MT5 produced no screenshot. exit={rc}; runtime={rt}; config={cfg}; symbol={sym}. Trace:\n{trace or "(no capture trace)"}\nLogs:\n{logs}')
+    emit_stage(job_id,'screenshot_ready','MT5 screenshot captured.')
     final=out/(hashlib.sha1(('MT5|'+str(src.resolve()).lower()).encode()).hexdigest()[:16]+'.png');out.mkdir(parents=True,exist_ok=True);shutil.copy2(img,final);meta.update({'isolated_runtime':str(rt),'symbol':sym,'staged':str(staged),'binary':str(binary),'job_id':job_id,'config':str(cfg)});return final,meta
 
 
@@ -428,6 +516,7 @@ def self_test():
         'compile_error_fast_fail':compile_has_errors('Result: 3 errors, 1 warnings'),
         'compile_zero_errors_not_failure':not compile_has_errors('Result: 0 errors, 2 warnings'),
         'job_id_sanitized':safe_job_id('job id:123')=='job-id-123',
+        'mt5_prime_v3_marker':'.mt5-preview-prime-v3'.endswith('prime-v3'),
     }
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
     emit({'ok':True,'checks':checks})
