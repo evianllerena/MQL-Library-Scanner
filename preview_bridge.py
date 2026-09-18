@@ -257,8 +257,7 @@ def compile_file(editor,src,mqlroot):
         end=time.monotonic()+3.0
         latest=''
         while time.monotonic()<end:
-            if expected.exists() and expected.stat().st_size:return expected,attempts,read_text(log)
-            latest=read_text(log)
+            if expected.exists() and expected.stat().st_size:return expected,attempts,read_text(log)            latest=read_text(log)
             if compile_has_errors(latest):return None,attempts,latest
             time.sleep(.15)
         latest=read_text(log)
@@ -517,8 +516,7 @@ def preview_trace(logs):
 
 def mt5_capture_source(rel,shot,win):
     return (
-        'void OnStart(){\n'
-        ' Print("MQLLIB_PREVIEW stage=onstart");\n'
+        'void OnStart(){\n'        ' Print("MQLLIB_PREVIEW stage=onstart");\n'
         ' ResetLastError();\n'
         f' Print("MQLLIB_PREVIEW stage=before_iCustom path={rel}");\n'
         f' int h=iCustom(_Symbol,_Period,"{rel}");\n'
@@ -596,9 +594,14 @@ def render_mt5(src,out,t,job_id):
     final=out/(hashlib.sha1(('MT5|'+str(src.resolve()).lower()).encode()).hexdigest()[:16]+'.png');out.mkdir(parents=True,exist_ok=True);shutil.copy2(img,final);meta.update({'isolated_runtime':str(rt),'symbol':sym,'staged':str(staged),'binary':str(binary),'job_id':job_id,'config':str(cfg)});return final,meta
 
 
-def render(source,out,terminal=None,job_id=None):
-    src=Path(source);dest=Path(out);job_id=safe_job_id(job_id);kind='MT5' if src.suffix.lower() in ('.mq5','.ex5') else 'MT4';ts=[x for x in terminals() if x['kind']==kind and x.get('editor') and x.get('data_dir')]
-    if terminal:ts=[x for x in ts if x['terminal'].lower()==terminal.lower()] or ts
+def preview_runtime(source,terminal=None):
+    src=Path(source)
+    if not src.exists() or not src.is_file():
+        raise RuntimeError(f'Preview source was not found: {src}')
+    kind='MT5' if src.suffix.lower() in ('.mq5','.ex5') else 'MT4'
+    ts=[x for x in terminals() if x['kind']==kind and x.get('terminal') and x.get('editor') and x.get('data_dir')]
+    if terminal:
+        ts=[x for x in ts if x['terminal'].lower()==terminal.lower()] or ts
     if not ts:
         base=Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'
         observed=[]
@@ -608,6 +611,27 @@ def render(source,out,terminal=None,job_id=None):
                     observed.append({'data_dir':str(d),'origin':read_origin(d/'origin.txt'),'has_mql4':(d/'MQL4').exists(),'has_mql5':(d/'MQL5').exists()})
         raise RuntimeError(f'{kind} + MetaEditor data directory were not detected. Observed terminal data folders: {json.dumps(observed,ensure_ascii=False)}')
     selected=ts[0]
+    checks={
+        'source':src.exists() and src.is_file(),
+        'terminal':Path(selected['terminal']).is_file(),
+        'metaeditor':Path(selected['editor']).is_file(),
+        'data_dir':Path(selected['data_dir']).is_dir(),
+        'mql_dir':(Path(selected['data_dir'])/kind).is_dir(),
+    }
+    missing=[name for name,ok in checks.items() if not ok]
+    if missing:
+        raise RuntimeError(f'Preview preflight failed for {kind}: missing or invalid {", ".join(missing)}.')
+    return src,kind,selected,checks
+
+
+def preflight(source,terminal=None):
+    src,kind,selected,checks=preview_runtime(source,terminal)
+    emit({'ok':True,'preflight':True,'source':str(src),'kind':kind,'terminal':selected,'checks':checks})
+
+
+def render(source,out,terminal=None,job_id=None):
+    src,kind,selected,_checks=preview_runtime(source,terminal)
+    dest=Path(out);job_id=safe_job_id(job_id)
     emit_stage(job_id,'terminal_selected',f'Using {kind} data folder: {selected["data_dir"]}',kind=kind,install_dir=selected['install_dir'],data_dir=selected['data_dir'])
     lock_path=dest.parent/'preview-runtime'/'.render.lock'
     with RenderLock(lock_path,timeout=5.0):
@@ -643,9 +667,10 @@ def self_test():
 
 
 def main():
-    a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True);s.add_parser('detect');s.add_parser('self-test');p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p=s.add_parser('open-source');p.add_argument('--source',required=True);p=s.add_parser('memory-stats');p.add_argument('--db',required=True);p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True);p=s.add_parser('archive-reset');p.add_argument('--db',required=True);x=a.parse_args()
+    a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True);s.add_parser('detect');s.add_parser('self-test');p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--terminal');p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p=s.add_parser('open-source');p.add_argument('--source',required=True);p=s.add_parser('memory-stats');p.add_argument('--db',required=True);p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True);p=s.add_parser('archive-reset');p.add_argument('--db',required=True);x=a.parse_args()
     if x.cmd=='detect':detect()
     elif x.cmd=='self-test':self_test()
+    elif x.cmd=='preflight':preflight(x.source,x.terminal)
     elif x.cmd=='render':render(x.source,x.out,x.terminal,x.job_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
