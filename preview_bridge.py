@@ -344,6 +344,23 @@ def existing_binary(src,ext):
     if p.exists() and p.stat().st_size:return p
     return None
 
+def find_live_binary(src,ext,data_dir):
+    """Find an already-compiled indicator binary (.ex4/.ex5) in the live terminal's
+    Indicators tree, matched by the source file's name. Lets the preview reuse the
+    working binary the terminal already runs when the source won't compile in isolation."""
+    if not data_dir:return None
+    try:base=Path(data_dir)/('MQL5' if ext=='.ex5' else 'MQL4')/'Indicators'
+    except Exception:return None
+    if not base.is_dir():return None
+    name=src.stem+ext
+    direct=base/name
+    if direct.is_file() and direct.stat().st_size:return direct
+    try:
+        for cand in base.rglob(name):
+            if cand.is_file() and cand.stat().st_size:return cand
+    except Exception:pass
+    return None
+
 def copy_compiled_support(src,dst,kind):
     dst.mkdir(parents=True,exist_ok=True)
     if not src.exists():return
@@ -410,13 +427,13 @@ def clone_runtime(t,out,kind):
     if missing:raise RuntimeError(f'Preview sandbox initialization failed for {kind}: {", ".join(missing)}')
     return rt
 
-def stage(src,mql,kind,editor):
+def stage(src,mql,kind,editor,data_dir=None):
     ext='.ex5' if kind=='MT5' else '.ex4'; job=hashlib.sha1(str(src.resolve()).lower().encode()).hexdigest()[:14]; d=mql/'Indicators'/'MQLLibraryPreview'/job;d.mkdir(parents=True,exist_ok=True)
     staged=d/safe_name(src); shutil.copy2(src,staged)
     for dep in src.parent.glob('*.mqh'):
         try:shutil.copy2(dep,d/dep.name)
         except Exception:pass
-    binary=d/(staged.stem+ext); old=existing_binary(src,ext)
+    binary=d/(staged.stem+ext); old=existing_binary(src,ext) or find_live_binary(src,ext,data_dir)
     if old:shutil.copy2(old,binary);return job,staged,binary,{'used_existing_binary':True,'existing_binary':str(old)}
     if src.suffix.lower() not in ('.mq4','.mq5'):raise RuntimeError(f'Indicator compile failed — {kind} executable could not be staged.')
     built,cmds,log=compile_file(editor,staged,mql)
@@ -608,7 +625,7 @@ def render_mt4(src,out,t,job_id):
     rt=clone_runtime(t,out,'MT4');mql=rt/'MQL4';scripts=mql/'Scripts';templates=rt/'templates';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,templates,files)]
     editor=rt/Path(t['editor']).name;terminal=rt/Path(t['terminal']).name;sym=copy_mt4_history(Path(t['data_dir']),rt)
     emit_stage(job_id,'indicator_compile','Compiling/staging the selected MT4 indicator.')
-    job,staged,binary,meta=stage(src,mql,'MT4',editor);emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT4 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT4 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
+    job,staged,binary,meta=stage(src,mql,'MT4',editor,t.get('data_dir'));emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT4 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT4 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
     tplname=f'MQLLibraryPreview_{job}.tpl';tpl=templates/tplname;sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0';tpl.write_text(f'<chart>\nsymbol={sym}\nperiod=60\ngraph=1\ngrid=1\n<window>\nheight=420\n<indicator>\nname=main\n</indicator>\n<indicator>\nname=Custom Indicator\n<expert>\nname={rel}\nflags=339\nwindow_num={win}\n</expert>\nshow_data=1\n</indicator>\n</window>\n</chart>\n')
     shot=f'MQLLibraryPreview_{job}.gif';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq4';cap.write_text(f'#property strict\nvoid OnStart(){{Print("MQLLIB_PREVIEW stage=onstart");Sleep(3000);WindowRedraw();ResetLastError();bool ok=WindowScreenShot("{shot}",1200,720);Print("MQLLIB_PREVIEW stage=screenshot ok=",ok," err=",GetLastError());Sleep(300);TerminalClose(ok?0:23);return;}}\n')
     emit_stage(job_id,'capture_compile','Compiling MT4 capture script.')
@@ -633,7 +650,7 @@ def render_mt5(src,out,t,job_id):
     editor=rt/Path(t['editor']).name;terminal=rt/Path(t['terminal']).name;sym=copy_mt5_history(Path(t['data_dir']),rt)
     prime_mt5_runtime(rt,terminal,sym,job_id)
     emit_stage(job_id,'indicator_compile','Compiling/staging the selected MT5 indicator.')
-    job,staged,binary,meta=stage(src,mql,'MT5',editor);emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT5 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT5 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}';shot=f'MQLLibraryPreview_{job}.png';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq5';sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0'
+    job,staged,binary,meta=stage(src,mql,'MT5',editor,t.get('data_dir'));emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT5 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT5 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}';shot=f'MQLLibraryPreview_{job}.png';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq5';sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0'
     cap.write_text(mt5_capture_source(rel,shot,win),encoding='utf-8')
     emit_stage(job_id,'capture_compile','Compiling MT5 capture script.')
     built,_,log=compile_file(editor,cap,mql)
