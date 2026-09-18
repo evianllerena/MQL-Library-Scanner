@@ -2,13 +2,21 @@ import { Command } from '@tauri-apps/plugin-shell';
 import { appDataDir, join } from '@tauri-apps/api/path';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 
-let token=0;
-let timer=null;
-let activeChild=null;
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
+let previewToken=0;
+let previewTimer=null;
+let activeJob=null;
+let cancellationBarrier=Promise.resolve();
+let desiredSource=null;
+let previewState={source:null,phase:'idle',message:'',image:null,kind:null};
 let clearConfirmUntil=0;
+let lastStallLog=0;
 
 async function dbPath(){return join(await appDataDir(),'library.sqlite3');}
-async function appLog(level,event,details={}){try{await invoke('app_log',{dbPath:await dbPath(),level,event,details,durationMs:null});}catch{}}
+async function appLog(level,event,details={}){
+  try{await invoke('app_log',{dbPath:await dbPath(),level,event,details,durationMs:null});}catch{}
+}
 
 function parsePayload(text){
   const lines=String(text||'').trim().split(/\r?\n/).filter(Boolean);
@@ -19,7 +27,7 @@ function parsePayload(text){
 async function execSidecar(name,args){
   const out=await Command.sidecar(name,args).execute();
   const payload=parsePayload(out.stdout);
-  if(out.code!==0||!payload?.ok)throw new Error(payload?.error||out.stderr||`${name} exited ${out.code}`);
+  if(out.code!==0||!payload?.ok)throw new Error(payload?.error||payload?.output||out.stderr||`${name} exited ${out.code}`);
   return payload;
 }
 
@@ -32,27 +40,95 @@ function detailSource(){
   return null;
 }
 
-async function cancelActive(reason){
-  const child=activeChild;
-  if(!child)return;
-  activeChild=null;
-  try{
-    await execSidecar('binaries/mql-preview-control',['cancel','--pid',String(child.pid)]);
-    await appLog('INFO','preview_cancelled',{pid:child.pid,reason});
-  }catch(e){
-    try{await child.kill();}catch{}
-    await appLog('WARN','preview_cancel_failed',{pid:child.pid,reason,error:String(e)});
+function newJobId(){
+  try{return crypto.randomUUID().replace(/[^A-Za-z0-9_.-]/g,'-');}
+  catch{return `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;}
+}
+
+function currentPreviewCard(source){
+  const card=document.getElementById('realMetaPreview');
+  return card?.dataset.source===source?card:null;
+}
+
+function applyPreviewState(){
+  const s=previewState;
+  if(!s.source)return;
+  const card=currentPreviewCard(s.source);
+  if(!card)return;
+  const status=card.querySelector('#previewStatus');
+  const img=card.querySelector('#previewImage');
+  const retry=card.querySelector('#retryPreview');
+  if(status)status.textContent=s.message||'Ready';
+  if(img){
+    if(s.image){
+      img.src=s.image;
+      img.style.display='block';
+    }else{
+      img.style.display='none';
+      img.removeAttribute('src');
+    }
   }
+  if(retry)retry.style.display=s.phase==='failed'?'inline-flex':'none';
+}
+
+function setPreviewState(source,patch){
+  if(previewState.source!==source)previewState={source,phase:'idle',message:'',image:null,kind:null};
+  previewState={...previewState,...patch,source};
+  applyPreviewState();
+}
+
+async function cancelActive(reason){
+  const job=activeJob;
+  if(!job)return {ok:true,cancelled:false,reason:'no active preview'};
+
+  await appLog('INFO','preview_cancel_requested',{
+    jobId:job.jobId,pid:job.pid,source:job.source,reason
+  });
+
+  let result;
+  try{
+    result=await execSidecar('binaries/mql-preview-control',['cancel','--pid',String(job.pid)]);
+  }catch(e){
+    await appLog('ERROR','preview_cancel_failed',{
+      jobId:job.jobId,pid:job.pid,source:job.source,reason,error:String(e)
+    });
+    throw new Error(`Previous preview process could not be safely stopped: ${e.message||e}`);
+  }
+
+  if(!result.cancelled||!result.verified_gone){
+    await appLog('ERROR','preview_cancel_unverified',{
+      jobId:job.jobId,pid:job.pid,source:job.source,reason,result
+    });
+    throw new Error('Previous preview process did not terminate cleanly. No new preview was started.');
+  }
+
+  if(activeJob?.jobId===job.jobId)activeJob=null;
+  await appLog('INFO','preview_cancel_result',{
+    jobId:job.jobId,pid:job.pid,source:job.source,reason,
+    cancelled:true,verifiedGone:true,alreadyExited:!!result.already_exited,
+    returncode:result.returncode??null,elapsedMs:result.elapsed_ms??null
+  });
+  return result;
+}
+
+function queueCancellation(reason){
+  cancellationBarrier=cancellationBarrier
+    .catch(()=>{})
+    .then(()=>cancelActive(reason));
+  return cancellationBarrier;
 }
 
 function invalidatePreview(reason){
-  token++;
-  if(timer){clearTimeout(timer);timer=null;}
-  void cancelActive(reason);
+  desiredSource=null;
+  previewToken++;
+  if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
+  return queueCancellation(reason);
 }
 
-async function spawnRender(args,myToken){
-  const cmd=Command.sidecar('binaries/mql-preview',args);
+async function spawnRender(source,outDir,myToken,jobId){
+  const cmd=Command.sidecar('binaries/mql-preview',[
+    'render','--source',source,'--out',outDir,'--job-id',jobId
+  ]);
   let stdout='',stderr='';
   cmd.stdout.on('data',data=>{stdout+=String(data)+'\n';});
   cmd.stderr.on('data',data=>{stderr+=String(data)+'\n';});
@@ -60,55 +136,107 @@ async function spawnRender(args,myToken){
     cmd.on('close',data=>resolve(data));
     cmd.on('error',error=>reject(error));
   });
+
   const child=await cmd.spawn();
-  if(myToken!==token){
-    try{await execSidecar('binaries/mql-preview-control',['cancel','--pid',String(child.pid)]);}catch{try{await child.kill();}catch{}}
+  const job={jobId,pid:child.pid,source,child,startedAt:performance.now()};
+  activeJob=job;
+  await appLog('INFO','preview_spawned',{jobId,pid:child.pid,source});
+
+  if(myToken!==previewToken||desiredSource!==source){
+    await cancelActive('selection changed during spawn');
     throw new Error('Preview cancelled');
   }
-  activeChild=child;
-  const closeData=await closed;
-  if(activeChild?.pid===child.pid)activeChild=null;
+
+  let closeData;
+  try{
+    closeData=await closed;
+  }finally{
+    const elapsedMs=Math.round(performance.now()-job.startedAt);
+    await appLog('INFO','preview_process_exit',{
+      jobId,pid:child.pid,source,code:closeData?.code??null,elapsedMs
+    });
+    if(activeJob?.jobId===jobId)activeJob=null;
+  }
+
   const payload=parsePayload(stdout);
   if(closeData.code!==0||!payload?.ok)throw new Error(payload?.error||stderr||`Preview engine exited ${closeData.code}`);
   return payload;
 }
 
-function schedulePreview(source,status,img,retry,delay=900){
-  invalidatePreview('preview superseded');
-  const myToken=token;
-  status.textContent='Preparing automatic preview…';
-  timer=setTimeout(async()=>{
-    timer=null;
-    if(myToken!==token||detailSource()!==source)return;
-    const kind=/\.(mq5|ex5)$/i.test(source)?'MT5':'MT4';
-    const started=performance.now();
-    retry.disabled=true;
-    status.textContent=`Rendering real ${kind} preview…`;
-    img.style.display='none';
-    await appLog('INFO','preview_start',{source,kind,automatic:true});
+function schedulePreview(source,delay=900){
+  if(!source)return;
+  if(desiredSource===source&&(previewTimer||activeJob?.source===source))return;
+  if(previewState.source===source&&previewState.phase==='success')return;
+
+  desiredSource=source;
+  previewToken++;
+  const myToken=previewToken;
+  if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
+  const kind=/\.(mq5|ex5)$/i.test(source)?'MT5':'MT4';
+  const jobId=newJobId();
+  const barrier=queueCancellation('preview superseded');
+
+  setPreviewState(source,{
+    phase:'scheduled',kind,image:null,
+    message:'Preparing automatic preview…'
+  });
+  void appLog('INFO','preview_scheduled',{jobId,source,kind,delayMs:delay});
+
+  previewTimer=setTimeout(async()=>{
+    previewTimer=null;
     try{
-      const result=await spawnRender(['render','--source',source,'--out',await join(await appDataDir(),'previews')],myToken);
-      if(myToken!==token||detailSource()!==source)return;
-      img.src=convertFileSrc(result.image)+`?t=${Date.now()}`;
-      img.style.display='block';
-      retry.style.display='none';
-      status.textContent=`Real ${result.kind||kind} preview • ${result.terminal?.install_dir||kind}`;
-      await appLog('INFO','preview_success',{source,kind:result.kind||kind,image:result.image,elapsedMs:Math.round(performance.now()-started),automatic:true});
+      await barrier;
     }catch(e){
-      if(myToken!==token)return;
+      if(myToken===previewToken&&desiredSource===source){
+        setPreviewState(source,{phase:'failed',message:`Preview blocked: ${e.message||e}`});
+      }
+      return;
+    }
+
+    if(myToken!==previewToken||desiredSource!==source||detailSource()!==source)return;
+
+    setPreviewState(source,{phase:'rendering',message:`Rendering real ${kind} preview…`,image:null});
+    await appLog('INFO','preview_start',{jobId,source,kind,automatic:true});
+    const started=performance.now();
+
+    try{
+      const outDir=await join(await appDataDir(),'previews');
+      const result=await spawnRender(source,outDir,myToken,jobId);
+      if(myToken!==previewToken||desiredSource!==source||detailSource()!==source)return;
+      const image=convertFileSrc(result.image)+`?t=${Date.now()}`;
+      setPreviewState(source,{
+        phase:'success',
+        kind:result.kind||kind,
+        image,
+        message:`Real ${result.kind||kind} preview • ${result.terminal?.install_dir||kind}`
+      });
+      await appLog('INFO','preview_success',{
+        jobId,source,kind:result.kind||kind,image:result.image,
+        elapsedMs:Math.round(performance.now()-started),automatic:true
+      });
+    }catch(e){
+      if(myToken!==previewToken||desiredSource!==source)return;
       const msg=String(e?.message||e);
-      status.textContent=msg.startsWith('Indicator compile failed')?msg:`Automatic preview failed: ${msg}`;
-      retry.style.display='inline-flex';
-      await appLog('ERROR','preview_failed',{source,kind,error:msg,elapsedMs:Math.round(performance.now()-started),automatic:true});
-    }finally{retry.disabled=false;}
+      setPreviewState(source,{
+        phase:'failed',
+        message:msg.startsWith('Indicator compile failed')?msg:`Automatic preview failed: ${msg}`
+      });
+      await appLog('ERROR','preview_failed',{
+        jobId,source,kind,error:msg,
+        elapsedMs:Math.round(performance.now()-started),automatic:true
+      });
+    }
   },delay);
 }
 
 async function openSource(source,status,button){
   button.disabled=true;
-  try{const out=await execSidecar('binaries/mql-preview',['open-source','--source',source]);status.textContent=`Opened in ${out.kind}: ${out.opened}`;}
-  catch(e){status.textContent=`Could not open MetaTrader/MetaEditor: ${e.message}`;}
-  finally{button.disabled=false;}
+  try{
+    const out=await execSidecar('binaries/mql-preview',['open-source','--source',source]);
+    status.textContent=`Opened in ${out.kind}: ${out.opened}`;
+  }catch(e){
+    status.textContent=`Could not open MetaTrader/MetaEditor: ${e.message}`;
+  }finally{button.disabled=false;}
 }
 
 function injectPreview(){
@@ -119,7 +247,11 @@ function injectPreview(){
   if(!source)return;
 
   const existing=document.getElementById('realMetaPreview');
-  if(existing?.dataset.source===source)return;
+  if(existing?.dataset.source===source){
+    applyPreviewState();
+    return;
+  }
+
   existing?.remove();
   for(const old of [...body.querySelectorAll('#v5RealPreview,#v57RealPreview')])old.remove();
 
@@ -128,16 +260,26 @@ function injectPreview(){
   section.className='section';
   section.id='realMetaPreview';
   section.dataset.source=source;
-  section.innerHTML=`<div class="label">Real MetaTrader Preview</div><div style="border:1px solid rgba(127,127,127,.22);border-radius:10px;padding:10px;margin-top:8px"><div class="muted" style="margin-bottom:9px">Real ${kind} rendering starts after the selection settles. Selecting another indicator cancels the previous preview process tree.</div><div class="status" id="previewStatus">Preparing automatic preview…</div><img id="previewImage" alt="MetaTrader indicator preview" style="display:none;width:100%;margin-top:10px;border-radius:8px;border:1px solid rgba(127,127,127,.25)"/><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn" id="retryPreview" style="display:none">Retry Preview</button><button class="btn" id="openPreviewSource">Open in MetaTrader / MetaEditor</button></div></div>`;
+  section.innerHTML=`<div class="label">Real MetaTrader Preview</div><div style="border:1px solid rgba(127,127,127,.22);border-radius:10px;padding:10px;margin-top:8px"><div class="muted" style="margin-bottom:9px">Only one real preview can run at a time. A new selection waits until the prior MetaTrader process tree is confirmed stopped.</div><div class="status" id="previewStatus">Preparing automatic preview…</div><img id="previewImage" alt="MetaTrader indicator preview" style="display:none;width:100%;margin-top:10px;border-radius:8px;border:1px solid rgba(127,127,127,.25)"/><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn" id="retryPreview" style="display:none">Retry Preview</button><button class="btn" id="openPreviewSource">Open in MetaTrader / MetaEditor</button></div></div>`;
   body.prepend(section);
 
   const status=section.querySelector('#previewStatus');
-  const img=section.querySelector('#previewImage');
   const retry=section.querySelector('#retryPreview');
   const open=section.querySelector('#openPreviewSource');
-  retry.onclick=()=>schedulePreview(source,status,img,retry,0);
+  retry.onclick=()=>{
+    previewState={source:null,phase:'idle',message:'',image:null,kind:null};
+    desiredSource=null;
+    schedulePreview(source,0);
+  };
   open.onclick=()=>openSource(source,status,open);
-  schedulePreview(source,status,img,retry);
+
+  if(previewState.source===source){
+    applyPreviewState();
+    if(!desiredSource&&!activeJob&&previewState.phase!=='success')schedulePreview(source);
+  }else{
+    previewState={source,phase:'idle',message:'',image:null,kind};
+    schedulePreview(source);
+  }
 }
 
 function armButton(button,label,confirmLabel,ms=6000){
@@ -201,10 +343,9 @@ async function clearApplication(button,status){
   button.disabled=true;
   button.textContent='Clearing Application…';
   status.textContent='Stopping preview work and removing local application data…';
-  invalidatePreview('application clear');
 
   try{
-    await new Promise(resolve=>setTimeout(resolve,250));
+    await invalidatePreview('application clear');
     const out=await execSidecar('binaries/mql-preview-control',['clear-app','--db',await dbPath()]);
     if(out.failed?.length)throw new Error(out.failed.join('; '));
     status.textContent='Application data cleared. Restarting with an empty library…';
@@ -235,11 +376,29 @@ function ensureClearCard(){
   button.onclick=()=>void clearApplication(button,status);
 }
 
+function startUiWatchdog(){
+  let expected=performance.now()+500;
+  setInterval(()=>{
+    const now=performance.now();
+    const stallMs=Math.round(now-expected);
+    expected=now+500;
+    if(stallMs>2000&&Date.now()-lastStallLog>5000){
+      lastStallLog=Date.now();
+      void appLog('WARN','ui_event_loop_stall',{
+        stallMs,
+        activeJob:activeJob?{jobId:activeJob.jobId,pid:activeJob.pid,source:activeJob.source}:null,
+        desiredSource
+      });
+    }
+  },500);
+}
+
 function boot(){
   const brand=document.querySelector('.brand small');
-  if(brand)brand.textContent='0.5.8 • Evidence Engine v4 + Cancellable MT4/MT5 Preview';
+  if(brand)brand.textContent='0.5.9 • Evidence Engine v4 + Single-Flight MT4/MT5 Preview';
   ensureClearCard();
   enhanceSourceRemoval();
+  startUiWatchdog();
 
   const observer=new MutationObserver(mutations=>{
     let detailNeedsCheck=false;
@@ -249,7 +408,8 @@ function boot(){
       const target=mutation.target;
       if(target?.id==='detail'&&mutation.type==='attributes')detailNeedsCheck=true;
       if(target?.id==='detailBody'&&mutation.type==='childList'){
-        const onlyOurPreview=[...mutation.addedNodes,...mutation.removedNodes].every(n=>n.nodeType!==1||n.id==='realMetaPreview'||n.closest?.('#realMetaPreview'));
+        const nodes=[...mutation.addedNodes,...mutation.removedNodes];
+        const onlyOurPreview=nodes.length>0&&nodes.every(n=>n.nodeType!==1||n.id==='realMetaPreview'||n.closest?.('#realMetaPreview'));
         if(!onlyOurPreview)detailNeedsCheck=true;
       }
       if(target?.id==='sources'||target?.closest?.('#sources'))sourcesNeedCheck=true;
@@ -264,12 +424,24 @@ function boot(){
 }
 
 document.addEventListener('pointerdown',e=>{
-  if(e.target.closest?.('#rows tr,#reviewRows tr'))invalidatePreview('new indicator selected');
-  if(e.target.closest?.('#closeDetail'))invalidatePreview('detail closed');
+  if(e.target.closest?.('#rows tr,#reviewRows tr')){
+    previewState={source:null,phase:'idle',message:'',image:null,kind:null};
+    void invalidatePreview('new indicator selected');
+  }
+  if(e.target.closest?.('#closeDetail')){
+    previewState={source:null,phase:'idle',message:'',image:null,kind:null};
+    void invalidatePreview('detail closed');
+  }
   if(e.target.closest?.('[data-view="settings"]'))queueMicrotask(ensureClearCard);
   if(e.target.closest?.('[data-view="scan"]'))queueMicrotask(enhanceSourceRemoval);
 },{capture:true});
-document.addEventListener('keydown',e=>{if(e.key==='Escape')invalidatePreview('escape');});
+
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){
+    previewState={source:null,phase:'idle',message:'',image:null,kind:null};
+    void invalidatePreview('escape');
+  }
+});
 
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});
 else boot();
