@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, ctypes, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, time, zipfile
+import argparse, ctypes, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, zipfile
 from pathlib import Path
 
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
@@ -127,36 +127,72 @@ def data_activity(path):
     return newest
 
 
-def terminals():
-    base=Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'
-    out=[]; seen=set()
+def same_path(a,b):
+    if not a or not b:return False
+    try:return Path(a).resolve()==Path(b).resolve()
+    except Exception:return os.path.normcase(os.path.abspath(str(a)))==os.path.normcase(os.path.abspath(str(b)))
 
-    # Authoritative path: each normal MetaTrader data directory identifies its own install in origin.txt.
-    if base.exists():
-        for d in base.iterdir():
-            if not d.is_dir():continue
-            origin_text=read_origin(d/'origin.txt')
-            if not origin_text:continue
-            install=Path(origin_text)
-            for exe,kind,ed in [('terminal.exe','MT4','metaeditor.exe'),('terminal64.exe','MT5','metaeditor64.exe')]:
-                terminal=install/exe; editor=install/ed
-                if not (d/kind).exists() or not terminal.exists() or not editor.exists():continue
-                key=(kind,str(terminal).lower(),str(d).lower())
-                if key in seen:continue
-                seen.add(key)
-                out.append({
-                    'kind':kind,
-                    'terminal':str(terminal),
-                    'editor':str(editor),
-                    'install_dir':str(install),
-                    'data_dir':str(d),
-                    'activity_ns':data_activity(d),
-                    'discovery':'origin.txt'
-                })
 
-    # Fallback for unusual/portable installs that do not have a normal origin.txt data directory.
-    roots=[Path(os.environ[x]) for x in ('ProgramFiles','ProgramFiles(x86)','LOCALAPPDATA') if os.environ.get(x) and Path(os.environ[x]).exists()]
+def metatrader_data_root():
+    return Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'
+
+
+def observed_data_folders(base=None):
+    base=Path(base) if base is not None else metatrader_data_root()
+    rows=[]
+    if not base.exists():return rows
+    for d in base.iterdir():
+        if not d.is_dir():continue
+        rows.append({
+            'data_dir':str(d),
+            'origin':read_origin(d/'origin.txt'),
+            'has_mql4':(d/'MQL4').is_dir(),
+            'has_mql5':(d/'MQL5').is_dir(),
+            'activity_ns':data_activity(d)
+        })
+    return rows
+
+
+def discover_data_dirs(base=None):
+    rows=[]
+    for item in observed_data_folders(base):
+        for kind,key in (('MT4','has_mql4'),('MT5','has_mql5')):
+            if not item[key]:continue
+            rows.append({
+                'kind':kind,
+                'data_dir':item['data_dir'],
+                'origin':item['origin'],
+                'activity_ns':item['activity_ns'],
+                'discovery':'data-folder'
+            })
+    return rows
+
+
+def find_editor(install,kind):
+    install=Path(install)
+    names=('metaeditor64.exe','metaeditor.exe') if kind=='MT5' else ('metaeditor.exe','metaeditor64.exe')
+    for name in names:
+        p=install/name
+        if p.is_file():return str(p)
+    try:
+        candidates=[p for p in install.iterdir() if p.is_file() and p.name.lower().startswith('metaeditor') and p.suffix.lower()=='.exe']
+    except Exception:candidates=[]
+    return str(candidates[0]) if candidates else None
+
+
+def candidate_install_dirs(base=None,roots=None):
+    seen=set(); out=[]
+    for item in observed_data_folders(base):
+        origin=item.get('origin')
+        if not origin:continue
+        key=os.path.normcase(str(origin))
+        if key in seen:continue
+        seen.add(key);out.append(Path(origin))
+    if roots is None:
+        roots=[Path(os.environ[x]) for x in ('ProgramFiles','ProgramFiles(x86)','LOCALAPPDATA') if os.environ.get(x) and Path(os.environ[x]).exists()]
     for root in roots:
+        root=Path(root)
+        if not root.exists():continue
         dirs=[]
         for pat in ('MetaTrader*','*MetaTrader*','*MT4*','*MT5*','*OANDA*'):
             try:dirs+=list(root.glob(pat))
@@ -164,38 +200,93 @@ def terminals():
         try:dirs+=[x for x in root.iterdir() if x.is_dir()]
         except Exception:pass
         for install in dirs:
-            for exe,kind,ed in [('terminal.exe','MT4','metaeditor.exe'),('terminal64.exe','MT5','metaeditor64.exe')]:
-                terminal=install/exe; editor=install/ed
-                if not terminal.exists() or not editor.exists():continue
-                matches=[]
-                if base.exists():
-                    for d in base.iterdir():
-                        if not d.is_dir() or not (d/kind).exists():continue
-                        origin_text=read_origin(d/'origin.txt')
-                        if not origin_text:continue
-                        try:same=Path(origin_text).resolve()==install.resolve()
-                        except Exception:same=os.path.normcase(origin_text)==os.path.normcase(str(install))
-                        if same:matches.append((data_activity(d),d))
-                if not matches:continue
-                activity,data_dir=max(matches,key=lambda x:x[0])
-                key=(kind,str(terminal).lower(),str(data_dir).lower())
-                if key in seen:continue
-                seen.add(key)
-                out.append({
-                    'kind':kind,
-                    'terminal':str(terminal),
-                    'editor':str(editor),
-                    'install_dir':str(install),
-                    'data_dir':str(data_dir),
-                    'activity_ns':activity,
-                    'discovery':'install-fallback'
-                })
-
-    out.sort(key=lambda t:(1 if t.get('discovery')=='origin.txt' else 0,t.get('activity_ns',0)),reverse=True)
+            key=os.path.normcase(str(install))
+            if key in seen:continue
+            seen.add(key);out.append(install)
     return out
 
 
-def detect():emit({'ok':True,'terminals':terminals()})
+def discover_installations(base=None,roots=None):
+    out=[]; seen=set()
+    for install in candidate_install_dirs(base,roots):
+        for exe,kind in (('terminal.exe','MT4'),('terminal64.exe','MT5')):
+            terminal=install/exe
+            if not terminal.is_file():continue
+            key=(kind,os.path.normcase(str(terminal)))
+            if key in seen:continue
+            seen.add(key)
+            out.append({
+                'kind':kind,
+                'terminal':str(terminal),
+                'editor':find_editor(install,kind),
+                'install_dir':str(install),
+                'terminal_discovery':'install-binary',
+                'editor_discovery':'terminal-install-dir'
+            })
+    return out
+
+
+def runtime_candidate_score(t):
+    terminal_ok=bool(t.get('terminal') and Path(t['terminal']).is_file())
+    editor_ok=bool(t.get('editor') and Path(t['editor']).is_file())
+    data_ok=bool(t.get('data_dir') and Path(t['data_dir']).is_dir())
+    mql_ok=bool(data_ok and (Path(t['data_dir'])/t['kind']).is_dir())
+    ready=terminal_ok and editor_ok and data_ok and mql_ok
+    origin_match=t.get('pair_method')=='origin-match'
+    return (1 if ready else 0,1 if origin_match else 0,1 if terminal_ok else 0,1 if editor_ok else 0,1 if data_ok else 0,int(t.get('activity_ns') or 0))
+
+
+def pair_runtime_candidates(installs=None,data_dirs=None):
+    installs=list(discover_installations() if installs is None else installs)
+    data_dirs=list(discover_data_dirs() if data_dirs is None else data_dirs)
+    out=[]
+    for inst in installs:
+        compatible=[d for d in data_dirs if d['kind']==inst['kind']]
+        exact=[d for d in compatible if d.get('origin') and same_path(d['origin'],inst['install_dir'])]
+        pool=exact or compatible
+        data=max(pool,key=lambda x:x.get('activity_ns',0)) if pool else None
+        row=dict(inst)
+        row.update({
+            'data_dir':data.get('data_dir') if data else None,
+            'data_origin':data.get('origin') if data else None,
+            'activity_ns':data.get('activity_ns',0) if data else 0,
+            'pair_method':'origin-match' if exact else ('platform-fallback' if data else 'unpaired-install')
+        })
+        out.append(row)
+    for data in data_dirs:
+        if any(x['kind']==data['kind'] and x.get('data_dir')==data['data_dir'] for x in out):continue
+        out.append({
+            'kind':data['kind'],
+            'terminal':None,
+            'editor':None,
+            'install_dir':None,
+            'data_dir':data['data_dir'],
+            'data_origin':data.get('origin'),
+            'activity_ns':data.get('activity_ns',0),
+            'pair_method':'unpaired-data'
+        })
+    out.sort(key=runtime_candidate_score,reverse=True)
+    return out
+
+
+def terminals(base=None,roots=None):
+    data=discover_data_dirs(base)
+    installs=discover_installations(base,roots)
+    return pair_runtime_candidates(installs,data)
+
+
+def detect():
+    base=metatrader_data_root()
+    data=discover_data_dirs(base)
+    installs=discover_installations(base)
+    emit({
+        'ok':True,
+        'installations':installs,
+        'data_directories':data,
+        'observed_data_folders':observed_data_folders(base),
+        'terminals':pair_runtime_candidates(installs,data)
+    })
+
 
 
 def memory_stats(db):
@@ -257,7 +348,8 @@ def compile_file(editor,src,mqlroot):
         end=time.monotonic()+3.0
         latest=''
         while time.monotonic()<end:
-            if expected.exists() and expected.stat().st_size:return expected,attempts,read_text(log)            latest=read_text(log)
+            if expected.exists() and expected.stat().st_size:return expected,attempts,read_text(log)
+            latest=read_text(log)
             if compile_has_errors(latest):return None,attempts,latest
             time.sleep(.15)
         latest=read_text(log)
@@ -287,46 +379,60 @@ def copy_compiled_support(src,dst,kind):
 
 
 def seed_mql_runtime(t,rt,kind):
-    """Seed only the support files needed for an isolated preview from the matched live terminal."""
-    live=Path(t['data_dir']); src=live/kind; dst=rt/kind; marker=rt/f'.{kind.lower()}-seed-v4'
-    if marker.exists() or not src.exists():return False
+    """Create a valid minimum MQL tree first, then seed reusable support files."""
+    live=Path(t['data_dir']); src=live/kind; dst=rt/kind; marker=rt/f'.{kind.lower()}-seed-v5'
     dst.mkdir(parents=True,exist_ok=True)
+    (dst/'Indicators').mkdir(parents=True,exist_ok=True)
+    (dst/'Scripts').mkdir(parents=True,exist_ok=True)
+    (dst/'Files').mkdir(parents=True,exist_ok=True)
+    if not src.is_dir():return False
 
-    for name in ('Include','Libraries','Presets','Images'):
-        s=src/name
-        if s.exists():
-            try:shutil.copytree(s,dst/name,dirs_exist_ok=True)
-            except Exception:pass
+    marker_valid=marker.exists() and (dst/'Indicators').is_dir()
+    if not marker_valid:
+        for name in ('Include','Libraries','Presets','Images'):
+            s=src/name
+            if s.exists():
+                try:shutil.copytree(s,dst/name,dirs_exist_ok=True)
+                except Exception:pass
+        copy_compiled_support(src/'Indicators',dst/'Indicators',kind)
+        marker.write_text(f'{src}\n{int(time.time())}',encoding='utf-8')
 
-    copy_compiled_support(src/'Indicators',dst/'Indicators',kind)
     preview_dir=dst/'Indicators'/'MQLLibraryPreview'
     if preview_dir.exists():shutil.rmtree(preview_dir,ignore_errors=True)
-    marker.write_text(f'{src}\n{int(time.time())}',encoding='utf-8')
-    return True
+    return not marker_valid
 
 
 def clone_runtime(t,out,kind):
     install=Path(t['install_dir'])
     live=Path(t['data_dir'])
-    token=hashlib.sha1((str(install)+'|'+str(live)).lower().encode()).hexdigest()[:10]
-    rt=out.parent/'preview-runtime'/'v4'/f'{kind.lower()}-{token}'
-    exe=install/('terminal64.exe' if kind=='MT5' else 'terminal.exe')
-    stamp=f'v4:{exe.stat().st_size}:{exe.stat().st_mtime_ns}:{str(live).lower()}'
+    terminal_src=Path(t['terminal'])
+    editor_src=Path(t['editor'])
+    token=hashlib.sha1((str(terminal_src)+'|'+str(live)).lower().encode()).hexdigest()[:10]
+    rt=out.parent/'preview-runtime'/'v5'/f'{kind.lower()}-{token}'
+    stamp=f'v5:{terminal_src.stat().st_size}:{terminal_src.stat().st_mtime_ns}:{editor_src.stat().st_size}:{editor_src.stat().st_mtime_ns}:{str(live).lower()}'
     marker=rt/'.stamp'
     if not rt.exists() or not marker.exists() or marker.read_text(errors='ignore')!=stamp:
         shutil.rmtree(rt,ignore_errors=True)
         def ign(_d,n):return {x for x in n if x.lower() in {'logs','bases','history','mql4','mql5','profiles','templates','tester','config'}}
         shutil.copytree(install,rt,ignore=ign)
-
         for name in ('config','profiles','templates'):
             source=live/name
             if source.exists():
                 try:shutil.copytree(source,rt/name,dirs_exist_ok=True)
                 except Exception:pass
-
         marker.parent.mkdir(parents=True,exist_ok=True)
         marker.write_text(stamp,encoding='utf-8')
+
     seed_mql_runtime(t,rt,kind)
+    required={
+        'sandbox':rt.is_dir(),
+        'sandbox_terminal':(rt/terminal_src.name).is_file(),
+        'sandbox_metaeditor':(rt/editor_src.name).is_file(),
+        'sandbox_mql_dir':(rt/kind).is_dir(),
+        'sandbox_indicators_dir':(rt/kind/'Indicators').is_dir()
+    }
+    missing=[name for name,ok in required.items() if not ok]
+    if missing:raise RuntimeError(f'Preview sandbox initialization failed for {kind}: {", ".join(missing)}')
     return rt
 
 
@@ -547,9 +653,9 @@ def mt5_capture_source(rel,shot,win):
 def render_mt4(src,out,t,job_id):
     emit_stage(job_id,'runtime_clone','Preparing isolated MT4 runtime.')
     rt=clone_runtime(t,out,'MT4');mql=rt/'MQL4';scripts=mql/'Scripts';templates=rt/'templates';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,templates,files)]
-    editor=rt/'metaeditor.exe';terminal=rt/'terminal.exe';sym=copy_mt4_history(Path(t['data_dir']),rt)
+    editor=rt/Path(t['editor']).name;terminal=rt/Path(t['terminal']).name;sym=copy_mt4_history(Path(t['data_dir']),rt)
     emit_stage(job_id,'indicator_compile','Compiling/staging the selected MT4 indicator.')
-    job,staged,binary,meta=stage(src,mql,'MT4',editor);rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
+    job,staged,binary,meta=stage(src,mql,'MT4',editor);emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT4 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT4 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
     tplname=f'MQLLibraryPreview_{job}.tpl';tpl=templates/tplname;sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0';tpl.write_text(f'<chart>\nsymbol={sym}\nperiod=60\ngraph=1\ngrid=1\n<window>\nheight=420\n<indicator>\nname=main\n</indicator>\n<indicator>\nname=Custom Indicator\n<expert>\nname={rel}\nflags=339\nwindow_num={win}\n</expert>\nshow_data=1\n</indicator>\n</window>\n</chart>\n')
     shot=f'MQLLibraryPreview_{job}.gif';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq4';cap.write_text(f'#property strict\nvoid OnStart(){{Print("MQLLIB_PREVIEW stage=onstart");Sleep(3000);WindowRedraw();ResetLastError();bool ok=WindowScreenShot("{shot}",1200,720);Print("MQLLIB_PREVIEW stage=screenshot ok=",ok," err=",GetLastError());Sleep(300);TerminalClose(ok?0:23);return;}}\n')
     emit_stage(job_id,'capture_compile','Compiling MT4 capture script.')
@@ -572,10 +678,10 @@ def render_mt4(src,out,t,job_id):
 def render_mt5(src,out,t,job_id):
     emit_stage(job_id,'runtime_clone','Preparing isolated MT5 runtime.')
     rt=clone_runtime(t,out,'MT5');mql=rt/'MQL5';scripts=mql/'Scripts';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,files)]
-    editor=rt/'metaeditor64.exe';terminal=rt/'terminal64.exe';sym=copy_mt5_history(Path(t['data_dir']),rt)
+    editor=rt/Path(t['editor']).name;terminal=rt/Path(t['terminal']).name;sym=copy_mt5_history(Path(t['data_dir']),rt)
     prime_mt5_runtime(rt,terminal,sym,job_id)
     emit_stage(job_id,'indicator_compile','Compiling/staging the selected MT5 indicator.')
-    job,staged,binary,meta=stage(src,mql,'MT5',editor);rel=f'MQLLibraryPreview\\{job}\\{binary.stem}';shot=f'MQLLibraryPreview_{job}.png';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq5';sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0'
+    job,staged,binary,meta=stage(src,mql,'MT5',editor);emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT5 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT5 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}';shot=f'MQLLibraryPreview_{job}.png';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq5';sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0'
     cap.write_text(mt5_capture_source(rel,shot,win),encoding='utf-8')
     emit_stage(job_id,'capture_compile','Compiling MT5 capture script.')
     built,_,log=compile_file(editor,cap,mql)
@@ -594,55 +700,205 @@ def render_mt5(src,out,t,job_id):
     final=out/(hashlib.sha1(('MT5|'+str(src.resolve()).lower()).encode()).hexdigest()[:16]+'.png');out.mkdir(parents=True,exist_ok=True);shutil.copy2(img,final);meta.update({'isolated_runtime':str(rt),'symbol':sym,'staged':str(staged),'binary':str(binary),'job_id':job_id,'config':str(cfg)});return final,meta
 
 
-def preview_runtime(source,terminal=None):
-    src=Path(source)
-    if not src.exists() or not src.is_file():
-        raise RuntimeError(f'Preview source was not found: {src}')
-    kind='MT5' if src.suffix.lower() in ('.mq5','.ex5') else 'MT4'
-    ts=[x for x in terminals() if x['kind']==kind and x.get('terminal') and x.get('editor') and x.get('data_dir')]
-    if terminal:
-        ts=[x for x in ts if x['terminal'].lower()==terminal.lower()] or ts
-    if not ts:
-        base=Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'
-        observed=[]
-        if base.exists():
-            for d in base.iterdir():
-                if d.is_dir():
-                    observed.append({'data_dir':str(d),'origin':read_origin(d/'origin.txt'),'has_mql4':(d/'MQL4').exists(),'has_mql5':(d/'MQL5').exists()})
-        raise RuntimeError(f'{kind} + MetaEditor data directory were not detected. Observed terminal data folders: {json.dumps(observed,ensure_ascii=False)}')
-    selected=ts[0]
-    checks={
-        'source':src.exists() and src.is_file(),
-        'terminal':Path(selected['terminal']).is_file(),
-        'metaeditor':Path(selected['editor']).is_file(),
-        'data_dir':Path(selected['data_dir']).is_dir(),
-        'mql_dir':(Path(selected['data_dir'])/kind).is_dir(),
+class PreviewRuntimeError(RuntimeError):
+    def __init__(self,message,diagnostics=None):
+        super().__init__(message)
+        self.diagnostics=diagnostics or []
+
+
+def source_kind(source):
+    return 'MT5' if Path(source).suffix.lower() in ('.mq5','.ex5') else 'MT4'
+
+
+def selection_checks(src,kind,selected):
+    data_dir=Path(selected['data_dir']) if selected.get('data_dir') else None
+    return {
+        'source':src.is_file(),
+        'terminal_binary':bool(selected.get('terminal') and Path(selected['terminal']).is_file()),
+        'metaeditor_binary':bool(selected.get('editor') and Path(selected['editor']).is_file()),
+        'data_directory':bool(data_dir and data_dir.is_dir()),
+        'mql_directory':bool(data_dir and (data_dir/kind).is_dir())
     }
-    missing=[name for name,ok in checks.items() if not ok]
+
+
+def discovery_diagnostics(kind,selected=None,checks=None):
+    selected=selected or {}
+    checks=checks or {}
+    mql_name=kind
+    return [
+        {'stage':'Terminal binary','status':'FOUND' if checks.get('terminal_binary') else 'NOT FOUND','path':selected.get('terminal')},
+        {'stage':'MetaEditor binary','status':'FOUND' if checks.get('metaeditor_binary') else 'NOT FOUND','path':selected.get('editor')},
+        {'stage':'Data directory','status':'FOUND' if checks.get('data_directory') else 'NOT FOUND','path':selected.get('data_dir'),'pair_method':selected.get('pair_method')},
+        {'stage':f'{mql_name} directory','status':'FOUND' if checks.get('mql_directory') else 'NOT FOUND','path':str(Path(selected['data_dir'])/kind) if selected.get('data_dir') else None}
+    ]
+
+
+def choose_runtime(kind,terminal=None):
+    candidates=[x for x in terminals() if x['kind']==kind]
+    if terminal:
+        exact=[x for x in candidates if x.get('terminal') and same_path(x['terminal'],terminal)]
+        if exact:candidates=exact
+    if not candidates:
+        diagnostics=[{'stage':'Terminal binary','status':'NOT FOUND','path':None}]
+        raise PreviewRuntimeError(f'No {kind} terminal binary was detected.',diagnostics)
+    return candidates[0]
+
+
+def preview_runtime(source,terminal=None,selected=None):
+    src=Path(source)
+    kind=source_kind(src)
+    if not src.is_file():
+        raise PreviewRuntimeError(f'Preview source was not found: {src}',[{'stage':'Source file','status':'NOT FOUND','path':str(src)}])
+    selected=selected or choose_runtime(kind,terminal)
+    checks=selection_checks(src,kind,selected)
+    diagnostics=discovery_diagnostics(kind,selected,checks)
+    missing=[d['stage'] for d in diagnostics if d['status']!='FOUND']
     if missing:
-        raise RuntimeError(f'Preview preflight failed for {kind}: missing or invalid {", ".join(missing)}.')
+        observed={
+            'installations':discover_installations(),
+            'data_directories':discover_data_dirs(),
+            'observed_data_folders':observed_data_folders()
+        }
+        raise PreviewRuntimeError(
+            f'{kind} preview runtime validation failed: {", ".join(missing)}.',
+            diagnostics+[{'stage':'Discovery inventory','status':'INFO','details':observed}]
+        )
     return src,kind,selected,checks
 
 
-def preflight(source,terminal=None):
-    src,kind,selected,checks=preview_runtime(source,terminal)
-    emit({'ok':True,'preflight':True,'source':str(src),'kind':kind,'terminal':selected,'checks':checks})
+def runtime_cache_path(dest,kind):
+    p=Path(dest).parent/'preview-runtime'/f'{kind.lower()}-selection-v5.json'
+    p.parent.mkdir(parents=True,exist_ok=True)
+    return p
+
+
+def load_runtime_cache(dest,kind):
+    path=runtime_cache_path(dest,kind)
+    if not path.is_file():return None
+    try:data=json.loads(path.read_text(encoding='utf-8'))
+    except Exception:return None
+    if data.get('kind')!=kind:return None
+    selected=data.get('terminal') or {}
+    src=Path(data.get('source') or '.')
+    checks=selection_checks(src,kind,selected)
+    if not all(checks[k] for k in ('terminal_binary','metaeditor_binary','data_directory','mql_directory')):
+        try:path.unlink()
+        except Exception:pass
+        return None
+    return selected
+
+
+def write_runtime_cache(dest,kind,source,selected):
+    path=runtime_cache_path(dest,kind)
+    path.write_text(json.dumps({'version':5,'kind':kind,'source':str(source),'terminal':selected,'saved_at':int(time.time())},ensure_ascii=False,indent=2),encoding='utf-8')
+    return path
+
+
+def preflight(source,out,terminal=None):
+    src=Path(source);kind=source_kind(src);dest=Path(out)
+    cached=None if terminal else load_runtime_cache(dest,kind)
+    cache_hit=bool(cached)
+    src,kind,selected,checks=preview_runtime(src,terminal,selected=cached)
+    diagnostics=discovery_diagnostics(kind,selected,checks)
+
+    rt=clone_runtime(selected,dest,kind)
+    sandbox_checks={
+        'sandbox':rt.is_dir(),
+        'sandbox_terminal':(rt/Path(selected['terminal']).name).is_file(),
+        'sandbox_metaeditor':(rt/Path(selected['editor']).name).is_file(),
+        'sandbox_mql_dir':(rt/kind).is_dir(),
+        'sandbox_indicators_dir':(rt/kind/'Indicators').is_dir()
+    }
+    diagnostics.extend([
+        {'stage':'Preview sandbox','status':'CREATED' if sandbox_checks['sandbox'] else 'FAILED','path':str(rt)},
+        {'stage':'Sandbox terminal','status':'FOUND' if sandbox_checks['sandbox_terminal'] else 'NOT FOUND','path':str(rt/Path(selected['terminal']).name)},
+        {'stage':'Sandbox MetaEditor','status':'FOUND' if sandbox_checks['sandbox_metaeditor'] else 'NOT FOUND','path':str(rt/Path(selected['editor']).name)},
+        {'stage':f'Sandbox {kind} directory','status':'FOUND' if sandbox_checks['sandbox_mql_dir'] else 'NOT FOUND','path':str(rt/kind)},
+        {'stage':'Sandbox Indicators directory','status':'FOUND' if sandbox_checks['sandbox_indicators_dir'] else 'NOT FOUND','path':str(rt/kind/'Indicators')}
+    ])
+    failed=[x['stage'] for x in diagnostics if x['status'] in ('FAILED','NOT FOUND')]
+    if failed:raise PreviewRuntimeError(f'Preview sandbox validation failed: {", ".join(failed)}.',diagnostics)
+    cache=write_runtime_cache(dest,kind,src,selected)
+    emit({
+        'ok':True,
+        'preflight':True,
+        'cache_hit':cache_hit,
+        'cache_file':str(cache),
+        'source':str(src),
+        'kind':kind,
+        'terminal':selected,
+        'sandbox':str(rt),
+        'checks':{**checks,**sandbox_checks},
+        'diagnostics':diagnostics
+    })
 
 
 def render(source,out,terminal=None,job_id=None):
-    src,kind,selected,_checks=preview_runtime(source,terminal)
-    dest=Path(out);job_id=safe_job_id(job_id)
-    emit_stage(job_id,'terminal_selected',f'Using {kind} data folder: {selected["data_dir"]}',kind=kind,install_dir=selected['install_dir'],data_dir=selected['data_dir'])
+    src=Path(source);dest=Path(out);kind=source_kind(src);job_id=safe_job_id(job_id)
+    cached=None if terminal else load_runtime_cache(dest,kind)
+    src,kind,selected,_checks=preview_runtime(src,terminal,selected=cached)
+    if not cached:
+        write_runtime_cache(dest,kind,src,selected)
+    emit_stage(job_id,'runtime_preflight_cached','Using validated cached preview runtime selection.' if cached else 'Using freshly validated preview runtime selection.',cache_hit=bool(cached))
+    emit_stage(job_id,'terminal_selected',f'Using {kind} data folder: {selected["data_dir"]}',kind=kind,install_dir=selected['install_dir'],terminal=selected['terminal'],editor=selected['editor'],data_dir=selected['data_dir'],pair_method=selected.get('pair_method'))
     lock_path=dest.parent/'preview-runtime'/'.render.lock'
     with RenderLock(lock_path,timeout=5.0):
         image,meta=(render_mt5(src,dest,selected,job_id) if kind=='MT5' else render_mt4(src,dest,selected,job_id))
-    emit({'ok':True,'image':str(image),'kind':kind,'cached':False,'job_id':job_id,'terminal':selected,'meta':meta})
+    emit({'ok':True,'image':str(image),'kind':kind,'cached':bool(cached),'job_id':job_id,'terminal':selected,'meta':meta})
 
 
 def open_source(source):
-    src=Path(source);kind='MT5' if src.suffix.lower() in ('.mq5','.ex5') else 'MT4';ts=[x for x in terminals() if x['kind']==kind]
-    if not ts:raise RuntimeError(f'{kind} was not detected.')
-    target=ts[0].get('editor') if src.suffix.lower() in ('.mq4','.mq5') else ts[0]['terminal'];subprocess.Popen([target,str(src)] if target.endswith('editor.exe') or target.endswith('editor64.exe') else [target]);emit({'ok':True,'opened':target,'kind':kind})
+    src=Path(source);kind=source_kind(src)
+    selected=choose_runtime(kind)
+    target=selected.get('editor') if src.suffix.lower() in ('.mq4','.mq5') else selected.get('terminal')
+    if not target or not Path(target).is_file():
+        which='MetaEditor' if src.suffix.lower() in ('.mq4','.mq5') else 'terminal'
+        raise RuntimeError(f'{kind} {which} binary was not detected.')
+    low=target.lower()
+    subprocess.Popen([target,str(src)] if low.endswith('editor.exe') or low.endswith('editor64.exe') else [target])
+    emit({'ok':True,'opened':target,'kind':kind})
+
+
+def self_test_discovery():
+    checks={}
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp);base=root/'MetaQuotes'/'Terminal';base.mkdir(parents=True)
+
+        mt5=root/'OANDA TMS MT5 Terminal';mt5.mkdir()
+        (mt5/'terminal64.exe').write_bytes(b'terminal')
+        (mt5/'metaeditor64.exe').write_bytes(b'editor')
+        d5=base/'DATA5';(d5/'MQL5'/'Indicators').mkdir(parents=True)
+        (d5/'origin.txt').write_text(str(mt5),encoding='utf-8')
+
+        mt4=root/'Blueberry Markets MetaTrader 4';mt4.mkdir()
+        (mt4/'terminal.exe').write_bytes(b'terminal')
+        d4=base/'DATA4';(d4/'MQL4'/'Indicators').mkdir(parents=True)
+        (d4/'origin.txt').write_text(str(mt4),encoding='utf-8')
+
+        data=discover_data_dirs(base)
+        installs=discover_installations(base,roots=[])
+        pairs=pair_runtime_candidates(installs,data)
+        p5=next((x for x in pairs if x['kind']=='MT5' and x.get('terminal')),None)
+        p4=next((x for x in pairs if x['kind']=='MT4' and x.get('terminal')),None)
+
+        checks['terminal_detection_independent_of_editor']=bool(p4 and p4.get('terminal') and not p4.get('editor'))
+        checks['metaeditor_from_terminal_install']=bool(p5 and p5.get('editor')==str(mt5/'metaeditor64.exe'))
+        checks['origin_data_pairing']=bool(p5 and p5.get('data_dir')==str(d5) and p5.get('pair_method')=='origin-match')
+
+        alt=root/'Alternate MT5';alt.mkdir()
+        (alt/'terminal64.exe').write_bytes(b'terminal')
+        (alt/'metaeditor64.exe').write_bytes(b'editor')
+        alt_install={'kind':'MT5','terminal':str(alt/'terminal64.exe'),'editor':str(alt/'metaeditor64.exe'),'install_dir':str(alt)}
+        fallback=pair_runtime_candidates([alt_install],[x for x in data if x['kind']=='MT5'])
+        checks['independent_platform_pairing']=bool(fallback and fallback[0].get('data_dir')==str(d5) and fallback[0].get('pair_method')=='platform-fallback')
+
+        out=root/'previews'
+        rt=clone_runtime(p5,out,'MT5')
+        checks['sandbox_mql_tree_created']=(rt/'MQL5'/'Indicators').is_dir()
+        cache=write_runtime_cache(out,'MT5',root/'demo.mq5',p5)
+        checks['runtime_selection_cache_written']=cache.is_file()
+
+    return checks
 
 
 def self_test():
@@ -657,20 +913,21 @@ def self_test():
         'compile_zero_errors_not_failure':not compile_has_errors('Result: 0 errors, 2 warnings'),
         'job_id_sanitized':safe_job_id('job id:123')=='job-id-123',
         'mt5_prime_v3_marker':'.mt5-preview-prime-v3'.endswith('prime-v3'),
-        'minimal_runtime_seed_v4':'.mql5-seed-v4'.endswith('seed-v4'),
+        'minimal_runtime_seed_v5':'.mql5-seed-v5'.endswith('seed-v5'),
         'shutdown_terminal_numeric':True,
         'origin_utf8_decode':decode_origin_bytes(b'C:\\Program Files\\OANDA TMS MT5')=='C:\\Program Files\\OANDA TMS MT5',
         'origin_utf16_decode':decode_origin_bytes(('C:\\Program Files\\MetaTrader 4').encode('utf-16'))=='C:\\Program Files\\MetaTrader 4',
     }
+    checks.update(self_test_discovery())
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
     emit({'ok':True,'checks':checks})
 
 
 def main():
-    a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True);s.add_parser('detect');s.add_parser('self-test');p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--terminal');p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p=s.add_parser('open-source');p.add_argument('--source',required=True);p=s.add_parser('memory-stats');p.add_argument('--db',required=True);p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True);p=s.add_parser('archive-reset');p.add_argument('--db',required=True);x=a.parse_args()
+    a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True);s.add_parser('detect');s.add_parser('self-test');p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p=s.add_parser('open-source');p.add_argument('--source',required=True);p=s.add_parser('memory-stats');p.add_argument('--db',required=True);p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True);p=s.add_parser('archive-reset');p.add_argument('--db',required=True);x=a.parse_args()
     if x.cmd=='detect':detect()
     elif x.cmd=='self-test':self_test()
-    elif x.cmd=='preflight':preflight(x.source,x.terminal)
+    elif x.cmd=='preflight':preflight(x.source,x.out,x.terminal)
     elif x.cmd=='render':render(x.source,x.out,x.terminal,x.job_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
@@ -680,4 +937,5 @@ def main():
 
 if __name__=='__main__':
     try:main()
+    except PreviewRuntimeError as e:emit({'ok':False,'error':f'{type(e).__name__}: {e}','diagnostics':e.diagnostics});sys.exit(1)
     except Exception as e:emit({'ok':False,'error':f'{type(e).__name__}: {e}'});sys.exit(1)
