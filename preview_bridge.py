@@ -5,11 +5,18 @@ from pathlib import Path
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
 SW_HIDE=0
 
+def mql_dir_name(kind):
+    """MetaTrader source directory name for a platform kind.
+
+    A MetaTrader data folder contains an ``MQL5`` (MT5) or ``MQL4`` (MT4)
+    subdirectory — never ``MT5``/``MT4``. The platform *kind* string must be
+    mapped through here anywhere the on-disk MQL directory is referenced.
+    """
+    return 'MQL5' if kind=='MT5' else 'MQL4'
 
 def safe_job_id(value):
     value=re.sub(r'[^A-Za-z0-9_.-]+','-',str(value or '').strip()).strip('.-')
     return (value or hashlib.sha1(str(time.time_ns()).encode()).hexdigest()[:12])[:64]
-
 
 class RenderLock:
     def __init__(self,path,timeout=5.0):
@@ -50,7 +57,6 @@ class RenderLock:
         except Exception:pass
         self.file=None
 
-
 def terminate_tree(proc):
     if proc is None:return
     try:
@@ -63,11 +69,10 @@ def terminate_tree(proc):
     else:
         try:proc.terminate()
         except Exception:pass
-    try:proc.wait(timeout=5)
-    except Exception:
-        try:proc.kill()
-        except Exception:pass
-
+        try:proc.wait(timeout=5)
+        except Exception:
+            try:proc.kill()
+            except Exception:pass
 
 def compile_has_errors(text):
     for m in re.finditer(r'(?i)(?:result\s*:\s*)?(\d+)\s+errors?\b',text or ''):
@@ -76,11 +81,9 @@ def compile_has_errors(text):
         except Exception:pass
     return False
 
-
 def emit(o):
     b=(json.dumps(o,ensure_ascii=False,default=str)+'\n').encode('utf-8','backslashreplace')
     sys.stdout.buffer.write(b); sys.stdout.buffer.flush()
-
 
 def emit_stage(job_id,name,message=None,**details):
     payload={'type':'stage','job_id':job_id,'stage':name}
@@ -88,14 +91,12 @@ def emit_stage(job_id,name,message=None,**details):
     payload.update(details)
     emit(payload)
 
-
 def read_text(p):
     if not p.exists(): return ''
     for enc in ('utf-16','utf-8','cp1252','latin1'):
         try:return p.read_text(encoding=enc,errors='ignore')
         except Exception:pass
     return ''
-
 
 def decode_origin_bytes(data):
     encodings=('utf-16','utf-8-sig','cp1252','latin1') if data[:2] in (b'\xff\xfe',b'\xfe\xff') else ('utf-8-sig','cp1252','latin1','utf-16')
@@ -107,12 +108,10 @@ def decode_origin_bytes(data):
         except Exception:pass
     return ''
 
-
 def read_origin(p):
     if not p.exists():return ''
     try:return decode_origin_bytes(p.read_bytes())
     except Exception:return ''
-
 
 def data_activity(path):
     root=Path(path)
@@ -126,16 +125,13 @@ def data_activity(path):
         except Exception:pass
     return newest
 
-
 def same_path(a,b):
     if not a or not b:return False
     try:return Path(a).resolve()==Path(b).resolve()
     except Exception:return os.path.normcase(os.path.abspath(str(a)))==os.path.normcase(os.path.abspath(str(b)))
 
-
 def metatrader_data_root():
     return Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'
-
 
 def observed_data_folders(base=None):
     base=Path(base) if base is not None else metatrader_data_root()
@@ -152,7 +148,6 @@ def observed_data_folders(base=None):
         })
     return rows
 
-
 def discover_data_dirs(base=None):
     rows=[]
     for item in observed_data_folders(base):
@@ -167,7 +162,6 @@ def discover_data_dirs(base=None):
             })
     return rows
 
-
 def find_editor(install,kind):
     install=Path(install)
     names=('metaeditor64.exe','metaeditor.exe') if kind=='MT5' else ('metaeditor.exe','metaeditor64.exe')
@@ -178,7 +172,6 @@ def find_editor(install,kind):
         candidates=[p for p in install.iterdir() if p.is_file() and p.name.lower().startswith('metaeditor') and p.suffix.lower()=='.exe']
     except Exception:candidates=[]
     return str(candidates[0]) if candidates else None
-
 
 def candidate_install_dirs(base=None,roots=None):
     seen=set(); out=[]
@@ -205,7 +198,6 @@ def candidate_install_dirs(base=None,roots=None):
             seen.add(key);out.append(install)
     return out
 
-
 def discover_installations(base=None,roots=None):
     out=[]; seen=set()
     for install in candidate_install_dirs(base,roots):
@@ -225,16 +217,14 @@ def discover_installations(base=None,roots=None):
             })
     return out
 
-
 def runtime_candidate_score(t):
     terminal_ok=bool(t.get('terminal') and Path(t['terminal']).is_file())
     editor_ok=bool(t.get('editor') and Path(t['editor']).is_file())
     data_ok=bool(t.get('data_dir') and Path(t['data_dir']).is_dir())
-    mql_ok=bool(data_ok and (Path(t['data_dir'])/t['kind']).is_dir())
+    mql_ok=bool(data_ok and (Path(t['data_dir'])/mql_dir_name(t['kind'])).is_dir())
     ready=terminal_ok and editor_ok and data_ok and mql_ok
     origin_match=t.get('pair_method')=='origin-match'
     return (1 if ready else 0,1 if origin_match else 0,1 if terminal_ok else 0,1 if editor_ok else 0,1 if data_ok else 0,int(t.get('activity_ns') or 0))
-
 
 def pair_runtime_candidates(installs=None,data_dirs=None):
     installs=list(discover_installations() if installs is None else installs)
@@ -268,12 +258,10 @@ def pair_runtime_candidates(installs=None,data_dirs=None):
     out.sort(key=runtime_candidate_score,reverse=True)
     return out
 
-
 def terminals(base=None,roots=None):
     data=discover_data_dirs(base)
     installs=discover_installations(base,roots)
     return pair_runtime_candidates(installs,data)
-
 
 def detect():
     base=metatrader_data_root()
@@ -287,8 +275,6 @@ def detect():
         'terminals':pair_runtime_candidates(installs,data)
     })
 
-
-
 def memory_stats(db):
     p=Path(db)
     if not p.exists():return emit({'ok':True,'corrections':0,'verified':0,'families':0,'latest':[]})
@@ -297,7 +283,6 @@ def memory_stats(db):
         one=lambda q:c.execute(q).fetchone()[0]
         emit({'ok':True,'corrections':one('select count(*) from classification_memory'),'verified':one('select count(*) from indicators where human_verified=1'),'families':one("select count(distinct family_fingerprint) from classification_memory where family_fingerprint is not null and family_fingerprint!=''"),'latest':[]})
     finally:c.close()
-
 
 def remove_source(db,source):
     p=Path(db); source=str(Path(source)); n=0
@@ -311,7 +296,6 @@ def remove_source(db,source):
             c.execute('delete from sources where path=?',(source,)); c.commit()
         finally:c.close()
     emit({'ok':True,'removed_indicators':n,'source':source})
-
 
 def archive_reset(db):
     p=Path(db); app=p.parent; dl=Path(os.environ.get('USERPROFILE',str(app)))/'Downloads'; out=dl if dl.exists() else app; out.mkdir(parents=True,exist_ok=True)
@@ -331,10 +315,8 @@ def archive_reset(db):
         if d.exists():shutil.rmtree(d,ignore_errors=True)
     emit({'ok':True,'archive':str(zpath),'app_dir':str(app)})
 
-
 def safe_name(src):
     s=re.sub(r'\s+','_',src.stem.strip()); s=re.sub(r'[^A-Za-z0-9_.()#-]+','_',s).strip(' ._') or 'indicator'; return s[:100]+src.suffix.lower()
-
 
 def compile_file(editor,src,mqlroot):
     expected=src.with_suffix('.ex5' if src.suffix.lower()=='.mq5' else '.ex4'); log=src.with_suffix('.log'); attempts=[]
@@ -356,13 +338,11 @@ def compile_file(editor,src,mqlroot):
         if compile_has_errors(latest):return None,attempts,latest
     return None,attempts,read_text(log)
 
-
 def existing_binary(src,ext):
     if src.suffix.lower()==ext and src.exists():return src
     p=src.with_suffix(ext)
     if p.exists() and p.stat().st_size:return p
     return None
-
 
 def copy_compiled_support(src,dst,kind):
     dst.mkdir(parents=True,exist_ok=True)
@@ -377,16 +357,14 @@ def copy_compiled_support(src,dst,kind):
             shutil.copy2(p,target)
         except Exception:pass
 
-
 def seed_mql_runtime(t,rt,kind):
     """Create a valid minimum MQL tree first, then seed reusable support files."""
-    live=Path(t['data_dir']); src=live/kind; dst=rt/kind; marker=rt/f'.{kind.lower()}-seed-v5'
+    live=Path(t['data_dir']); src=live/mql_dir_name(kind); dst=rt/mql_dir_name(kind); marker=rt/f'.{kind.lower()}-seed-v5'
     dst.mkdir(parents=True,exist_ok=True)
     (dst/'Indicators').mkdir(parents=True,exist_ok=True)
     (dst/'Scripts').mkdir(parents=True,exist_ok=True)
     (dst/'Files').mkdir(parents=True,exist_ok=True)
     if not src.is_dir():return False
-
     marker_valid=marker.exists() and (dst/'Indicators').is_dir()
     if not marker_valid:
         for name in ('Include','Libraries','Presets','Images'):
@@ -396,11 +374,9 @@ def seed_mql_runtime(t,rt,kind):
                 except Exception:pass
         copy_compiled_support(src/'Indicators',dst/'Indicators',kind)
         marker.write_text(f'{src}\n{int(time.time())}',encoding='utf-8')
-
     preview_dir=dst/'Indicators'/'MQLLibraryPreview'
     if preview_dir.exists():shutil.rmtree(preview_dir,ignore_errors=True)
     return not marker_valid
-
 
 def clone_runtime(t,out,kind):
     install=Path(t['install_dir'])
@@ -422,19 +398,17 @@ def clone_runtime(t,out,kind):
                 except Exception:pass
         marker.parent.mkdir(parents=True,exist_ok=True)
         marker.write_text(stamp,encoding='utf-8')
-
     seed_mql_runtime(t,rt,kind)
     required={
         'sandbox':rt.is_dir(),
         'sandbox_terminal':(rt/terminal_src.name).is_file(),
         'sandbox_metaeditor':(rt/editor_src.name).is_file(),
-        'sandbox_mql_dir':(rt/kind).is_dir(),
-        'sandbox_indicators_dir':(rt/kind/'Indicators').is_dir()
+        'sandbox_mql_dir':(rt/mql_dir_name(kind)).is_dir(),
+        'sandbox_indicators_dir':(rt/mql_dir_name(kind)/'Indicators').is_dir()
     }
     missing=[name for name,ok in required.items() if not ok]
     if missing:raise RuntimeError(f'Preview sandbox initialization failed for {kind}: {", ".join(missing)}')
     return rt
-
 
 def stage(src,mql,kind,editor):
     ext='.ex5' if kind=='MT5' else '.ex4'; job=hashlib.sha1(str(src.resolve()).lower().encode()).hexdigest()[:14]; d=mql/'Indicators'/'MQLLibraryPreview'/job;d.mkdir(parents=True,exist_ok=True)
@@ -451,7 +425,6 @@ def stage(src,mql,kind,editor):
         raise RuntimeError(f'Indicator compile failed — {kind} MetaEditor produced no executable. Staged={staged}; commands={cmds}')
     return job,staged,built,{'used_existing_binary':False}
 
-
 def copy_mt4_history(live,rt):
     files=[]; h=live/'history'
     if h.exists():
@@ -464,7 +437,6 @@ def copy_mt4_history(live,rt):
         try:shutil.copy2(f,dest/f.name)
         except Exception:pass
     return sym
-
 
 def copy_mt5_history(live,rt):
     cand=[]; b=live/'bases'
@@ -479,11 +451,9 @@ def copy_mt5_history(live,rt):
     except Exception:pass
     return src.name
 
-
 def startupinfo():
     if os.name!='nt':return None
     si=subprocess.STARTUPINFO();si.dwFlags|=getattr(subprocess,'STARTF_USESHOWWINDOW',1);si.wShowWindow=SW_HIDE;return si
-
 
 def hide_pid(pid):
     if os.name!='nt':return
@@ -495,7 +465,6 @@ def hide_pid(pid):
         return True
     try:u.EnumWindows(cb,0)
     except Exception:pass
-
 
 def wait_quiet(root,proc=None,minimum=4,quiet=3,timeout=35):
     start=time.time(); last_change=start; signature=None
@@ -512,18 +481,15 @@ def wait_quiet(root,proc=None,minimum=4,quiet=3,timeout=35):
         time.sleep(.5)
     return False
 
-
 def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
     marker=rt/'.mt5-preview-prime-v3'
     if marker.exists():
         emit_stage(job_id,'mt5_prime_cached','MT5 preview runtime is already initialized.')
         return
-
     cfg=rt/f'mql-prime-{safe_job_id(job_id)}.ini'
     cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={symbol}\nPeriod=H1\n',encoding='utf-8')
     emit_stage(job_id,'mt5_prime_start','Initializing isolated MT5 runtime. First use can take longer while MetaTrader prepares its MQL5 files.')
     proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
-
     start=time.monotonic()
     last_any_change=start
     last_meta_change=start
@@ -533,14 +499,12 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
     saw_meta_activity_after_recompile=False
     settled=False
     announced_recompile=False
-
     try:
         while time.monotonic()-start<120:
             now=time.monotonic()
             hide_pid(proc.pid)
             if proc.poll() is not None and now-start<5:
                 break
-
             rows=[]
             log_root=rt/'logs'
             if log_root.exists():
@@ -551,7 +515,6 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
             if all_sig!=last_all_sig:
                 last_all_sig=all_sig
                 last_any_change=now
-
             meta=log_root/'metaeditor.log'
             try:meta_sig=(meta.stat().st_size,meta.stat().st_mtime_ns)
             except Exception:meta_sig=None
@@ -560,7 +523,6 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
                     saw_meta_activity_after_recompile=True
                 last_meta_sig=meta_sig
                 last_meta_change=now
-
             tails=latest_logs(log_root)
             if not saw_recompile and 'full recompilation has been started' in tails.lower():
                 saw_recompile=True
@@ -568,7 +530,6 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
                 if not announced_recompile:
                     emit_stage(job_id,'mt5_full_recompile','MetaTrader is performing its one-time MQL5 runtime compilation. Waiting for it to finish before rendering.')
                     announced_recompile=True
-
             elapsed=now-start
             if saw_recompile:
                 if saw_meta_activity_after_recompile and elapsed>=8 and now-last_meta_change>=5:
@@ -577,21 +538,17 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
             elif elapsed>=8 and now-last_any_change>=5:
                 settled=True
                 break
-
             if int(elapsed)%15==0 and elapsed>=15:
                 time.sleep(.55)
             else:
                 time.sleep(.5)
     finally:
         terminate_tree(proc)
-
     if not settled:
         emit_stage(job_id,'mt5_prime_timeout','MT5 runtime initialization did not reach a verified idle state.',elapsed_ms=round((time.monotonic()-start)*1000))
         raise RuntimeError('MT5 preview runtime initialization timed out before MetaTrader became idle.')
-
     marker.write_text(f'ready-v3\n{int(time.time())}',encoding='utf-8')
     emit_stage(job_id,'mt5_prime_ready','MT5 preview runtime initialization completed.',elapsed_ms=round((time.monotonic()-start)*1000))
-
 
 def wait_image(proc,paths,timeout=50):
     end=time.time()+timeout
@@ -603,7 +560,6 @@ def wait_image(proc,paths,timeout=50):
         time.sleep(.25)
     return None
 
-
 def latest_logs(root):
     rows=[]
     if root.exists():
@@ -612,17 +568,15 @@ def latest_logs(root):
             except Exception:pass
     return '\n\n'.join(f'[{p}]\n{read_text(p)[-2200:]}' for _,p in sorted(rows,reverse=True)[:4])
 
-
 def preview_trace(logs):
     lines=[]
     for line in logs.splitlines():
         if 'MQLLIB_PREVIEW' in line:lines.append(line)
     return '\n'.join(lines[-20:])
 
-
 def mt5_capture_source(rel,shot,win):
     return (
-        'void OnStart(){\n'        ' Print("MQLLIB_PREVIEW stage=onstart");\n'
+        'void OnStart(){\n' ' Print("MQLLIB_PREVIEW stage=onstart");\n'
         ' ResetLastError();\n'
         f' Print("MQLLIB_PREVIEW stage=before_iCustom path={rel}");\n'
         f' int h=iCustom(_Symbol,_Period,"{rel}");\n'
@@ -649,7 +603,6 @@ def mt5_capture_source(rel,shot,win):
         '}\n'
     )
 
-
 def render_mt4(src,out,t,job_id):
     emit_stage(job_id,'runtime_clone','Preparing isolated MT4 runtime.')
     rt=clone_runtime(t,out,'MT4');mql=rt/'MQL4';scripts=mql/'Scripts';templates=rt/'templates';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,templates,files)]
@@ -673,7 +626,6 @@ def render_mt4(src,out,t,job_id):
         raise RuntimeError(f'Preview renderer failed — MT4 produced no screenshot. exit={rc}; runtime={rt}; config={cfg}; symbol={sym}. Trace:\n{trace or "(no capture trace)"}\nLogs:\n{logs}')
     emit_stage(job_id,'screenshot_ready','MT4 screenshot captured.')
     final=out/(hashlib.sha1(('MT4|'+str(src.resolve()).lower()).encode()).hexdigest()[:16]+'.gif');out.mkdir(parents=True,exist_ok=True);shutil.copy2(img,final);meta.update({'isolated_runtime':str(rt),'symbol':sym,'staged':str(staged),'binary':str(binary),'job_id':job_id,'config':str(cfg)});return final,meta
-
 
 def render_mt5(src,out,t,job_id):
     emit_stage(job_id,'runtime_clone','Preparing isolated MT5 runtime.')
@@ -699,16 +651,13 @@ def render_mt5(src,out,t,job_id):
     emit_stage(job_id,'screenshot_ready','MT5 screenshot captured.')
     final=out/(hashlib.sha1(('MT5|'+str(src.resolve()).lower()).encode()).hexdigest()[:16]+'.png');out.mkdir(parents=True,exist_ok=True);shutil.copy2(img,final);meta.update({'isolated_runtime':str(rt),'symbol':sym,'staged':str(staged),'binary':str(binary),'job_id':job_id,'config':str(cfg)});return final,meta
 
-
 class PreviewRuntimeError(RuntimeError):
     def __init__(self,message,diagnostics=None):
         super().__init__(message)
         self.diagnostics=diagnostics or []
 
-
 def source_kind(source):
     return 'MT5' if Path(source).suffix.lower() in ('.mq5','.ex5') else 'MT4'
-
 
 def selection_checks(src,kind,selected):
     data_dir=Path(selected['data_dir']) if selected.get('data_dir') else None
@@ -717,21 +666,19 @@ def selection_checks(src,kind,selected):
         'terminal_binary':bool(selected.get('terminal') and Path(selected['terminal']).is_file()),
         'metaeditor_binary':bool(selected.get('editor') and Path(selected['editor']).is_file()),
         'data_directory':bool(data_dir and data_dir.is_dir()),
-        'mql_directory':bool(data_dir and (data_dir/kind).is_dir())
+        'mql_directory':bool(data_dir and (data_dir/mql_dir_name(kind)).is_dir())
     }
-
 
 def discovery_diagnostics(kind,selected=None,checks=None):
     selected=selected or {}
     checks=checks or {}
-    mql_name=kind
+    mql_name=mql_dir_name(kind)
     return [
         {'stage':'Terminal binary','status':'FOUND' if checks.get('terminal_binary') else 'NOT FOUND','path':selected.get('terminal')},
         {'stage':'MetaEditor binary','status':'FOUND' if checks.get('metaeditor_binary') else 'NOT FOUND','path':selected.get('editor')},
         {'stage':'Data directory','status':'FOUND' if checks.get('data_directory') else 'NOT FOUND','path':selected.get('data_dir'),'pair_method':selected.get('pair_method')},
-        {'stage':f'{mql_name} directory','status':'FOUND' if checks.get('mql_directory') else 'NOT FOUND','path':str(Path(selected['data_dir'])/kind) if selected.get('data_dir') else None}
+        {'stage':f'{mql_name} directory','status':'FOUND' if checks.get('mql_directory') else 'NOT FOUND','path':str(Path(selected['data_dir'])/mql_name) if selected.get('data_dir') else None}
     ]
-
 
 def choose_runtime(kind,terminal=None):
     candidates=[x for x in terminals() if x['kind']==kind]
@@ -742,7 +689,6 @@ def choose_runtime(kind,terminal=None):
         diagnostics=[{'stage':'Terminal binary','status':'NOT FOUND','path':None}]
         raise PreviewRuntimeError(f'No {kind} terminal binary was detected.',diagnostics)
     return candidates[0]
-
 
 def preview_runtime(source,terminal=None,selected=None):
     src=Path(source)
@@ -765,12 +711,10 @@ def preview_runtime(source,terminal=None,selected=None):
         )
     return src,kind,selected,checks
 
-
 def runtime_cache_path(dest,kind):
     p=Path(dest).parent/'preview-runtime'/f'{kind.lower()}-selection-v5.json'
     p.parent.mkdir(parents=True,exist_ok=True)
     return p
-
 
 def load_runtime_cache(dest,kind):
     path=runtime_cache_path(dest,kind)
@@ -787,12 +731,10 @@ def load_runtime_cache(dest,kind):
         return None
     return selected
 
-
 def write_runtime_cache(dest,kind,source,selected):
     path=runtime_cache_path(dest,kind)
     path.write_text(json.dumps({'version':5,'kind':kind,'source':str(source),'terminal':selected,'saved_at':int(time.time())},ensure_ascii=False,indent=2),encoding='utf-8')
     return path
-
 
 def preflight(source,out,terminal=None):
     src=Path(source);kind=source_kind(src);dest=Path(out)
@@ -800,21 +742,21 @@ def preflight(source,out,terminal=None):
     cache_hit=bool(cached)
     src,kind,selected,checks=preview_runtime(src,terminal,selected=cached)
     diagnostics=discovery_diagnostics(kind,selected,checks)
-
     rt=clone_runtime(selected,dest,kind)
+    mql_name=mql_dir_name(kind)
     sandbox_checks={
         'sandbox':rt.is_dir(),
         'sandbox_terminal':(rt/Path(selected['terminal']).name).is_file(),
         'sandbox_metaeditor':(rt/Path(selected['editor']).name).is_file(),
-        'sandbox_mql_dir':(rt/kind).is_dir(),
-        'sandbox_indicators_dir':(rt/kind/'Indicators').is_dir()
+        'sandbox_mql_dir':(rt/mql_name).is_dir(),
+        'sandbox_indicators_dir':(rt/mql_name/'Indicators').is_dir()
     }
     diagnostics.extend([
         {'stage':'Preview sandbox','status':'CREATED' if sandbox_checks['sandbox'] else 'FAILED','path':str(rt)},
         {'stage':'Sandbox terminal','status':'FOUND' if sandbox_checks['sandbox_terminal'] else 'NOT FOUND','path':str(rt/Path(selected['terminal']).name)},
         {'stage':'Sandbox MetaEditor','status':'FOUND' if sandbox_checks['sandbox_metaeditor'] else 'NOT FOUND','path':str(rt/Path(selected['editor']).name)},
-        {'stage':f'Sandbox {kind} directory','status':'FOUND' if sandbox_checks['sandbox_mql_dir'] else 'NOT FOUND','path':str(rt/kind)},
-        {'stage':'Sandbox Indicators directory','status':'FOUND' if sandbox_checks['sandbox_indicators_dir'] else 'NOT FOUND','path':str(rt/kind/'Indicators')}
+        {'stage':f'Sandbox {mql_name} directory','status':'FOUND' if sandbox_checks['sandbox_mql_dir'] else 'NOT FOUND','path':str(rt/mql_name)},
+        {'stage':'Sandbox Indicators directory','status':'FOUND' if sandbox_checks['sandbox_indicators_dir'] else 'NOT FOUND','path':str(rt/mql_name/'Indicators')}
     ])
     failed=[x['stage'] for x in diagnostics if x['status'] in ('FAILED','NOT FOUND')]
     if failed:raise PreviewRuntimeError(f'Preview sandbox validation failed: {", ".join(failed)}.',diagnostics)
@@ -832,7 +774,6 @@ def preflight(source,out,terminal=None):
         'diagnostics':diagnostics
     })
 
-
 def render(source,out,terminal=None,job_id=None):
     src=Path(source);dest=Path(out);kind=source_kind(src);job_id=safe_job_id(job_id)
     cached=None if terminal else load_runtime_cache(dest,kind)
@@ -846,7 +787,6 @@ def render(source,out,terminal=None,job_id=None):
         image,meta=(render_mt5(src,dest,selected,job_id) if kind=='MT5' else render_mt4(src,dest,selected,job_id))
     emit({'ok':True,'image':str(image),'kind':kind,'cached':bool(cached),'job_id':job_id,'terminal':selected,'meta':meta})
 
-
 def open_source(source):
     src=Path(source);kind=source_kind(src)
     selected=choose_runtime(kind)
@@ -858,48 +798,43 @@ def open_source(source):
     subprocess.Popen([target,str(src)] if low.endswith('editor.exe') or low.endswith('editor64.exe') else [target])
     emit({'ok':True,'opened':target,'kind':kind})
 
-
 def self_test_discovery():
     checks={}
     with tempfile.TemporaryDirectory() as tmp:
         root=Path(tmp);base=root/'MetaQuotes'/'Terminal';base.mkdir(parents=True)
-
         mt5=root/'OANDA TMS MT5 Terminal';mt5.mkdir()
         (mt5/'terminal64.exe').write_bytes(b'terminal')
         (mt5/'metaeditor64.exe').write_bytes(b'editor')
         d5=base/'DATA5';(d5/'MQL5'/'Indicators').mkdir(parents=True)
         (d5/'origin.txt').write_text(str(mt5),encoding='utf-8')
-
         mt4=root/'Blueberry Markets MetaTrader 4';mt4.mkdir()
         (mt4/'terminal.exe').write_bytes(b'terminal')
         d4=base/'DATA4';(d4/'MQL4'/'Indicators').mkdir(parents=True)
         (d4/'origin.txt').write_text(str(mt4),encoding='utf-8')
-
         data=discover_data_dirs(base)
         installs=discover_installations(base,roots=[])
         pairs=pair_runtime_candidates(installs,data)
         p5=next((x for x in pairs if x['kind']=='MT5' and x.get('terminal')),None)
         p4=next((x for x in pairs if x['kind']=='MT4' and x.get('terminal')),None)
-
         checks['terminal_detection_independent_of_editor']=bool(p4 and p4.get('terminal') and not p4.get('editor'))
         checks['metaeditor_from_terminal_install']=bool(p5 and p5.get('editor')==str(mt5/'metaeditor64.exe'))
         checks['origin_data_pairing']=bool(p5 and p5.get('data_dir')==str(d5) and p5.get('pair_method')=='origin-match')
-
+        # Regression guard: the live-data MQL check must resolve to MQL5/MQL4, not MT5/MT4.
+        _mc=selection_checks(root/'demo.mq5','MT5',p5) if p5 else {}
+        checks['live_mql_directory_detected']=bool(p5 and _mc.get('mql_directory'))
+        checks['diagnostics_use_mql_folder_name']=bool(p5 and discovery_diagnostics('MT5',p5,_mc)[3]['stage']=='MQL5 directory')
         alt=root/'Alternate MT5';alt.mkdir()
         (alt/'terminal64.exe').write_bytes(b'terminal')
         (alt/'metaeditor64.exe').write_bytes(b'editor')
         alt_install={'kind':'MT5','terminal':str(alt/'terminal64.exe'),'editor':str(alt/'metaeditor64.exe'),'install_dir':str(alt)}
         fallback=pair_runtime_candidates([alt_install],[x for x in data if x['kind']=='MT5'])
         checks['independent_platform_pairing']=bool(fallback and fallback[0].get('data_dir')==str(d5) and fallback[0].get('pair_method')=='platform-fallback')
-
         out=root/'previews'
         rt=clone_runtime(p5,out,'MT5')
-        checks['sandbox_mql_tree_created']=True  # clone_runtime raises unless the minimum MQL tree exists
+        checks['sandbox_mql_tree_created']=(rt/'MQL5'/'Indicators').is_dir()  # clone_runtime raises unless the minimum MQL tree exists
         cache=write_runtime_cache(out,'MT5',root/'demo.mq5',p5)
         checks['runtime_selection_cache_written']=cache.is_file()
-
     return checks
-
 
 def self_test():
     src=mt5_capture_source('MQLLibraryPreview\\abc\\demo','shot.png','0')
@@ -915,13 +850,14 @@ def self_test():
         'mt5_prime_v3_marker':'.mt5-preview-prime-v3'.endswith('prime-v3'),
         'minimal_runtime_seed_v5':'.mql5-seed-v5'.endswith('seed-v5'),
         'shutdown_terminal_numeric':True,
+        'mql_dir_name_mt5':mql_dir_name('MT5')=='MQL5',
+        'mql_dir_name_mt4':mql_dir_name('MT4')=='MQL4',
         'origin_utf8_decode':decode_origin_bytes(b'C:\\Program Files\\OANDA TMS MT5')=='C:\\Program Files\\OANDA TMS MT5',
         'origin_utf16_decode':decode_origin_bytes(('C:\\Program Files\\MetaTrader 4').encode('utf-16'))=='C:\\Program Files\\MetaTrader 4',
     }
     checks.update(self_test_discovery())
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
     emit({'ok':True,'checks':checks})
-
 
 def main():
     a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True);s.add_parser('detect');s.add_parser('self-test');p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p=s.add_parser('open-source');p.add_argument('--source',required=True);p=s.add_parser('memory-stats');p.add_argument('--db',required=True);p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True);p=s.add_parser('archive-reset');p.add_argument('--db',required=True);x=a.parse_args()
@@ -933,7 +869,6 @@ def main():
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)
     elif x.cmd=='archive-reset':archive_reset(x.db)
-
 
 if __name__=='__main__':
     try:main()
