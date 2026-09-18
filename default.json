@@ -1,0 +1,68 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Desktop permissions for MQL Indicator Library",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries/mql-engine",
+          "cmd": "binaries/mql-engine",
+          "sidecar": true,
+          "args": true
+        },
+        {
+          "name": "binaries/mql-preview",
+          "cmd": "binaries/mql-preview",
+          "sidecar": true,
+          "args": true
+        },
+        {
+          "name": "binaries/mql-preview-control",
+          "cmd": "binaries/mql-preview-control",
+          "sidecar": true,
+          "args": true
+        },
+        {
+          "name": "binaries/mql-preview-batch",
+          "cmd": "binaries/mql-preview-batch",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "binaries/mql-engine",
+          "cmd": "binaries/mql-engine",
+          "sidecar": true,
+          "args": true
+        },
+        {
+          "name": "binaries/mql-preview",
+          "cmd": "binaries/mql-preview",
+          "sidecar": true,
+          "args": true
+        },
+        {
+          "name": "binaries/mql-preview-control",
+          "cmd": "binaries/mql-preview-control",
+          "sidecar": true,
+          "args": true
+        },
+        {
+          "name": "binaries/mql-preview-batch",
+          "cmd": "binaries/mql-preview-batch",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    }
+  ]
+}
