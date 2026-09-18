@@ -128,7 +128,7 @@ jobs:
           if($bridge -notmatch 'mt5-preview-prime-v3'){throw 'MT5 prime v3 readiness marker missing'}
           if($bridge -notmatch 'seed-v5'){throw 'Minimum runtime seed v5 missing'}
           if($bridge -notmatch 'terminal_selected'){throw 'Terminal data-folder selection stage missing'}
-          if($bridge -notmatch 'def preflight' -or $bridge -notmatch "s.add_parser('preflight')"){throw 'Preview runtime preflight command missing'}
+          if($bridge -notmatch 'def preflight' -or $bridge -notmatch "add_parser\('preflight'\)"){throw 'Preview runtime preflight command missing'}
           if($bridge -notmatch 'decode_origin_bytes'){throw 'origin.txt byte-aware decoder missing'}
           if($bridge -notmatch 'discover_installations' -or $bridge -notmatch 'discover_data_dirs' -or $bridge -notmatch 'pair_runtime_candidates'){throw 'Separated terminal/data discovery missing'}
           if($bridge -notmatch 'find_editor' -or $bridge -notmatch 'terminal-install-dir'){throw 'MetaEditor resolution from terminal install missing'}
