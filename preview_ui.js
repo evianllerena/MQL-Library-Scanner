@@ -125,12 +125,51 @@ function invalidatePreview(reason){
   return queueCancellation(reason);
 }
 
+function previewStageMessage(stage,payload){
+  if(payload?.message)return payload.message;
+  const labels={
+    runtime_clone:'Preparing isolated MetaTrader runtime…',
+    mt5_prime_start:'Initializing isolated MT5 runtime…',
+    mt5_full_recompile:'MetaTrader is compiling its MQL5 runtime for first use…',
+    mt5_prime_ready:'MT5 runtime initialization completed.',
+    mt5_prime_cached:'MT5 runtime is ready.',
+    indicator_compile:'Compiling/staging selected indicator…',
+    capture_compile:'Compiling screenshot capture script…',
+    terminal_launch:'Launching isolated MetaTrader terminal…',
+    screenshot_wait:'Waiting for MetaTrader screenshot…',
+    screenshot_ready:'Screenshot captured.'
+  };
+  return labels[stage]||`Preview engine: ${stage}`;
+}
+
+async function handleEngineStage(line,source,jobId){
+  let payload;
+  try{payload=JSON.parse(line);}catch{return;}
+  if(payload?.type!=='stage')return;
+  if(payload.job_id&&payload.job_id!==jobId)return;
+  await appLog('INFO','preview_engine_stage',{jobId,source,...payload});
+  if(desiredSource===source&&previewState.source===source){
+    setPreviewState(source,{
+      phase:'rendering',
+      message:previewStageMessage(payload.stage,payload),
+      image:null
+    });
+  }
+}
+
 async function spawnRender(source,outDir,myToken,jobId){
   const cmd=Command.sidecar('binaries/mql-preview',[
     'render','--source',source,'--out',outDir,'--job-id',jobId
   ]);
-  let stdout='',stderr='';
-  cmd.stdout.on('data',data=>{stdout+=String(data)+'\n';});
+  let stdout='',stderr='',lineBuffer='';
+  cmd.stdout.on('data',data=>{
+    const chunk=String(data);
+    stdout+=chunk+'\n';
+    lineBuffer+=chunk;
+    const lines=lineBuffer.split(/\r?\n/);
+    lineBuffer=lines.pop()||'';
+    for(const line of lines){if(line.trim())void handleEngineStage(line.trim(),source,jobId);}
+  });
   cmd.stderr.on('data',data=>{stderr+=String(data)+'\n';});
   const closed=new Promise((resolve,reject)=>{
     cmd.on('close',data=>resolve(data));
@@ -150,6 +189,7 @@ async function spawnRender(source,outDir,myToken,jobId){
   let closeData;
   try{
     closeData=await closed;
+    if(lineBuffer.trim())await handleEngineStage(lineBuffer.trim(),source,jobId);
   }finally{
     const elapsedMs=Math.round(performance.now()-job.startedAt);
     await appLog('INFO','preview_process_exit',{
@@ -395,7 +435,7 @@ function startUiWatchdog(){
 
 function boot(){
   const brand=document.querySelector('.brand small');
-  if(brand)brand.textContent='0.5.9 • Evidence Engine v4 + Single-Flight MT4/MT5 Preview';
+  if(brand)brand.textContent='0.5.10 • Evidence Engine v4 + Verified MT4/MT5 Runtime';
   ensureClearCard();
   enhanceSourceRemoval();
   startUiWatchdog();
