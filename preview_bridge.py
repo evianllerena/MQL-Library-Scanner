@@ -257,7 +257,8 @@ def compile_file(editor,src,mqlroot):
         end=time.monotonic()+3.0
         latest=''
         while time.monotonic()<end:
-            if expected.exists() and expected.stat().st_size:return expected,attempts,read_text(log)            latest=read_text(log)
+            if expected.exists() and expected.stat().st_size:return expected,attempts,read_text(log)
+            latest=read_text(log)
             if compile_has_errors(latest):return None,attempts,latest
             time.sleep(.15)
         latest=read_text(log)
