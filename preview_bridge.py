@@ -97,10 +97,7 @@ def read_text(p):
     return ''
 
 
-def read_origin(p):
-    if not p.exists():return ''
-    try:data=p.read_bytes()
-    except Exception:return ''
+def decode_origin_bytes(data):
     encodings=('utf-16','utf-8-sig','cp1252','latin1') if data[:2] in (b'\xff\xfe',b'\xfe\xff') else ('utf-8-sig','cp1252','latin1','utf-16')
     for enc in encodings:
         try:
@@ -109,6 +106,12 @@ def read_origin(p):
                 return text
         except Exception:pass
     return ''
+
+
+def read_origin(p):
+    if not p.exists():return ''
+    try:return decode_origin_bytes(p.read_bytes())
+    except Exception:return ''
 
 
 def data_activity(path):
@@ -632,7 +635,8 @@ def self_test():
         'mt5_prime_v3_marker':'.mt5-preview-prime-v3'.endswith('prime-v3'),
         'minimal_runtime_seed_v4':'.mql5-seed-v4'.endswith('seed-v4'),
         'shutdown_terminal_numeric':True,
-        'origin_utf8_decode':read_origin_bytes_test() if False else True,
+        'origin_utf8_decode':decode_origin_bytes(b'C:\\Program Files\\OANDA TMS MT5')=='C:\\Program Files\\OANDA TMS MT5',
+        'origin_utf16_decode':decode_origin_bytes(('C:\\Program Files\\MetaTrader 4').encode('utf-16'))=='C:\\Program Files\\MetaTrader 4',
     }
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
     emit({'ok':True,'checks':checks})
