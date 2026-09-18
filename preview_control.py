@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, gc, json, os, shutil, sqlite3, subprocess, sys, time
+import argparse, gc, json, os, re, shutil, sqlite3, subprocess, sys, time
 from pathlib import Path
 
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
@@ -10,16 +10,86 @@ def emit(obj):
     sys.stdout.buffer.write(data);sys.stdout.buffer.flush()
 
 
-def cancel_tree(pid:int):
-    if pid<=0: return emit({'ok':True,'cancelled':False,'reason':'invalid pid'})
+def pid_exists(pid:int)->bool:
+    if pid<=0:
+        return False
     if os.name=='nt':
-        cp=subprocess.run(['taskkill','/PID',str(pid),'/T','/F'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,creationflags=CREATE_NO_WINDOW)
-        emit({'ok':True,'cancelled':cp.returncode==0,'pid':pid,'returncode':cp.returncode,'output':(cp.stdout or cp.stderr or '').strip()[-1200:]})
-        return
+        cp=subprocess.run(
+            ['tasklist','/FI',f'PID eq {pid}','/FO','CSV','/NH'],
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+            creationflags=CREATE_NO_WINDOW
+        )
+        text=(cp.stdout or '').strip()
+        return cp.returncode==0 and re.search(rf',"{pid}",',text) is not None
     try:
-        os.kill(pid,15);emit({'ok':True,'cancelled':True,'pid':pid})
+        os.kill(pid,0)
+        return True
     except ProcessLookupError:
-        emit({'ok':True,'cancelled':False,'pid':pid,'reason':'not running'})
+        return False
+    except PermissionError:
+        return True
+
+
+def cancel_tree_result(pid:int):
+    started=time.monotonic()
+    if pid<=0:
+        return {'ok':False,'cancelled':False,'pid':pid,'reason':'invalid pid','verified_gone':False}
+
+    if not pid_exists(pid):
+        return {
+            'ok':True,'cancelled':True,'pid':pid,'already_exited':True,
+            'verified_gone':True,'elapsed_ms':round((time.monotonic()-started)*1000)
+        }
+
+    if os.name=='nt':
+        cp=subprocess.run(
+            ['taskkill','/PID',str(pid),'/T','/F'],
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+            creationflags=CREATE_NO_WINDOW
+        )
+        output=(cp.stdout or cp.stderr or '').strip()[-1600:]
+        gone=False
+        for _ in range(60):
+            if not pid_exists(pid):
+                gone=True
+                break
+            time.sleep(.05)
+        return {
+            'ok':gone,
+            'cancelled':gone,
+            'pid':pid,
+            'returncode':cp.returncode,
+            'verified_gone':gone,
+            'output':output,
+            'elapsed_ms':round((time.monotonic()-started)*1000)
+        }
+
+    try:
+        os.kill(pid,15)
+    except ProcessLookupError:
+        return {'ok':True,'cancelled':True,'pid':pid,'already_exited':True,'verified_gone':True}
+    except Exception as e:
+        return {'ok':False,'cancelled':False,'pid':pid,'verified_gone':False,'error':str(e)}
+
+    gone=False
+    for _ in range(60):
+        if not pid_exists(pid):
+            gone=True
+            break
+        time.sleep(.05)
+    if not gone:
+        try:os.kill(pid,9)
+        except Exception:pass
+        time.sleep(.1)
+        gone=not pid_exists(pid)
+    return {
+        'ok':gone,'cancelled':gone,'pid':pid,'verified_gone':gone,
+        'elapsed_ms':round((time.monotonic()-started)*1000)
+    }
+
+
+def cancel_tree(pid:int):
+    emit(cancel_tree_result(pid))
 
 
 def remove_item(item:Path):
@@ -82,9 +152,34 @@ def clear_app(db:str):
 
 def self_test():
     checks={
-        'taskkill_available':True if os.name!='nt' else bool(subprocess.run(['where','taskkill'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=CREATE_NO_WINDOW).returncode==0),
-        'clear_scoped_to_db_parent':True
+        'taskkill_available':True if os.name!='nt' else bool(subprocess.run(
+            ['where','taskkill'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW
+        ).returncode==0),
+        'clear_scoped_to_db_parent':True,
+        'cancel_verifies_process_exit':False
     }
+    proc=None
+    try:
+        if os.name=='nt':
+            proc=subprocess.Popen(
+                ['cmd','/c','ping','127.0.0.1','-n','30'],
+                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW
+            )
+        else:
+            proc=subprocess.Popen(['sleep','30'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        time.sleep(.2)
+        result=cancel_tree_result(proc.pid)
+        checks['cancel_verifies_process_exit']=bool(
+            result.get('ok') and result.get('cancelled') and result.get('verified_gone')
+            and not pid_exists(proc.pid)
+        )
+    finally:
+        if proc is not None and pid_exists(proc.pid):
+            try:proc.kill()
+            except Exception:pass
+
     emit({'ok':all(checks.values()),'checks':checks})
 
 
