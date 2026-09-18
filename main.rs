@@ -11,7 +11,7 @@ fn startup_log(message: &str) {
 }
 
 fn main() {
-    startup_log("0.5.9 process entered main()");
+    startup_log("0.5.10 process entered main()");
     std::panic::set_hook(Box::new(|info| {
         startup_log(&format!("PANIC: {}", info));
     }));
