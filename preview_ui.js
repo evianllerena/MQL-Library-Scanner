@@ -27,7 +27,11 @@ function parsePayload(text){
 async function execSidecar(name,args){
   const out=await Command.sidecar(name,args).execute();
   const payload=parsePayload(out.stdout);
-  if(out.code!==0||!payload?.ok)throw new Error(payload?.error||payload?.output||out.stderr||`${name} exited ${out.code}`);
+  if(out.code!==0||!payload?.ok){
+    const error=new Error(payload?.error||payload?.output||out.stderr||`${name} exited ${out.code}`);
+    error.payload=payload;
+    throw error;
+  }
   return payload;
 }
 
@@ -128,13 +132,16 @@ function invalidatePreview(reason){
 function previewStageMessage(stage,payload){
   if(payload?.message)return payload.message;
   const labels={
-    terminal_selected:'Matched the active MetaTrader data folder.',
+    terminal_selected:'Matched the active MetaTrader terminal and data folder.',
+    runtime_preflight_cached:'Using validated preview runtime selection.',
     runtime_clone:'Preparing isolated MetaTrader runtime from the matched terminal…',
     mt5_prime_start:'Initializing isolated MT5 runtime…',
     mt5_full_recompile:'MetaTrader is compiling its MQL5 runtime for first use…',
     mt5_prime_ready:'MT5 runtime initialization completed.',
     mt5_prime_cached:'MT5 runtime is ready.',
     indicator_compile:'Compiling/staging selected indicator…',
+    indicator_staged:'Indicator copied into the isolated preview runtime.',
+    indicator_compile_success:'Indicator compile/stage succeeded.',
     capture_compile:'Compiling screenshot capture script…',
     terminal_launch:'Launching isolated MetaTrader terminal…',
     screenshot_wait:'Waiting for MetaTrader screenshot…',
@@ -242,7 +249,11 @@ function schedulePreview(source,delay=900){
     try{
       setPreviewState(source,{phase:'preflight',message:`Checking ${kind} preview runtime…`,image:null});
       await appLog('INFO','preview_preflight_start',{jobId,source,kind,automatic:true});
-      const readiness=await execSidecar('binaries/mql-preview',['preflight','--source',source]);
+      const outDir=await join(await appDataDir(),'previews');
+      const readiness=await execSidecar('binaries/mql-preview',['preflight','--source',source,'--out',outDir]);
+      for(const stage of readiness.diagnostics||[]){
+        await appLog('INFO','preview_discovery_stage',{jobId,source,kind,...stage});
+      }
       await appLog('INFO','preview_preflight_success',{
         jobId,source,kind,
         terminal:readiness.terminal?.terminal||null,
@@ -257,7 +268,6 @@ function schedulePreview(source,delay=900){
 
       setPreviewState(source,{phase:'rendering',message:`Rendering real ${kind} preview…`,image:null});
       await appLog('INFO','preview_start',{jobId,source,kind,automatic:true});
-      const outDir=await join(await appDataDir(),'previews');
       const result=await spawnRender(source,outDir,myToken,jobId);
       if(myToken!==previewToken||desiredSource!==source||detailSource()!==source)return;
       const image=convertFileSrc(result.image)+`?t=${Date.now()}`;
@@ -278,8 +288,14 @@ function schedulePreview(source,delay=900){
         phase:'failed',
         message:msg.startsWith('Indicator compile failed')?msg:`Automatic preview failed: ${msg}`
       });
+      if(!preflightPassed){
+        for(const stage of e?.payload?.diagnostics||[]){
+          await appLog(stage.status==='INFO'?'INFO':'ERROR','preview_discovery_stage',{jobId,source,kind,...stage});
+        }
+      }
       await appLog('ERROR',preflightPassed?'preview_failed':'preview_preflight_failed',{
         jobId,source,kind,error:msg,
+        diagnostics:e?.payload?.diagnostics||null,
         workerStarted:preflightPassed,
         elapsedMs:Math.round(performance.now()-started),automatic:true
       });
@@ -453,7 +469,7 @@ function startUiWatchdog(){
 
 function boot(){
   const brand=document.querySelector('.brand small');
-  if(brand)brand.textContent='0.5.13 • Evidence Engine v4 + Preview Runtime Preflight';
+  if(brand)brand.textContent='0.5.14 • Evidence Engine v5 + Paired Runtime Discovery';
   ensureClearCard();
   enhanceSourceRemoval();
   startUiWatchdog();
