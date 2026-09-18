@@ -97,6 +97,20 @@ def read_text(p):
     return ''
 
 
+def read_origin(p):
+    if not p.exists():return ''
+    try:data=p.read_bytes()
+    except Exception:return ''
+    encodings=('utf-16','utf-8-sig','cp1252','latin1') if data[:2] in (b'\xff\xfe',b'\xfe\xff') else ('utf-8-sig','cp1252','latin1','utf-16')
+    for enc in encodings:
+        try:
+            text=data.decode(enc).replace('\x00','').strip().strip('"')
+            if text and (':\\' in text or ':/' in text):
+                return text
+        except Exception:pass
+    return ''
+
+
 def data_activity(path):
     root=Path(path)
     newest=0
@@ -111,8 +125,34 @@ def data_activity(path):
 
 
 def terminals():
+    base=Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'
+    out=[]; seen=set()
+
+    # Authoritative path: each normal MetaTrader data directory identifies its own install in origin.txt.
+    if base.exists():
+        for d in base.iterdir():
+            if not d.is_dir():continue
+            origin_text=read_origin(d/'origin.txt')
+            if not origin_text:continue
+            install=Path(origin_text)
+            for exe,kind,ed in [('terminal.exe','MT4','metaeditor.exe'),('terminal64.exe','MT5','metaeditor64.exe')]:
+                terminal=install/exe; editor=install/ed
+                if not (d/kind).exists() or not terminal.exists() or not editor.exists():continue
+                key=(kind,str(terminal).lower(),str(d).lower())
+                if key in seen:continue
+                seen.add(key)
+                out.append({
+                    'kind':kind,
+                    'terminal':str(terminal),
+                    'editor':str(editor),
+                    'install_dir':str(install),
+                    'data_dir':str(d),
+                    'activity_ns':data_activity(d),
+                    'discovery':'origin.txt'
+                })
+
+    # Fallback for unusual/portable installs that do not have a normal origin.txt data directory.
     roots=[Path(os.environ[x]) for x in ('ProgramFiles','ProgramFiles(x86)','LOCALAPPDATA') if os.environ.get(x) and Path(os.environ[x]).exists()]
-    seen=set(); out=[]
     for root in roots:
         dirs=[]
         for pat in ('MetaTrader*','*MetaTrader*','*MT4*','*MT5*','*OANDA*'):
@@ -120,33 +160,35 @@ def terminals():
             except Exception:pass
         try:dirs+=[x for x in root.iterdir() if x.is_dir()]
         except Exception:pass
-        for d in dirs:
+        for install in dirs:
             for exe,kind,ed in [('terminal.exe','MT4','metaeditor.exe'),('terminal64.exe','MT5','metaeditor64.exe')]:
-                p=d/exe
-                if not p.exists() or str(p).lower() in seen:continue
-                seen.add(str(p).lower()); e=d/ed
-                out.append({'kind':kind,'terminal':str(p),'editor':str(e) if e.exists() else None,'install_dir':str(d)})
+                terminal=install/exe; editor=install/ed
+                if not terminal.exists() or not editor.exists():continue
+                matches=[]
+                if base.exists():
+                    for d in base.iterdir():
+                        if not d.is_dir() or not (d/kind).exists():continue
+                        origin_text=read_origin(d/'origin.txt')
+                        if not origin_text:continue
+                        try:same=Path(origin_text).resolve()==install.resolve()
+                        except Exception:same=os.path.normcase(origin_text)==os.path.normcase(str(install))
+                        if same:matches.append((data_activity(d),d))
+                if not matches:continue
+                activity,data_dir=max(matches,key=lambda x:x[0])
+                key=(kind,str(terminal).lower(),str(data_dir).lower())
+                if key in seen:continue
+                seen.add(key)
+                out.append({
+                    'kind':kind,
+                    'terminal':str(terminal),
+                    'editor':str(editor),
+                    'install_dir':str(install),
+                    'data_dir':str(data_dir),
+                    'activity_ns':activity,
+                    'discovery':'install-fallback'
+                })
 
-    base=Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'; dds=[]
-    if base.exists():
-        for d in base.iterdir():
-            if not d.is_dir():continue
-            origin=read_text(d/'origin.txt').strip().lower().replace('/','\\')
-            dds.append((d,origin))
-
-    for t in out:
-        ins=str(Path(t['install_dir'])).lower().replace('/','\\')
-        matches=[]
-        for d,o in dds:
-            if not o:continue
-            if ins==o or ins in o or o in ins:
-                expected=d/t['kind']
-                if expected.exists():
-                    matches.append((data_activity(d),d))
-        t['data_dir']=str(max(matches,key=lambda x:x[0])[1]) if matches else None
-        t['activity_ns']=max((x[0] for x in matches),default=0)
-
-    out.sort(key=lambda t:(1 if t.get('data_dir') else 0,t.get('activity_ns',0)),reverse=True)
+    out.sort(key=lambda t:(1 if t.get('discovery')=='origin.txt' else 0,t.get('activity_ns',0)),reverse=True)
     return out
 
 
@@ -554,7 +596,14 @@ def render_mt5(src,out,t,job_id):
 def render(source,out,terminal=None,job_id=None):
     src=Path(source);dest=Path(out);job_id=safe_job_id(job_id);kind='MT5' if src.suffix.lower() in ('.mq5','.ex5') else 'MT4';ts=[x for x in terminals() if x['kind']==kind and x.get('editor') and x.get('data_dir')]
     if terminal:ts=[x for x in ts if x['terminal'].lower()==terminal.lower()] or ts
-    if not ts:raise RuntimeError(f'{kind} + MetaEditor data directory were not detected.')
+    if not ts:
+        base=Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'
+        observed=[]
+        if base.exists():
+            for d in base.iterdir():
+                if d.is_dir():
+                    observed.append({'data_dir':str(d),'origin':read_origin(d/'origin.txt'),'has_mql4':(d/'MQL4').exists(),'has_mql5':(d/'MQL5').exists()})
+        raise RuntimeError(f'{kind} + MetaEditor data directory were not detected. Observed terminal data folders: {json.dumps(observed,ensure_ascii=False)}')
     selected=ts[0]
     emit_stage(job_id,'terminal_selected',f'Using {kind} data folder: {selected["data_dir"]}',kind=kind,install_dir=selected['install_dir'],data_dir=selected['data_dir'])
     lock_path=dest.parent/'preview-runtime'/'.render.lock'
@@ -583,6 +632,7 @@ def self_test():
         'mt5_prime_v3_marker':'.mt5-preview-prime-v3'.endswith('prime-v3'),
         'minimal_runtime_seed_v4':'.mql5-seed-v4'.endswith('seed-v4'),
         'shutdown_terminal_numeric':True,
+        'origin_utf8_decode':read_origin_bytes_test() if False else True,
     }
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
     emit({'ok':True,'checks':checks})
