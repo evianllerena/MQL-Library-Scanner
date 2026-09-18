@@ -284,16 +284,20 @@ function schedulePreview(source,delay=900){
     }catch(e){
       if(myToken!==previewToken||desiredSource!==source)return;
       const msg=String(e?.message||e);
+      const compileFailed=msg.startsWith('Indicator compile failed');
       setPreviewState(source,{
         phase:'failed',
-        message:msg.startsWith('Indicator compile failed')?msg:`Automatic preview failed: ${msg}`
+        message:compileFailed?msg:`Automatic preview failed: ${msg}`
       });
       if(!preflightPassed){
         for(const stage of e?.payload?.diagnostics||[]){
           await appLog(stage.status==='INFO'?'INFO':'ERROR','preview_discovery_stage',{jobId,source,kind,...stage});
         }
       }
-      await appLog('ERROR',preflightPassed?'preview_failed':'preview_preflight_failed',{
+      await appLog(
+        compileFailed?'WARN':'ERROR',
+        compileFailed?'preview_incompatible':(preflightPassed?'preview_failed':'preview_preflight_failed'),
+        {
         jobId,source,kind,error:msg,
         diagnostics:e?.payload?.diagnostics||null,
         workerStarted:preflightPassed,
