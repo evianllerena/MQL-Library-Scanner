@@ -436,7 +436,7 @@ function startUiWatchdog(){
 
 function boot(){
   const brand=document.querySelector('.brand small');
-  if(brand)brand.textContent='0.5.11 • Evidence Engine v4 + Bound MT4/MT5 Runtime';
+  if(brand)brand.textContent='0.5.12 • Evidence Engine v4 + Authoritative MT4/MT5 Discovery';
   ensureClearCard();
   enhanceSourceRemoval();
   startUiWatchdog();
