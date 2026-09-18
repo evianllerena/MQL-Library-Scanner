@@ -1,4 +1,5 @@
 name: Build Windows Beta Installer
+# PR validation sync
 
 on:
   workflow_dispatch:
