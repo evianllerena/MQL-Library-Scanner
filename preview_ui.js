@@ -236,11 +236,27 @@ function schedulePreview(source,delay=900){
 
     if(myToken!==previewToken||desiredSource!==source||detailSource()!==source)return;
 
-    setPreviewState(source,{phase:'rendering',message:`Rendering real ${kind} preview…`,image:null});
-    await appLog('INFO','preview_start',{jobId,source,kind,automatic:true});
     const started=performance.now();
+    let preflightPassed=false;
 
     try{
+      setPreviewState(source,{phase:'preflight',message:`Checking ${kind} preview runtime…`,image:null});
+      await appLog('INFO','preview_preflight_start',{jobId,source,kind,automatic:true});
+      const readiness=await execSidecar('binaries/mql-preview',['preflight','--source',source]);
+      await appLog('INFO','preview_preflight_success',{
+        jobId,source,kind,
+        terminal:readiness.terminal?.terminal||null,
+        metaeditor:readiness.terminal?.editor||null,
+        dataDir:readiness.terminal?.data_dir||null,
+        checks:readiness.checks||null,
+        elapsedMs:Math.round(performance.now()-started),
+        automatic:true
+      });
+      preflightPassed=true;
+      if(myToken!==previewToken||desiredSource!==source||detailSource()!==source)return;
+
+      setPreviewState(source,{phase:'rendering',message:`Rendering real ${kind} preview…`,image:null});
+      await appLog('INFO','preview_start',{jobId,source,kind,automatic:true});
       const outDir=await join(await appDataDir(),'previews');
       const result=await spawnRender(source,outDir,myToken,jobId);
       if(myToken!==previewToken||desiredSource!==source||detailSource()!==source)return;
@@ -262,8 +278,9 @@ function schedulePreview(source,delay=900){
         phase:'failed',
         message:msg.startsWith('Indicator compile failed')?msg:`Automatic preview failed: ${msg}`
       });
-      await appLog('ERROR','preview_failed',{
+      await appLog('ERROR',preflightPassed?'preview_failed':'preview_preflight_failed',{
         jobId,source,kind,error:msg,
+        workerStarted:preflightPassed,
         elapsedMs:Math.round(performance.now()-started),automatic:true
       });
     }
@@ -436,7 +453,7 @@ function startUiWatchdog(){
 
 function boot(){
   const brand=document.querySelector('.brand small');
-  if(brand)brand.textContent='0.5.12 • Evidence Engine v4 + Authoritative MT4/MT5 Discovery';
+  if(brand)brand.textContent='0.5.13 • Evidence Engine v4 + Preview Runtime Preflight';
   ensureClearCard();
   enhanceSourceRemoval();
   startUiWatchdog();
