@@ -22,7 +22,16 @@
         "center": true
       }
     ],
-    "security": { "csp": null }
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/previews/*",
+          "$APPDATA/previews/**"
+        ]
+      }
+    }
   },
   "bundle": {
     "active": true,
