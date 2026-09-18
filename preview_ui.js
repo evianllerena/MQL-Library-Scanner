@@ -128,7 +128,8 @@ function invalidatePreview(reason){
 function previewStageMessage(stage,payload){
   if(payload?.message)return payload.message;
   const labels={
-    runtime_clone:'Preparing isolated MetaTrader runtime…',
+    terminal_selected:'Matched the active MetaTrader data folder.',
+    runtime_clone:'Preparing isolated MetaTrader runtime from the matched terminal…',
     mt5_prime_start:'Initializing isolated MT5 runtime…',
     mt5_full_recompile:'MetaTrader is compiling its MQL5 runtime for first use…',
     mt5_prime_ready:'MT5 runtime initialization completed.',
@@ -435,7 +436,7 @@ function startUiWatchdog(){
 
 function boot(){
   const brand=document.querySelector('.brand small');
-  if(brand)brand.textContent='0.5.10 • Evidence Engine v4 + Verified MT4/MT5 Runtime';
+  if(brand)brand.textContent='0.5.11 • Evidence Engine v4 + Bound MT4/MT5 Runtime';
   ensureClearCard();
   enhanceSourceRemoval();
   startUiWatchdog();
