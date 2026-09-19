@@ -1067,8 +1067,6 @@ def _ensure_preview_queue_schema(con):
     con.execute("UPDATE indicators SET preview_status='pending' WHERE preview_status='rendering'")
     con.execute("UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='' "
                 "WHERE preview_status='ready' AND COALESCE(preview_hash,'')!=COALESCE(sha256,'')")
-    con.execute("UPDATE indicators SET preview_status='failed' "
-                "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)>=2")
     con.commit()
 
 
@@ -1089,6 +1087,8 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_a
                 emit({'ok':True,'job_id':job_id,'paused':True,'reason':pause_reason})
                 break
             attempts=max(1,min(int(max_attempts),10))
+            con.execute("UPDATE indicators SET preview_status='failed' WHERE preview_status='pending' AND COALESCE(preview_attempts,0)>=?",(attempts,))
+            con.commit()
             rows=con.execute(
                 "SELECT id,path,platform,sha256 FROM indicators "
                 "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)<? "
