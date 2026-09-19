@@ -85,8 +85,10 @@ jobs:
           Copy-Item "$r/default.json" 'src-tauri/capabilities/default.json' -Force
           Copy-Item "$r/package.json" 'package.json' -Force
           Copy-Item "$r/tauri.conf.json" 'src-tauri/tauri.conf.json' -Force
-          New-Item -ItemType Directory -Force -Path 'src-tauri/windows' | Out-Null
-          Copy-Item "$r/windows/*" 'src-tauri/windows/' -Force
+          if(Test-Path "$r/windows"){
+            New-Item -ItemType Directory -Force -Path 'src-tauri/windows' | Out-Null
+            Copy-Item "$r/windows/*" 'src-tauri/windows/' -Force
+          }
 
       - uses: actions/setup-python@v5
         with:
