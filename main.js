@@ -29,13 +29,6 @@ async function logEvent(level,event,details={},durationMs=null){if(!dbPath)retur
 async function timed(event,fn,details={}){const t=performance.now();try{const out=await fn();logEvent('INFO',event,{...details,ok:true},performance.now()-t);return out;}catch(e){logEvent('ERROR',event,{...details,ok:false,error:String(e)},performance.now()-t);throw e;}}
 async function engine(args){const cmd=Command.sidecar('binaries/mql-engine',args);const out=await cmd.execute();if(out.code!==0)throw new Error(out.stderr||`Engine exited ${out.code}`);return out.stdout.trim();}
 
-let batchPreviewRunning=false;
-
-function batchJobId(){
-  try{return crypto.randomUUID().replace(/[^A-Za-z0-9_.-]/g,'-');}
-  catch{return `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`;}
-}
-
 async function filteredIndicatorRows(){
   const rows=[];let offset=0;
   while(offset<state.totalRows){
@@ -49,94 +42,32 @@ async function filteredIndicatorRows(){
   return rows;
 }
 
-function markBatchRow(source,text,ok=null){
-  const idx=state.rows.findIndex(r=>r.path===source);
-  if(idx<0)return;
-  const tr=el('rows')?.querySelector(`tr[data-idx="${idx}"]`);
-  const cell=tr?.querySelector('td');
-  if(!cell)return;
-  let tag=cell.querySelector('.batch-preview-status');
-  if(!tag){
-    tag=document.createElement('div');
-    tag.className='muted batch-preview-status';
-    tag.style.fontSize='11px';
-    tag.style.marginTop='3px';
-    cell.appendChild(tag);
+async function prioritizePreviewPaths(paths,priority=100,force=false){
+  const unique=[...new Set((paths||[]).filter(Boolean))];
+  if(!unique.length||!dbPath)return;
+  try{
+    await invoke('preview_queue_update',{dbPath,paths:unique,priority,force});
+  }catch(e){
+    logEvent('ERROR','preview_priority_update_failed',{error:String(e),count:unique.length,priority,force});
   }
-  tag.textContent=text;
-  if(ok===true)tag.style.opacity='1';
-  else if(ok===false)tag.style.opacity='.8';
 }
 
 async function previewAllFiltered(){
-  if(batchPreviewRunning)return;
   const button=el('previewAllBtn'),status=el('previewAllStatus');
-  batchPreviewRunning=true;button.disabled=true;
-  status.textContent='Collecting filtered indicators…';
+  button.disabled=true;status.textContent='Prioritizing filtered preview cache…';
   try{
     const rows=await filteredIndicatorRows();
-    const mt5=rows.filter(r=>/\.(mq5|ex5)$/i.test(r.path||''));
-    if(!mt5.length){status.textContent='No MT5 indicators in the current filter.';return;}
-    if(typeof window.__mqlPreviewCancelForBatch==='function')await window.__mqlPreviewCancelForBatch();
-    const manifest=await invoke('write_preview_batch_sources',{sources:mt5.map(r=>r.path)});
-    const outDir=await join(await appDataDir(),'previews');
-    const jobId=batchJobId();
-    status.textContent=`0 of ${mt5.length} done • preparing one MT5 terminal launch…`;
-    const cmd=Command.sidecar('binaries/mql-preview',[
-      'render-batch','--sources',manifest.path,'--out',outDir,'--job-id',jobId
-    ]);
-    let stdout='',stderr='',buffer='',prepared=0;
-    cmd.stdout.on('data',data=>{
-      const chunk=String(data);stdout+=chunk+'\n';buffer+=chunk;
-      const lines=buffer.split(/\r?\n/);buffer=lines.pop()||'';
-      for(const raw of lines){
-        const line=raw.trim();if(!line)continue;
-        let ev;try{ev=JSON.parse(line);}catch{continue;}
-        if(ev.type==='stage'){
-          if(ev.stage==='indicator_compile'&&ev.source){
-            prepared=Math.min(mt5.length,prepared+1);
-            markBatchRow(ev.source,'Preparing batch preview…');
-            status.textContent=`${prepared} of ${mt5.length} prepared • rendering in one MT5 launch…`;
-          }else if(ev.stage==='item_shot'&&ev.source){
-            markBatchRow(ev.source,ev.ok===false?'Preview failed':'Preview ready',ev.ok!==false);
-          }else if(ev.stage==='item'&&ev.source&&ev.ok===false){
-            markBatchRow(ev.source,'Preview failed',false);
-          }else if(ev.message){
-            status.textContent=ev.message;
-          }
-        }
-      }
-    });
-    cmd.stderr.on('data',data=>{stderr+=String(data)+'\n';});
-    const closed=new Promise((resolve,reject)=>{cmd.on('close',resolve);cmd.on('error',reject);});
-    await cmd.spawn();
-    const closeData=await closed;
-    if(buffer.trim()){stdout+=buffer+'\n';}
-    const lines=stdout.trim().split(/\r?\n/).filter(Boolean);
-    let payload=null;
-    for(let i=lines.length-1;i>=0;i--){try{payload=JSON.parse(lines[i]);if(payload?.batch||payload?.ok!==undefined)break;}catch{}}
-    if(closeData.code!==0||!payload?.ok)throw new Error(payload?.error||stderr||`Batch preview exited ${closeData.code}`);
-    const results=payload.results||{};
-    let done=0;
-    for(const [source,result] of Object.entries(results)){
-      done++;
-      if(result?.ok){
-        markBatchRow(source,'Preview ready',true);
-        window.dispatchEvent(new CustomEvent('mql-batch-preview-result',{detail:{source,image:result.image,kind:result.kind||'MT5'}}));
-      }else{
-        markBatchRow(source,result?.error||'Preview failed',false);
-      }
-      status.textContent=`${done} of ${mt5.length} done`;
-    }
-    status.textContent=`${payload.rendered||0} rendered • ${payload.failed||0} failed • ${mt5.length} MT5 indicators processed`;
-    await logEvent('INFO','preview_batch_complete',{jobId,total:mt5.length,rendered:payload.rendered||0,failed:payload.failed||0});
+    if(!rows.length){status.textContent='No indicators in the current filter.';return;}
+    await prioritizePreviewPaths(rows.map(r=>r.path),500,false);
+    status.textContent=`Queued ${rows.length.toLocaleString()} filtered indicators for background preview`;
+    void startPreviewLibraryWorker();
   }catch(e){
-    status.textContent=`Preview all failed: ${e.message||e}`;
-    await logEvent('ERROR','preview_batch_failed',{error:String(e)});
-  }finally{
-    batchPreviewRunning=false;button.disabled=false;
-  }
+    status.textContent=`Preview queue failed: ${e.message||e}`;
+    await logEvent('ERROR','preview_queue_failed',{error:String(e)});
+  }finally{button.disabled=false;}
 }
+
+window.__mqlQueuePreview=prioritizePreviewPaths;
 async function ensureDb(){await timed('ensure_database',()=>engine(['stats','--db',dbPath]));}
 function queryArgs(reviewOnly,offset){return{dbPath,search:reviewOnly?'':state.search,platform:reviewOnly?'ALL':state.platform,category:reviewOnly?'ALL':state.category,reviewOnly,limit:state.pageSize,offset,sortBy:state.sortBy,sortDir:state.sortDir};}
 
@@ -167,11 +98,12 @@ async function startPreviewLibraryWorker(){
     logEvent('ERROR','preview_library_start_failed',{error:String(e)});
   }
 }
+window.__mqlStartPreviewLibraryWorker=startPreviewLibraryWorker;
 
 async function setup(){const base=await appDataDir();dbPath=await join(base,'library.sqlite3');el('dbLocation').textContent=dbPath;await logEvent('INFO','app_start',{userAgent:navigator.userAgent});await listen('scan-engine-line',e=>handleScanLine(e.payload?.line??e.payload));await listen('scan-engine-stderr',e=>{const line=e.payload?.line??e.payload;console.error('scanner',line);logEvent('ERROR','scan_engine_stderr_ui',{line});if(state.scanning&&line)scanText.textContent=`Scanner: ${line}`;});await listen('scan-engine-done',async e=>{if(!state.scanning)return;const code=Number(e.payload?.code??-1);logEvent(code===0?'INFO':'ERROR','scan_engine_done_ui',{code});if(code!==0&&!scanText.textContent.startsWith('Scan failed:'))scanText.textContent=`Scan engine exited with code ${code}`;await finishScan();});await listen('preview-library-line',e=>handlePreviewLibraryLine(e.payload?.line??e.payload));await listen('preview-library-stderr',e=>{const line=e.payload?.line??e.payload;console.error('preview worker',line);logEvent('ERROR','preview_library_stderr_ui',{line});});await listen('preview-library-done',async e=>{const code=Number(e.payload?.code??-1);logEvent(code===0?'INFO':'ERROR','preview_library_done_ui',{code});if(code===0)el('previewAllStatus').textContent='Preview cache is up to date';await reloadAll();});await ensureDb();await reloadAll();void startPreviewLibraryWorker();await logEvent('INFO','app_ready',{totalIndicators:state.stats.total||0},performance.now()-bootStarted);}
 async function reloadAll(){const t=performance.now();await Promise.all([loadStats(),loadRows(),loadReview()]);logEvent('INFO','reload_all',{rows:state.rows.length,reviewRows:state.reviewRows.length},performance.now()-t);}
 async function loadStats(){const t=performance.now();try{state.stats=await invoke('db_stats',{dbPath});if(!state.sources.length)state.sources=(state.stats.sources||[]).map(s=>s.path);renderStats();renderSources();logEvent('INFO','load_stats',{total:state.stats.total,backendElapsedMs:state.stats.elapsed_ms},performance.now()-t);}catch(e){console.error(e);el('appStatus').textContent=`Database error: ${e}`;logEvent('ERROR','load_stats_failed',{error:String(e)},performance.now()-t);}}
-async function loadRows(){const offset=state.page*state.pageSize,t=performance.now();try{const out=await invoke('db_query',queryArgs(false,offset));state.rows=out.rows||[];state.totalRows=out.total||0;renderRows();logEvent('INFO','load_library_page',{page:state.page,count:state.rows.length,total:state.totalRows,search:state.search,sortBy:state.sortBy,sortDir:state.sortDir},performance.now()-t);}catch(e){console.error(e);logEvent('ERROR','load_library_page_failed',{error:String(e)},performance.now()-t);}}
+async function loadRows(){const offset=state.page*state.pageSize,t=performance.now();try{const out=await invoke('db_query',queryArgs(false,offset));state.rows=out.rows||[];state.totalRows=out.total||0;renderRows();void prioritizePreviewPaths(state.rows.map(r=>r.path),100,false);logEvent('INFO','load_library_page',{page:state.page,count:state.rows.length,total:state.totalRows,search:state.search,sortBy:state.sortBy,sortDir:state.sortDir},performance.now()-t);}catch(e){console.error(e);logEvent('ERROR','load_library_page_failed',{error:String(e)},performance.now()-t);}}
 async function loadReview(){const offset=state.reviewPage*state.pageSize,t=performance.now();try{const out=await invoke('db_query',queryArgs(true,offset));state.reviewRows=out.rows||[];state.totalReview=out.total||0;renderReview();logEvent('INFO','load_review_page',{page:state.reviewPage,count:state.reviewRows.length,total:state.totalReview,sortBy:state.sortBy,sortDir:state.sortDir},performance.now()-t);}catch(e){console.error(e);logEvent('ERROR','load_review_page_failed',{error:String(e)},performance.now()-t);}}
 
 function renderStats(){el('statTotal').textContent=state.stats.total||0;el('statMq4').textContent=state.stats.mq4||0;el('statMq5').textContent=state.stats.mq5||0;el('statReview').textContent=state.stats.review||0;el('statVerified').textContent=state.stats.verified||0;}
@@ -197,7 +129,7 @@ function structuralPreview(r){
   return `<div class="section"><div class="label">Structural Preview</div><div style="border:1px solid rgba(148,163,184,.22);border-radius:10px;padding:10px;background:rgba(15,23,42,.35)"><svg viewBox="0 0 320 150" width="100%" height="170" role="img" aria-label="Indicator structural preview">${grid}${shapes}</svg><div class="muted" style="font-size:11px;margin-top:4px">Derived from source plot metadata (${esc(r.visual_category)} • ${esc(r.display_location)}). This is not live market output.</div></div></div>`;
 }
 function evidenceHtml(items){if(!items?.length)return '<div class="muted">No reliable functional evidence recorded.</div>';return items.slice(0,30).map(e=>`<div class="evidence"><b>${esc(e.category)}</b> <span class="muted">+${esc(e.weight)}</span><br>${esc(e.detail)}</div>`).join('');}
-function showDetail(r){const secondary=r.secondary_categories||[];const tags=[...(r.behavior_tags||[]),...(r.techniques||[])];const options=categories.map(c=>`<option ${c===r.primary_category?'selected':''}>${c}</option>`).join('');const detail=el('detail');detail.dataset.previewStatus=r.preview_status||'';detail.dataset.previewPath=r.preview_path||'';detail.dataset.previewHash=r.preview_hash||'';detail.dataset.sourceHash=r.sha256||'';el('detailBody').innerHTML=`<h2>${esc(r.filename)}</h2>${structuralPreview(r)}<div class="section"><div class="label">Classification</div><div class="value">${esc(r.primary_category)} • ${r.confidence}%</div><div class="value confidence ${statusClass(r.classification_status)}">${esc(r.classification_status)}</div>${r.review_reason?`<div class="muted detail-note">${esc(r.review_reason)}</div>`:''}</div><div class="section"><div class="label">Secondary Functions</div><div class="value">${secondary.map(x=>`<span class="badge">${esc(x)}</span>`).join(' ')||'None'}</div></div><div class="section"><div class="label">Evidence</div>${evidenceHtml(r.evidence)}</div><div class="section"><div class="label">Techniques & Behavior</div><div class="value">${tags.map(x=>`<span class="badge">${esc(x)}</span>`).join(' ')||'None detected'}</div></div><div class="section"><div class="label">Visual / Source</div><div class="value">${esc(r.visual_category)} • ${esc(r.display_location)}<br>${esc(r.platform)} • ${esc(r.source_structure)}<br>Buffers: ${r.active_buffers||0}/${r.declared_buffers||0} active/declared • Plots: ${r.declared_plots||0}</div></div><div class="section"><div class="label">Verification</div><select id="verifyPrimary" class="detail-select">${options}</select><button id="verifyBtn" class="btn primary verify-btn">${r.human_verified?'Update Verification':'Verify / Correct'}</button><div class="muted detail-note">Verification is stored separately from machine classification and becomes classification-memory input.</div></div><div class="section"><div class="label">File</div><div class="value" style="word-break:break-all">${esc(r.path)}</div></div>${(r.warnings||[]).length?`<div class="section"><div class="label">Warnings</div><div class="value">${r.warnings.map(esc).join('<br>')}</div></div>`:''}`;el('detail').classList.add('open');el('verifyBtn').onclick=()=>verifyIndicator(r);}
+function showDetail(r){const secondary=r.secondary_categories||[];const tags=[...(r.behavior_tags||[]),...(r.techniques||[])];const options=categories.map(c=>`<option ${c===r.primary_category?'selected':''}>${c}</option>`).join('');const detail=el('detail');detail.dataset.previewStatus=r.preview_status||'';detail.dataset.previewPath=r.preview_path||'';detail.dataset.previewHash=r.preview_hash||'';detail.dataset.previewError=r.preview_error||'';detail.dataset.previewAttempts=String(r.preview_attempts||0);detail.dataset.sourceHash=r.sha256||'';void prioritizePreviewPaths([r.path],1000,false);void startPreviewLibraryWorker();el('detailBody').innerHTML=`<h2>${esc(r.filename)}</h2>${structuralPreview(r)}<div class="section"><div class="label">Classification</div><div class="value">${esc(r.primary_category)} • ${r.confidence}%</div><div class="value confidence ${statusClass(r.classification_status)}">${esc(r.classification_status)}</div>${r.review_reason?`<div class="muted detail-note">${esc(r.review_reason)}</div>`:''}</div><div class="section"><div class="label">Secondary Functions</div><div class="value">${secondary.map(x=>`<span class="badge">${esc(x)}</span>`).join(' ')||'None'}</div></div><div class="section"><div class="label">Evidence</div>${evidenceHtml(r.evidence)}</div><div class="section"><div class="label">Techniques & Behavior</div><div class="value">${tags.map(x=>`<span class="badge">${esc(x)}</span>`).join(' ')||'None detected'}</div></div><div class="section"><div class="label">Visual / Source</div><div class="value">${esc(r.visual_category)} • ${esc(r.display_location)}<br>${esc(r.platform)} • ${esc(r.source_structure)}<br>Buffers: ${r.active_buffers||0}/${r.declared_buffers||0} active/declared • Plots: ${r.declared_plots||0}</div></div><div class="section"><div class="label">Verification</div><select id="verifyPrimary" class="detail-select">${options}</select><button id="verifyBtn" class="btn primary verify-btn">${r.human_verified?'Update Verification':'Verify / Correct'}</button><div class="muted detail-note">Verification is stored separately from machine classification and becomes classification-memory input.</div></div><div class="section"><div class="label">File</div><div class="value" style="word-break:break-all">${esc(r.path)}</div></div>${(r.warnings||[]).length?`<div class="section"><div class="label">Warnings</div><div class="value">${r.warnings.map(esc).join('<br>')}</div></div>`:''}`;el('detail').classList.add('open');el('verifyBtn').onclick=()=>verifyIndicator(r);}
 async function verifyIndicator(r){const primary=el('verifyPrimary').value,t=performance.now();try{await invoke('db_verify',{dbPath,indicatorId:r.id,primaryCategory:primary,secondaryCategories:r.secondary_categories||[]});logEvent('INFO','verify_indicator',{id:r.id,primary},performance.now()-t);el('detail').classList.remove('open');await reloadAll();}catch(e){logEvent('ERROR','verify_indicator_failed',{id:r.id,error:String(e)},performance.now()-t);alert(`Verification failed: ${e}`);}}
 
 function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
