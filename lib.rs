@@ -323,7 +323,7 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
     let mut total_stmt=conn.prepare(&total_sql).map_err(|e|e.to_string())?;
     let total:i64=total_stmt.query_row(rusqlite::params_from_iter(vals.iter()),|r|r.get(0)).map_err(|e|e.to_string())?;
     let order=sort_sql(sort_by.as_deref().unwrap_or("name"),sort_dir.as_deref().unwrap_or("asc"));
-    let sql=format!("SELECT id,path,filename,platform,source_structure,display_location,primary_category,secondary_categories,visual_category,behavior_tags,techniques,evidence,classification_status,review_reason,classifier_version,standard_indicators,custom_dependencies,confidence,warnings,duplicate_of,user_favorite,user_tags,human_verified,verified_primary,verified_secondary,family_fingerprint,analyzed_at,draw_types,line_plots,histogram_plots,arrow_plots,filling_plots,object_usage,declared_buffers,declared_plots,active_buffers,preview_status,preview_path,preview_hash FROM indicators{} ORDER BY {} LIMIT ? OFFSET ?",where_sql,order);
+    let sql=format!("SELECT id,path,filename,platform,source_structure,display_location,primary_category,secondary_categories,visual_category,behavior_tags,techniques,evidence,classification_status,review_reason,classifier_version,standard_indicators,custom_dependencies,confidence,warnings,duplicate_of,user_favorite,user_tags,human_verified,verified_primary,verified_secondary,family_fingerprint,analyzed_at,draw_types,line_plots,histogram_plots,arrow_plots,filling_plots,object_usage,declared_buffers,declared_plots,active_buffers,preview_status,preview_path,preview_hash,sha256,preview_error,preview_updated_at,preview_attempts FROM indicators{} ORDER BY {} LIMIT ? OFFSET ?",where_sql,order);
     let mut all=vals.clone(); all.push(limit.clamp(1,500).to_string()); all.push(offset.max(0).to_string());
     let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;
     let mapped=stmt.query_map(rusqlite::params_from_iter(all.iter()),|r| {
@@ -346,7 +346,9 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
           "draw_types":parse_json_text(r.get::<_,String>(27)?),"line_plots":r.get::<_,i64>(28)?,"histogram_plots":r.get::<_,i64>(29)?,
           "arrow_plots":r.get::<_,i64>(30)?,"filling_plots":r.get::<_,i64>(31)?,"object_usage":r.get::<_,i64>(32)?==1,
           "declared_buffers":r.get::<_,i64>(33)?,"declared_plots":r.get::<_,i64>(34)?,"active_buffers":r.get::<_,i64>(35)?,
-          "preview_status":r.get::<_,Option<String>>(36)?,"preview_path":r.get::<_,Option<String>>(37)?,"preview_hash":r.get::<_,Option<String>>(38)?
+          "preview_status":r.get::<_,Option<String>>(36)?,"preview_path":r.get::<_,Option<String>>(37)?,"preview_hash":r.get::<_,Option<String>>(38)?,
+          "sha256":r.get::<_,Option<String>>(39)?,"preview_error":r.get::<_,Option<String>>(40)?,"preview_updated_at":r.get::<_,Option<String>>(41)?,
+          "preview_attempts":r.get::<_,Option<i64>>(42)?.unwrap_or(0)
         }))
     }).map_err(|e|e.to_string())?;
     let mut rows_out=Vec::new();
