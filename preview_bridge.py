@@ -591,12 +591,21 @@ def preview_trace(logs):
         if 'MQLLIB_PREVIEW' in line:lines.append(line)
     return '\n'.join(lines[-20:])
 
-def mt5_capture_source(rel,shot,win):
+def _mql_str(s):
+    """Escape a Python string so it is a SAFE double-quoted MQL4/MQL5 literal.
+    Backslash MUST be escaped before the quote."""
+    return str(s).replace('\\', '\\\\').replace('"', '\\"')
+
+# Guardrail: Any path or user-supplied string inserted into a generated MQL "..." literal
+# must go through _mql_str() first.
+def mt5_capture_source(rel, shot, win):
+    rel_lit = _mql_str(rel)
+    shot_lit = _mql_str(shot)
     return (
         'void OnStart(){\n' ' Print("MQLLIB_PREVIEW stage=onstart");\n'
         ' ResetLastError();\n'
-        f' Print("MQLLIB_PREVIEW stage=before_iCustom path={rel}");\n'
-        f' int h=iCustom(_Symbol,_Period,"{rel}");\n'
+        f' Print("MQLLIB_PREVIEW stage=before_iCustom path={rel_lit}");\n'
+        f' int h=iCustom(_Symbol,_Period,"{rel_lit}");\n'
         ' int err=GetLastError();\n'
         ' PrintFormat("MQLLIB_PREVIEW stage=after_iCustom handle=%d err=%d",h,err);\n'
         ' if(h==INVALID_HANDLE){TerminalClose(21);return;}\n'
@@ -611,7 +620,7 @@ def mt5_capture_source(rel,shot,win):
         ' for(int i=0;i<20;i++){if(BarsCalculated(h)>=0)break;Sleep(250);}\n'
         ' Sleep(1500);\n'
         ' ResetLastError();\n'
-        f' bool ok=ChartScreenShot(0,"{shot}",1200,720,ALIGN_RIGHT);\n'
+        f' bool ok=ChartScreenShot(0,"{shot_lit}",1200,720,ALIGN_RIGHT);\n'
         ' err=GetLastError();\n'
         ' PrintFormat("MQLLIB_PREVIEW stage=screenshot ok=%s err=%d",ok?"true":"false",err);\n'
         ' IndicatorRelease(h);\n'
