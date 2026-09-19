@@ -423,7 +423,6 @@ function injectPreview(){
   };
   applyPreviewState();
 }
-}
 
 function armButton(button,label,confirmLabel,ms=6000){
   const now=Date.now();
