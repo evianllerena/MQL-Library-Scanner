@@ -944,7 +944,7 @@ def _ensure_preview_queue_schema(con):
         'preview_status':"TEXT DEFAULT 'pending'",
         'preview_path':'TEXT','preview_hash':'TEXT',
         'preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT',
-        'preview_attempts':'INTEGER DEFAULT 0'
+        'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0'
     }
     for name,decl in additions.items():
         if name not in cols:con.execute(f'ALTER TABLE indicators ADD COLUMN {name} {decl}')
@@ -968,7 +968,7 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, job_i
             rows=con.execute(
                 "SELECT id,path,platform,sha256 FROM indicators "
                 "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)<2 "
-                "ORDER BY user_favorite DESC,id LIMIT ?",
+                "ORDER BY COALESCE(preview_priority,0) DESC,user_favorite DESC,id LIMIT ?",
                 (max(1,min(int(chunk_size),200)),)).fetchall()
             if not rows:break
             ids=[r['id'] for r in rows]
@@ -1006,7 +1006,7 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, job_i
                 if res and res.get('ok'):
                     con.execute(
                         "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,"
-                        "preview_error='',preview_updated_at=datetime('now') WHERE id=?",
+                        "preview_error='',preview_updated_at=datetime('now'),preview_priority=0 WHERE id=?",
                         (res['image'],r['sha256'],r['id']))
                 else:
                     err=(res or {}).get('error','render timeout/hang')
