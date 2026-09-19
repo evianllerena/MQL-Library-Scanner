@@ -936,6 +936,26 @@ def _worker_pause_reason(con,dest):
     return None
 
 
+def _cleanup_cache_files(con,dest):
+    try:valid={str(r[0]).lower() for r in con.execute("SELECT sha256 FROM indicators WHERE sha256 IS NOT NULL") if r[0]}
+    except Exception:return
+    root=Path(dest)
+    if root.exists():
+        for p in root.rglob('*'):
+            if not p.is_file():continue
+            name=p.name.lower()
+            stem=name[:-10] if name.endswith('.thumb.png') else p.stem.lower()
+            if stem not in valid:
+                try:p.unlink()
+                except Exception:pass
+    comp=root.parent/'preview-runtime'/'compiled-cache'
+    if comp.exists():
+        for p in comp.rglob('*'):
+            if p.is_file() and p.suffix.lower() in ('.ex4','.ex5') and p.stem.lower() not in valid:
+                try:p.unlink()
+                except Exception:pass
+
+
 def _backfill_thumbnails(con):
     try:rows=con.execute("SELECT preview_path FROM indicators WHERE preview_status='ready' AND preview_path IS NOT NULL").fetchall()
     except Exception:return
@@ -1051,6 +1071,11 @@ def _render_chunk(rows, dest, sel, rt, sym, job_id, item_timeout):
         results[item['source']]={'ok':False,'error':'MetaTrader exited before the preview completed.'}
         remaining=remaining[bad+1:]
 
+    try:
+        preview_tree=mql/'Indicators'/'MQLLibraryPreview'
+        shutil.rmtree(preview_tree,ignore_errors=True)
+        preview_tree.mkdir(parents=True,exist_ok=True)
+    except Exception:pass
     return results
 
 
@@ -1145,6 +1170,7 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_a
             ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
             total=con.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
             emit({'type':'progress','job_id':job_id,'done':ready,'total':total})
+    _cleanup_cache_files(con,dest)
     con.close()
     emit({'ok':True,'job_id':job_id,'finished':True})
 
