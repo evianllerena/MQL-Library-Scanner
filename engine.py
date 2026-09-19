@@ -80,7 +80,7 @@ def migrate(conn):
       'family_id':'TEXT','human_verified':'INTEGER DEFAULT 0','verified_primary':'TEXT','verified_secondary':"TEXT DEFAULT '[]'",
       'verified_at':'TEXT','mtime_ns':'INTEGER DEFAULT 0','scan_status':"TEXT DEFAULT 'complete'",'user_favorite':'INTEGER DEFAULT 0','user_tags':"TEXT DEFAULT '[]'",
       'preview_status':"TEXT DEFAULT 'pending'",'preview_path':'TEXT','preview_hash':'TEXT','preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT',
-      'preview_attempts':'INTEGER DEFAULT 0'
+      'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0'
     }
     existing=cols(conn,'indicators')
     for name,decl in additions.items():
