@@ -299,6 +299,14 @@ fn sort_sql(sort_by: &str, sort_dir: &str) -> String {
 }
 
 #[tauri::command]
+fn write_preview_batch_sources(sources:Vec<String>) -> Result<Value,String> {
+    let path=std::env::temp_dir().join(format!("mql-preview-batch-{}-{}.json",std::process::id(),now_ms()));
+    let body=serde_json::to_string(&sources).map_err(|e|e.to_string())?;
+    fs::write(&path,body).map_err(|e|e.to_string())?;
+    Ok(json!({"path":path.to_string_lossy()}))
+}
+
+#[tauri::command]
 fn db_query(db_path:String, search:String, platform:String, category:String, review_only:bool, limit:i64, offset:i64, sort_by:Option<String>, sort_dir:Option<String>) -> Result<Value,String> {
     let conn=open_db(&db_path)?;
     let mut clauses:Vec<String>=Vec::new();
@@ -457,7 +465,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,app_log,export_diagnostics])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,write_preview_batch_sources,app_log,export_diagnostics])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }
