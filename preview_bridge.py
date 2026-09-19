@@ -830,6 +830,39 @@ def _preview_final_path(dest, kind, source):
     return dest/(digest+('.png' if kind=='MT5' else '.gif'))
 
 
+def _thumb_path(image):
+    image=Path(image)
+    return image.with_name(image.stem+'.thumb.png')
+
+
+def _make_thumb(image):
+    image=Path(image)
+    thumb=_thumb_path(image)
+    if thumb.exists() and thumb.stat().st_size:return thumb
+    try:
+        from PIL import Image
+        with Image.open(image) as im:
+            im=im.convert('RGB')
+            width=300
+            height=max(1,round(im.height*(width/im.width)))
+            im.thumbnail((width,height))
+            thumb.parent.mkdir(parents=True,exist_ok=True)
+            im.save(thumb,format='PNG',optimize=True)
+        return thumb
+    except Exception:
+        return None
+
+
+def _backfill_thumbnails(con):
+    try:rows=con.execute("SELECT preview_path FROM indicators WHERE preview_status='ready' AND preview_path IS NOT NULL").fetchall()
+    except Exception:return
+    for row in rows:
+        try:
+            p=Path(row[0])
+            if p.is_file() and not _thumb_path(p).exists():_make_thumb(p)
+        except Exception:pass
+
+
 def _render_chunk(rows, dest, sel, rt, sym, job_id, item_timeout):
     dest=Path(dest);mql=rt/'MQL5';scripts=mql/'Scripts';files=mql/'Files'
     scripts.mkdir(parents=True,exist_ok=True);files.mkdir(parents=True,exist_ok=True)
@@ -960,6 +993,7 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, job_i
     job_id=safe_job_id(job_id);dest=Path(out)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     _ensure_preview_queue_schema(con)
+    _backfill_thumbnails(con)
     mt5_sel=mt5_rt=mt5_sym=None
     mt4_sel=None
     lock=dest.parent/'preview-runtime'/'.render.lock'
@@ -1004,6 +1038,7 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, job_i
             for r in rows:
                 res=results.get(str(r['path']))
                 if res and res.get('ok'):
+                    _make_thumb(res['image'])
                     con.execute(
                         "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,"
                         "preview_error='',preview_updated_at=datetime('now'),preview_priority=0 WHERE id=?",
