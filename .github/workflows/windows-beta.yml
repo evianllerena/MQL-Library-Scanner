@@ -109,8 +109,11 @@ jobs:
         run: |
           Set-Location $env:APP_DIR
           python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py
+          if($LASTEXITCODE -ne 0){throw 'Python source validation failed'}
           node --check ui/main.js
+          if($LASTEXITCODE -ne 0){throw 'main.js syntax validation failed'}
           node --check ui/preview_ui.js
+          if($LASTEXITCODE -ne 0){throw 'preview_ui.js syntax validation failed'}
           $packageVersion=(Get-Content package.json -Raw | ConvertFrom-Json).version
           $tauriVersion=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $cargoVersion=[regex]::Match((Get-Content src-tauri/Cargo.toml -Raw),'(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
