@@ -1,13 +1,13 @@
 import './styles.css';
 import { Command } from '@tauri-apps/plugin-shell';
 import { appDataDir, join } from '@tauri-apps/api/path';
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
 const state={
   sources:[],rows:[],reviewRows:[],stats:{total:0,mq4:0,mq5:0,review:0,duplicates:0,verified:0},
   scanning:false,view:'library',search:'',platform:'ALL',category:'ALL',
-  page:0,reviewPage:0,pageSize:250,totalRows:0,totalReview:0,
+  page:0,reviewPage:0,pageSize:500,totalRows:0,totalReview:0,
   folderPreview:null,browserPath:null,browserData:null,sortBy:'name',sortDir:'asc'
 };
 let dbPath='';
@@ -16,10 +16,10 @@ const categories=['Trend','Oscillator','Volume','Bill Williams','Volatility','Su
 const app=document.querySelector('#app');
 const header=(label,key)=>`<th data-sort="${key}" style="cursor:pointer;user-select:none" title="Sort by ${label}">${label} <span class="sort-mark" data-sort-mark="${key}"></span></th>`;
 app.innerHTML=`<div class="app"><aside class="sidebar"><div class="brand">MQL Indicator Library<small>0.4.0 • Evidence Engine v4</small></div><div class="nav"><button data-view="library" class="active">Library</button><button data-view="scan">Scan</button><button data-view="review">Review</button><button data-view="settings">Settings</button></div><div class="sidebar-footer" id="appStatus">Local library • Offline core</div></aside><main class="main"><div class="topbar"><input id="searchBox" class="search" placeholder="Search indicators, techniques, categories…"><button class="btn" id="refreshBtn">Refresh</button></div><div class="content">
-<section id="library" class="view active"><div class="title-row"><div><h1>Indicator Library</h1><div class="muted">Truth-first classification with explicit evidence and abstention.</div></div></div><div class="cards"><div class="card"><div class="muted">All Indicators</div><div class="n" id="statTotal">0</div></div><div class="card"><div class="muted">MQL4</div><div class="n" id="statMq4">0</div></div><div class="card"><div class="muted">MQL5</div><div class="n" id="statMq5">0</div></div><div class="card"><div class="muted">Needs Review</div><div class="n" id="statReview">0</div></div><div class="card"><div class="muted">Verified</div><div class="n" id="statVerified">0</div></div></div><div class="toolbar"><select id="platformFilter"><option>ALL</option><option>MQL4</option><option>MQL5</option></select><select id="categoryFilter"><option>ALL</option>${categories.map(x=>`<option>${x}</option>`).join('')}</select><button class="btn" id="previewAllBtn">Preview all</button><span class="status" id="previewAllStatus"></span><span class="status" id="resultCount"></span></div><div class="table-wrap"><table><thead><tr>${header('Name','name')}${header('Platform','platform')}${header('Function','function')}${header('Status','status')}${header('Visual','visual')}${header('Confidence','confidence')}</tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty">No indicators yet. Add a folder from Scan.</div></div><div class="pager"><button class="btn" id="prevBtn">Previous</button><span id="pageInfo" class="status"></span><button class="btn" id="nextBtn">Next</button></div></section>
+<section id="library" class="view active"><div class="title-row"><div><h1>Indicator Library</h1><div class="muted">Truth-first classification with explicit evidence and abstention.</div></div></div><div class="cards"><div class="card"><div class="muted">All Indicators</div><div class="n" id="statTotal">0</div></div><div class="card"><div class="muted">MQL4</div><div class="n" id="statMq4">0</div></div><div class="card"><div class="muted">MQL5</div><div class="n" id="statMq5">0</div></div><div class="card"><div class="muted">Needs Review</div><div class="n" id="statReview">0</div></div><div class="card"><div class="muted">Verified</div><div class="n" id="statVerified">0</div></div></div><div class="toolbar"><select id="platformFilter"><option>ALL</option><option>MQL4</option><option>MQL5</option></select><select id="categoryFilter"><option>ALL</option>${categories.map(x=>`<option>${x}</option>`).join('')}</select><button class="btn" id="previewAllBtn">Prioritize filtered previews</button><div class="preview-cache-meter" title="Background preview cache progress"><div id="previewCacheBar"></div></div><span class="status" id="previewAllStatus"></span><span class="status" id="resultCount"></span></div><div class="table-wrap"><table><thead><tr>${header('Name','name')}${header('Platform','platform')}${header('Function','function')}${header('Status','status')}${header('Visual','visual')}${header('Confidence','confidence')}</tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty">No indicators yet. Add a folder from Scan.</div></div><div class="pager"><button class="btn" id="prevBtn">Previous</button><span id="pageInfo" class="status"></span><button class="btn" id="nextBtn">Next</button></div></section>
 <section id="scan" class="view"><div class="title-row"><div><h1>Scan Library</h1><div class="muted">Browse folders inside the app. Files remain visible while you choose the folder to scan.</div></div></div><div class="scan-panel"><button class="btn" id="addFolderBtn">+ Add Folder</button><div class="sources" id="sources"></div><div id="folderPreview" class="folder-preview"><div class="muted">No folder preview yet.</div></div><div style="margin-top:14px"><button class="btn primary" id="scanBtn">Scan Library</button></div><div class="progress"><div id="progressBar"></div></div><div class="status" id="scanText">Ready</div><div class="scan-stats"><div class="scan-stat"><div class="muted">Processed</div><b id="processed">0</b></div><div class="scan-stat"><div class="muted">Skipped</div><b id="skipped">0</b></div><div class="scan-stat"><div class="muted">Failed</div><b id="failed">0</b></div><div class="scan-stat"><div class="muted">Current</div><b id="current">0 / 0</b></div></div></div></section>
 <section id="review" class="view"><div class="title-row"><div><h1>Review Queue</h1><div class="muted">Only uncertain, unverified classifications appear here.</div></div></div><div class="review-note">Unknown is a valid truthful result. Verify or correct only when you know what the indicator does.</div><div class="table-wrap"><table><thead><tr>${header('Name','name')}${header('Platform','platform')}${header('Possible Function','function')}${header('Status','status')}${header('Confidence','confidence')}</tr></thead><tbody id="reviewRows"></tbody></table></div><div class="pager"><button class="btn" id="reviewPrevBtn">Previous</button><span id="reviewPageInfo" class="status"></span><button class="btn" id="reviewNextBtn">Next</button></div></section>
-<section id="settings" class="view"><div class="title-row"><div><h1>Settings</h1><div class="muted">0.4.0 keeps the core offline and stores classification evidence locally.</div></div></div><div class="scan-panel"><h3>Performance</h3><p class="muted">Library browsing uses direct Rust → SQLite queries with 250-row pages and whole-library sorting.</p><div class="diagnostic-card"><h3>Diagnostics</h3><p class="muted">Export a support bundle containing application logs, scan engine output, errors, database health, timings, delays, paths, counts and startup diagnostics. Indicator source code is not copied.</p><button class="btn primary" id="exportDiagBtn">Export Diagnostic Bundle</button><div class="status" id="diagStatus" style="margin-top:10px">Ready</div></div><h3>Data</h3><div class="muted">Database location</div><div id="dbLocation" style="margin-top:7px;word-break:break-all"></div></div></section></div></main><aside class="detail" id="detail"><button class="btn close" id="closeDetail">×</button><div id="detailBody"></div></aside></div>
+<section id="settings" class="view"><div class="title-row"><div><h1>Settings</h1><div class="muted">0.4.0 keeps the core offline and stores classification evidence locally.</div></div></div><div class="scan-panel"><h3>Performance</h3><p class="muted">Library browsing uses direct Rust → SQLite queries with 500-row pages, a 50-row virtual window, lazy thumbnails, and whole-library sorting.</p><div class="diagnostic-card"><h3>Diagnostics</h3><p class="muted">Export a support bundle containing application logs, scan engine output, errors, database health, timings, delays, paths, counts and startup diagnostics. Indicator source code is not copied.</p><button class="btn primary" id="exportDiagBtn">Export Diagnostic Bundle</button><div class="status" id="diagStatus" style="margin-top:10px">Ready</div></div><h3>Data</h3><div class="muted">Database location</div><div id="dbLocation" style="margin-top:7px;word-break:break-all"></div></div></section></div></main><aside class="detail" id="detail"><button class="btn close" id="closeDetail">×</button><div id="detailBody"></div></aside></div>
 <div id="folderBrowser" class="browser-overlay hidden"><div class="browser-modal"><div class="browser-header"><div><h2>Select Folder</h2><div class="muted">Folders and files are shown together. Double-click a folder to open it.</div></div><button class="btn" id="browserClose">×</button></div><div class="browser-toolbar"><button class="btn" id="browserPc">This PC</button><button class="btn" id="browserUp">↑ Up</button><div class="browser-path" id="browserPath">This PC</div></div><div class="browser-list" id="browserList"></div><div class="browser-footer"><span class="status" id="browserStatus"></span><div><button class="btn" id="browserCancel">Cancel</button><button class="btn primary" id="browserUse">Use This Folder</button></div></div></div></div>`;
 
 const el=id=>document.getElementById(id);
@@ -73,26 +73,32 @@ function queryArgs(reviewOnly,offset){return{dbPath,search:reviewOnly?'':state.s
 
 function handleScanLine(line){try{const ev=JSON.parse(line);if(ev.type==='source_preflight'){scanText.textContent=`Preflight: ${ev.source_files||0} source files, ${ev.compiled_files||0} compiled files.`;}else if(ev.type==='scan_start'){current.textContent=`0 / ${ev.total||0}`;scanText.textContent=ev.total?`Found ${ev.total.toLocaleString()} classifiable source files.`:'No classifiable source files found.';}else if(['item','progress','error'].includes(ev.type)){current.textContent=`${ev.current||0} / ${ev.total||0}`;progressBar.style.width=`${ev.total?(ev.current/ev.total)*100:0}%`;if(ev.processed!==undefined)processed.textContent=ev.processed;if(ev.skipped!==undefined)skipped.textContent=ev.skipped;if(ev.failed!==undefined)failed.textContent=ev.failed;scanText.textContent=ev.filename||ev.error||'Scanning…';}else if(ev.type==='scan_complete'){processed.textContent=ev.processed;skipped.textContent=ev.skipped;failed.textContent=ev.failed;scanText.textContent=`Complete in ${ev.elapsed_seconds}s`;progressBar.style.width='100%';}else if(ev.type==='fatal'){scanText.textContent=`Scan failed: ${ev.error}`;logEvent('ERROR','scan_fatal',ev);}}catch(e){console.error('Invalid scanner output',line,e);logEvent('ERROR','scan_output_parse_failed',{line,error:String(e)});}}
 
+function updatePreviewProgress(done,total){
+  const d=Number(done||0),t=Number(total||0);
+  const pct=t?Math.min(100,(d/t)*100):0;
+  el('previewCacheBar').style.width=`${pct}%`;
+  el('previewAllStatus').textContent=`Previews ${d.toLocaleString()} / ${t.toLocaleString()} ready`;
+}
+async function refreshPreviewQueueStats(){
+  if(!dbPath)return;
+  try{const s=await invoke('preview_queue_stats',{dbPath});updatePreviewProgress(s.ready,s.total);}catch{}
+}
 function handlePreviewLibraryLine(line){
   let ev;try{ev=JSON.parse(line);}catch{return;}
-  const status=el('previewAllStatus');
-  if(ev.type==='progress'){
-    status.textContent=`Previews ${Number(ev.done||0).toLocaleString()} / ${Number(ev.total||0).toLocaleString()} ready`;
-  }else if(ev.ok&&ev.finished){
-    status.textContent='Preview cache is up to date';
-  }
+  if(ev.type==='progress')updatePreviewProgress(ev.done,ev.total);
+  else if(ev.ok&&ev.finished)void refreshPreviewQueueStats();
 }
 
 async function startPreviewLibraryWorker(){
   if(!dbPath)return;
+  await refreshPreviewQueueStats();
   const outDir=await join(await appDataDir(),'previews');
   const jobId=`library-${Date.now()}`;
   try{
     const out=await invoke('start_preview_library',{args:[
       'render-library','--db',dbPath,'--out',outDir,'--chunk','40','--timeout','45','--job-id',jobId
     ]});
-    if(out?.already_running)el('previewAllStatus').textContent='Preview cache worker running…';
-    else if(out?.started)el('previewAllStatus').textContent='Building preview cache in background…';
+    if(out?.already_running||out?.started)void refreshPreviewQueueStats();
   }catch(e){
     el('previewAllStatus').textContent=`Preview cache worker: ${e}`;
     logEvent('ERROR','preview_library_start_failed',{error:String(e)});
@@ -100,7 +106,7 @@ async function startPreviewLibraryWorker(){
 }
 window.__mqlStartPreviewLibraryWorker=startPreviewLibraryWorker;
 
-async function setup(){const base=await appDataDir();dbPath=await join(base,'library.sqlite3');el('dbLocation').textContent=dbPath;await logEvent('INFO','app_start',{userAgent:navigator.userAgent});await listen('scan-engine-line',e=>handleScanLine(e.payload?.line??e.payload));await listen('scan-engine-stderr',e=>{const line=e.payload?.line??e.payload;console.error('scanner',line);logEvent('ERROR','scan_engine_stderr_ui',{line});if(state.scanning&&line)scanText.textContent=`Scanner: ${line}`;});await listen('scan-engine-done',async e=>{if(!state.scanning)return;const code=Number(e.payload?.code??-1);logEvent(code===0?'INFO':'ERROR','scan_engine_done_ui',{code});if(code!==0&&!scanText.textContent.startsWith('Scan failed:'))scanText.textContent=`Scan engine exited with code ${code}`;await finishScan();});await listen('preview-library-line',e=>handlePreviewLibraryLine(e.payload?.line??e.payload));await listen('preview-library-stderr',e=>{const line=e.payload?.line??e.payload;console.error('preview worker',line);logEvent('ERROR','preview_library_stderr_ui',{line});});await listen('preview-library-done',async e=>{const code=Number(e.payload?.code??-1);logEvent(code===0?'INFO':'ERROR','preview_library_done_ui',{code});if(code===0)el('previewAllStatus').textContent='Preview cache is up to date';await reloadAll();});await ensureDb();await reloadAll();void startPreviewLibraryWorker();await logEvent('INFO','app_ready',{totalIndicators:state.stats.total||0},performance.now()-bootStarted);}
+async function setup(){const base=await appDataDir();dbPath=await join(base,'library.sqlite3');el('dbLocation').textContent=dbPath;await logEvent('INFO','app_start',{userAgent:navigator.userAgent});await listen('scan-engine-line',e=>handleScanLine(e.payload?.line??e.payload));await listen('scan-engine-stderr',e=>{const line=e.payload?.line??e.payload;console.error('scanner',line);logEvent('ERROR','scan_engine_stderr_ui',{line});if(state.scanning&&line)scanText.textContent=`Scanner: ${line}`;});await listen('scan-engine-done',async e=>{if(!state.scanning)return;const code=Number(e.payload?.code??-1);logEvent(code===0?'INFO':'ERROR','scan_engine_done_ui',{code});if(code!==0&&!scanText.textContent.startsWith('Scan failed:'))scanText.textContent=`Scan engine exited with code ${code}`;await finishScan();});await listen('preview-library-line',e=>handlePreviewLibraryLine(e.payload?.line??e.payload));await listen('preview-library-stderr',e=>{const line=e.payload?.line??e.payload;console.error('preview worker',line);logEvent('ERROR','preview_library_stderr_ui',{line});});await listen('preview-library-done',async e=>{const code=Number(e.payload?.code??-1);logEvent(code===0?'INFO':'ERROR','preview_library_done_ui',{code});await refreshPreviewQueueStats();await reloadAll();});await ensureDb();await reloadAll();void startPreviewLibraryWorker();await logEvent('INFO','app_ready',{totalIndicators:state.stats.total||0},performance.now()-bootStarted);}
 async function reloadAll(){const t=performance.now();await Promise.all([loadStats(),loadRows(),loadReview()]);logEvent('INFO','reload_all',{rows:state.rows.length,reviewRows:state.reviewRows.length},performance.now()-t);}
 async function loadStats(){const t=performance.now();try{state.stats=await invoke('db_stats',{dbPath});if(!state.sources.length)state.sources=(state.stats.sources||[]).map(s=>s.path);renderStats();renderSources();logEvent('INFO','load_stats',{total:state.stats.total,backendElapsedMs:state.stats.elapsed_ms},performance.now()-t);}catch(e){console.error(e);el('appStatus').textContent=`Database error: ${e}`;logEvent('ERROR','load_stats_failed',{error:String(e)},performance.now()-t);}}
 async function loadRows(){const offset=state.page*state.pageSize,t=performance.now();try{const out=await invoke('db_query',queryArgs(false,offset));state.rows=out.rows||[];state.totalRows=out.total||0;renderRows();void prioritizePreviewPaths(state.rows.map(r=>r.path),100,false);logEvent('INFO','load_library_page',{page:state.page,count:state.rows.length,total:state.totalRows,search:state.search,sortBy:state.sortBy,sortDir:state.sortDir},performance.now()-t);}catch(e){console.error(e);logEvent('ERROR','load_library_page_failed',{error:String(e)},performance.now()-t);}}
@@ -111,9 +117,63 @@ function renderSources(){const target=el('sources');target.innerHTML=state.sourc
 function renderFolderPreview(){const box=el('folderPreview');const p=state.folderPreview;if(!p){box.innerHTML='<div class="muted">No folder preview yet.</div>';return;}const shown=p.preview_files||[];box.innerHTML=`<div class="preview-head"><b>${Number(p.total_files||0).toLocaleString()} files visible to the app</b><span class="muted">${p.access_errors?`${p.access_errors} access error(s)`:''}</span></div><div class="muted preview-path">${esc(p.path)}</div><div class="preview-list">${shown.length?shown.map(f=>`<div>${esc(f)}</div>`).join(''):'<div class="muted">No files found in this folder tree.</div>'}</div>${p.total_files>shown.length?`<div class="muted preview-more">Showing first ${shown.length.toLocaleString()} of ${Number(p.total_files).toLocaleString()} files.</div>`:''}`;}
 function statusClass(s){return s==='Verified'||s==='High Confidence'?'high':s==='Probable'?'med':'low';}
 function updateSortMarks(){document.querySelectorAll('[data-sort-mark]').forEach(x=>{x.textContent=x.dataset.sortMark===state.sortBy?(state.sortDir==='asc'?'▲':'▼'):'';});}
+const VIRTUAL_ROW_HEIGHT=64;
+const VIRTUAL_WINDOW=50;
+let previewThumbObserver=null;
+
+function thumbPath(full){
+  const s=String(full||'');const i=s.lastIndexOf('.');
+  return i>0?s.slice(0,i)+'.thumb.png':s+'.thumb.png';
+}
+function previewStateText(r){
+  if(r.preview_status==='ready')return 'Preview ready';
+  if(r.preview_status==='rendering')return 'Rendering preview…';
+  if(r.preview_status==='failed')return "Can't preview";
+  return 'Preview pending';
+}
+function observePreviewThumbs(target){
+  const wrap=target.closest('.table-wrap');
+  if(!('IntersectionObserver' in window)){
+    target.querySelectorAll('img[data-preview-src]').forEach(img=>{img.src=convertFileSrc(img.dataset.previewSrc);});
+    return;
+  }
+  if(previewThumbObserver)previewThumbObserver.disconnect();
+  previewThumbObserver=new IntersectionObserver(entries=>{
+    for(const entry of entries){
+      if(!entry.isIntersecting)continue;
+      const img=entry.target;const src=img.dataset.previewSrc;const full=img.dataset.previewFull;
+      if(src){
+        img.onerror=()=>{if(full&&img.dataset.fallback!=='1'){img.dataset.fallback='1';img.src=convertFileSrc(full);}else{img.style.display='none';}};
+        img.src=convertFileSrc(src);
+      }
+      previewThumbObserver.unobserve(img);
+    }
+  },{root:wrap,rootMargin:'160px'});
+  target.querySelectorAll('img[data-preview-src]').forEach(img=>previewThumbObserver.observe(img));
+}
 function renderRows(){renderTable(state.rows,el('rows'),false);el('resultCount').textContent=`${state.totalRows.toLocaleString()} matched`;el('empty').style.display=state.totalRows?'none':'block';const pages=Math.max(1,Math.ceil(state.totalRows/state.pageSize));el('pageInfo').textContent=`Page ${state.page+1} of ${pages}`;el('prevBtn').disabled=state.page===0;el('nextBtn').disabled=(state.page+1)*state.pageSize>=state.totalRows;updateSortMarks();}
 function renderReview(){renderTable(state.reviewRows,el('reviewRows'),true);const pages=Math.max(1,Math.ceil(state.totalReview/state.pageSize));el('reviewPageInfo').textContent=`Page ${state.reviewPage+1} of ${pages} • ${state.totalReview.toLocaleString()} items`;el('reviewPrevBtn').disabled=state.reviewPage===0;el('reviewNextBtn').disabled=(state.reviewPage+1)*state.pageSize>=state.totalReview;updateSortMarks();}
-function renderTable(rows,target,review){target.innerHTML=rows.map((r,i)=>`<tr data-idx="${i}"><td>${esc(r.filename)}</td><td><span class="badge">${esc(r.platform)}</span></td><td>${esc(r.primary_category)}</td><td><span class="confidence ${statusClass(r.classification_status)}">${esc(r.classification_status)}</span></td>${review?'':`<td>${esc(r.visual_category)}</td>`}<td class="confidence ${r.confidence>=85?'high':r.confidence>=70?'med':'low'}">${r.confidence}%</td></tr>`).join('');target.querySelectorAll('tr').forEach(tr=>tr.onclick=()=>showDetail(rows[Number(tr.dataset.idx)]));}
+function renderTable(rows,target,review){
+  const wrap=target.closest('.table-wrap');if(!wrap)return;
+  const start=Math.max(0,Math.floor(wrap.scrollTop/VIRTUAL_ROW_HEIGHT)-8);
+  const end=Math.min(rows.length,start+VIRTUAL_WINDOW);
+  const top=start*VIRTUAL_ROW_HEIGHT,bottom=Math.max(0,(rows.length-end)*VIRTUAL_ROW_HEIGHT);
+  const cols=review?5:6;
+  const body=rows.slice(start,end).map((r,n)=>{
+    const i=start+n;
+    const ready=r.preview_status==='ready'&&r.preview_path;
+    const preview=ready?`<img class="preview-thumb" data-preview-src="${esc(thumbPath(r.preview_path))}" data-preview-full="${esc(r.preview_path)}" alt="" loading="lazy"/>`:`<span class="preview-placeholder ${r.preview_status==='failed'?'failed':''}"></span>`;
+    return `<tr data-idx="${i}"><td><div class="indicator-name-cell">${preview}<div><div>${esc(r.filename)}</div><div class="preview-row-state">${esc(previewStateText(r))}</div></div></div></td><td><span class="badge">${esc(r.platform)}</span></td><td>${esc(r.primary_category)}</td><td><span class="confidence ${statusClass(r.classification_status)}">${esc(r.classification_status)}</span></td>${review?'':`<td>${esc(r.visual_category)}</td>`}<td class="confidence ${r.confidence>=85?'high':r.confidence>=70?'med':'low'}">${r.confidence}%</td></tr>`;
+  }).join('');
+  target.innerHTML=`<tr class="virtual-spacer"><td colspan="${cols}" style="height:${top}px"></td></tr>${body}<tr class="virtual-spacer"><td colspan="${cols}" style="height:${bottom}px"></td></tr>`;
+  target.querySelectorAll('tr[data-idx]').forEach(tr=>tr.onclick=()=>showDetail(rows[Number(tr.dataset.idx)]));
+  observePreviewThumbs(target);
+  wrap.__virtualRender=()=>renderTable(rows,target,review);
+  if(!wrap.dataset.virtualized){
+    wrap.dataset.virtualized='1';let scheduled=false;
+    wrap.addEventListener('scroll',()=>{if(scheduled)return;scheduled=true;requestAnimationFrame(()=>{scheduled=false;wrap.__virtualRender?.();});},{passive:true});
+  }
+}
 
 function structuralPreview(r){
   const lines=Math.min(3,Number(r.line_plots||0)), hist=Number(r.histogram_plots||0)>0, arrows=Number(r.arrow_plots||0)>0, fill=Number(r.filling_plots||0)>0, objects=!!r.object_usage;
