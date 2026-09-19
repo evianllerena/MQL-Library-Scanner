@@ -77,6 +77,7 @@ async function previewAllFiltered(){
     const rows=await filteredIndicatorRows();
     const mt5=rows.filter(r=>/\.(mq5|ex5)$/i.test(r.path||''));
     if(!mt5.length){status.textContent='No MT5 indicators in the current filter.';return;}
+    if(typeof window.__mqlPreviewCancelForBatch==='function')await window.__mqlPreviewCancelForBatch();
     const manifest=await invoke('write_preview_batch_sources',{sources:mt5.map(r=>r.path)});
     const outDir=await join(await appDataDir(),'previews');
     const jobId=batchJobId();
