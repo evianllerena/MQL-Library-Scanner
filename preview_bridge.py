@@ -893,6 +893,49 @@ def _make_thumb(image):
         return None
 
 
+def _migrate_ready_cache(con,dest):
+    try:rows=con.execute("SELECT id,sha256,preview_path FROM indicators WHERE preview_status='ready' AND preview_path IS NOT NULL").fetchall()
+    except Exception:return
+    root=Path(dest).resolve()
+    for row in rows:
+        try:
+            old=Path(row['preview_path'] if isinstance(row,sqlite3.Row) else row[2])
+            sha=row['sha256'] if isinstance(row,sqlite3.Row) else row[1]
+            if not old.is_file() or not sha:continue
+            target=_cache_image_path(dest,sha)
+            if old.resolve()!=target.resolve():
+                final=_store_preview_image(old,dest,sha)
+                con.execute("UPDATE indicators SET preview_path=? WHERE id=?",(str(final),row['id'] if isinstance(row,sqlite3.Row) else row[0]))
+                try:
+                    old_res=old.resolve()
+                    if root in old_res.parents:
+                        old.unlink(missing_ok=True)
+                        _thumb_path(old).unlink(missing_ok=True)
+                except Exception:pass
+        except Exception:pass
+    con.commit()
+
+
+def _worker_pause_reason(con,dest):
+    try:
+        row=con.execute("SELECT value FROM meta WHERE key='preview_paused'").fetchone()
+        if row and str(row[0])=='1':return 'paused_by_user'
+    except Exception:pass
+    try:
+        free=shutil.disk_usage(Path(dest).parent).free
+        if free<2*1024*1024*1024:return 'low_disk'
+    except Exception:pass
+    if os.name=='nt':
+        try:
+            class SYSTEM_POWER_STATUS(ctypes.Structure):
+                _fields_=[('ACLineStatus',ctypes.c_ubyte),('BatteryFlag',ctypes.c_ubyte),('BatteryLifePercent',ctypes.c_ubyte),('SystemStatusFlag',ctypes.c_ubyte),('BatteryLifeTime',ctypes.c_ulong),('BatteryFullLifeTime',ctypes.c_ulong)]
+            s=SYSTEM_POWER_STATUS()
+            if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s)) and s.ACLineStatus==0 and s.BatteryLifePercent!=255 and s.BatteryLifePercent<=20:
+                return 'low_battery'
+        except Exception:pass
+    return None
+
+
 def _backfill_thumbnails(con):
     try:rows=con.execute("SELECT preview_path FROM indicators WHERE preview_status='ready' AND preview_path IS NOT NULL").fetchall()
     except Exception:return
@@ -1029,21 +1072,28 @@ def _ensure_preview_queue_schema(con):
     con.commit()
 
 
-def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, job_id=None):
+def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_attempts=2, job_id=None):
     job_id=safe_job_id(job_id);dest=Path(out)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
+    con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=30000')
     _ensure_preview_queue_schema(con)
+    _migrate_ready_cache(con,dest)
     _backfill_thumbnails(con)
     mt5_sel=mt5_rt=mt5_sym=None
     mt4_sel=None
     lock=dest.parent/'preview-runtime'/'.render.lock'
     with RenderLock(lock,timeout=5.0):
         while True:
+            pause_reason=_worker_pause_reason(con,dest)
+            if pause_reason:
+                emit({'ok':True,'job_id':job_id,'paused':True,'reason':pause_reason})
+                break
+            attempts=max(1,min(int(max_attempts),10))
             rows=con.execute(
                 "SELECT id,path,platform,sha256 FROM indicators "
-                "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)<2 "
+                "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)<? "
                 "ORDER BY COALESCE(preview_priority,0) DESC,user_favorite DESC,id LIMIT ?",
-                (max(1,min(int(chunk_size),200)),)).fetchall()
+                (attempts,max(1,min(int(chunk_size),200)))).fetchall()
             if not rows:break
             ids=[r['id'] for r in rows]
             con.executemany(
@@ -1088,9 +1138,9 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, job_i
                 else:
                     err=(res or {}).get('error','render timeout/hang')
                     con.execute(
-                        "UPDATE indicators SET preview_status=CASE WHEN COALESCE(preview_attempts,0)>=2 "
+                        "UPDATE indicators SET preview_status=CASE WHEN COALESCE(preview_attempts,0)>=? "
                         "THEN 'failed' ELSE 'pending' END,preview_error=? WHERE id=?",
-                        (str(err)[:800],r['id']))
+                        (attempts,str(err)[:800],r['id']))
             con.commit()
             ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
             total=con.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
@@ -1360,7 +1410,7 @@ def main():
     p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal')
     p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
-    p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=40);p.add_argument('--timeout',type=int,default=45);p.add_argument('--job-id')
+    p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=40);p.add_argument('--timeout',type=int,default=45);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
     p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
@@ -1378,7 +1428,7 @@ def main():
         with RenderLock(lock_path,timeout=5.0):
             sel=load_runtime_cache(Path(x.out),'MT5') or choose_runtime('MT5',x.terminal)
             render_mt5_batch(mt5,x.out,sel,job)
-    elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.job_id)
+    elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)
