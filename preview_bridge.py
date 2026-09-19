@@ -591,12 +591,21 @@ def preview_trace(logs):
         if 'MQLLIB_PREVIEW' in line:lines.append(line)
     return '\n'.join(lines[-20:])
 
-def mt5_capture_source(rel,shot,win):
+def _mql_str(s):
+    """Escape a Python string so it is a SAFE double-quoted MQL4/MQL5 literal.
+    Backslash MUST be escaped before the quote."""
+    return str(s).replace('\\', '\\\\').replace('"', '\\"')
+
+# Guardrail: Any path or user-supplied string inserted into a generated MQL "..." literal
+# must go through _mql_str() first.
+def mt5_capture_source(rel, shot, win):
+    rel_lit = _mql_str(rel)
+    shot_lit = _mql_str(shot)
     return (
         'void OnStart(){\n' ' Print("MQLLIB_PREVIEW stage=onstart");\n'
         ' ResetLastError();\n'
-        f' Print("MQLLIB_PREVIEW stage=before_iCustom path={rel}");\n'
-        f' int h=iCustom(_Symbol,_Period,"{rel}");\n'
+        f' Print("MQLLIB_PREVIEW stage=before_iCustom path={rel_lit}");\n'
+        f' int h=iCustom(_Symbol,_Period,"{rel_lit}");\n'
         ' int err=GetLastError();\n'
         ' PrintFormat("MQLLIB_PREVIEW stage=after_iCustom handle=%d err=%d",h,err);\n'
         ' if(h==INVALID_HANDLE){TerminalClose(21);return;}\n'
@@ -611,7 +620,7 @@ def mt5_capture_source(rel,shot,win):
         ' for(int i=0;i<20;i++){if(BarsCalculated(h)>=0)break;Sleep(250);}\n'
         ' Sleep(1500);\n'
         ' ResetLastError();\n'
-        f' bool ok=ChartScreenShot(0,"{shot}",1200,720,ALIGN_RIGHT);\n'
+        f' bool ok=ChartScreenShot(0,"{shot_lit}",1200,720,ALIGN_RIGHT);\n'
         ' err=GetLastError();\n'
         ' PrintFormat("MQLLIB_PREVIEW stage=screenshot ok=%s err=%d",ok?"true":"false",err);\n'
         ' IndicatorRelease(h);\n'
@@ -619,6 +628,170 @@ def mt5_capture_source(rel,shot,win):
         ' TerminalClose(ok?0:23);\n'
         '}\n'
     )
+
+
+def mt5_batch_capture_source(manifest_rel, done_marker):
+    """One script that renders every indicator listed in a manifest file.
+
+    manifest_rel : path (relative to MQL5\\Files) of a UTF-8 text file with one
+                   record per line:  rel<TAB>shot<TAB>win
+    done_marker  : filename (in MQL5\\Files) written when the whole batch is done,
+                   so the Python side knows to stop waiting.
+    """
+    manifest_lit = _mql_str(manifest_rel)
+    done_lit = _mql_str(done_marker)
+    return (
+        'void _clear_all(){\n'
+        '  for(int w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL)-1;w>=0;w--){\n'
+        '    int total=ChartIndicatorsTotal(0,w);\n'
+        '    for(int i=total-1;i>=0;i--){\n'
+        '      string nm=ChartIndicatorName(0,w,i);\n'
+        '      ChartIndicatorDelete(0,w,nm);\n'
+        '    }\n'
+        '  }\n'
+        '  ChartRedraw();\n'
+        '}\n'
+        'void OnStart(){\n'
+        '  Print("MQLLIB_PREVIEW stage=batch_start");\n'
+        f'  int fh=FileOpen("{manifest_lit}",FILE_READ|FILE_TXT|FILE_ANSI);\n'
+        '  if(fh==INVALID_HANDLE){Print("MQLLIB_PREVIEW stage=manifest_missing err=",GetLastError());TerminalClose(31);return;}\n'
+        '  while(!FileIsEnding(fh)){\n'
+        '    string line=FileReadString(fh);\n'
+        '    if(StringLen(line)==0) continue;\n'
+        '    string parts[]; int n=StringSplit(line,(ushort)9,parts);\n'
+        '    if(n<2) continue;\n'
+        '    string rel=parts[0]; string shot=parts[1];\n'
+        '    int win=(n>=3)?(int)StringToInteger(parts[2]):0;\n'
+        '    _clear_all();\n'
+        '    ResetLastError();\n'
+        '    int h=iCustom(_Symbol,_Period,rel);\n'
+        '    int err=GetLastError();\n'
+        '    PrintFormat("MQLLIB_PREVIEW stage=item rel=%s handle=%d err=%d",rel,h,err);\n'
+        '    if(h==INVALID_HANDLE){ continue; }\n'
+        '    int w=win; if(w==1) w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);\n'
+        '    bool added=ChartIndicatorAdd(0,w,h);\n'
+        '    if(!added){ IndicatorRelease(h); continue; }\n'
+        '    ChartRedraw();\n'
+        '    for(int i=0;i<20;i++){ if(BarsCalculated(h)>=0) break; Sleep(200); }\n'
+        '    Sleep(900);\n'
+        '    ResetLastError();\n'
+        '    bool ok=ChartScreenShot(0,shot,1200,720,ALIGN_RIGHT);\n'
+        '    PrintFormat("MQLLIB_PREVIEW stage=item_shot shot=%s ok=%s err=%d",shot,ok?"true":"false",GetLastError());\n'
+        '    IndicatorRelease(h);\n'
+        '    Sleep(150);\n'
+        '  }\n'
+        '  FileClose(fh);\n'
+        f'  int dm=FileOpen("{done_lit}",FILE_WRITE|FILE_TXT|FILE_ANSI);\n'
+        '  if(dm!=INVALID_HANDLE){ FileWrite(dm,"done"); FileClose(dm); }\n'
+        '  Print("MQLLIB_PREVIEW stage=batch_done");\n'
+        '  Sleep(300);\n'
+        '  TerminalClose(0);\n'
+        '}\n'
+    )
+
+
+def render_mt5_batch(sources, out, t, job_id):
+    """Render many MT5 indicators with a SINGLE terminal launch.
+
+    \`sources\` is a list of file paths (str/Path). Returns a dict:
+        { "<source path>": {"ok":True,"image":...} | {"ok":False,"error":...} }
+
+    NOTE: relies on helpers already in preview_bridge.py:
+      clone_runtime, copy_mt5_history, prime_mt5_runtime, stage, read_text,
+      compile_file, wait_image, startupinfo, terminate_tree, latest_logs,
+      emit, emit_stage, CREATE_NO_WINDOW
+    """
+    out = Path(out)
+    results = {}
+    emit_stage(job_id, 'runtime_clone', 'Preparing isolated MT5 runtime (batch).')
+    rt = clone_runtime(t, out, 'MT5')
+    mql = rt / 'MQL5'
+    scripts = mql / 'Scripts'
+    files = mql / 'Files'
+    for d in (scripts, files):
+        d.mkdir(parents=True, exist_ok=True)
+    editor = rt / Path(t['editor']).name
+    terminal = rt / Path(t['terminal']).name
+    sym = copy_mt5_history(Path(t['data_dir']), rt)
+
+    # Prime ONCE for the whole batch (this is the slow one-time step).
+    prime_mt5_runtime(rt, terminal, sym, job_id)
+
+    # Stage + compile every indicator. Failures are recorded, not fatal.
+    manifest_lines = []
+    plan = []  # (source, shot_path_in_files, rel)
+    for i, source in enumerate(sources):
+        src = Path(source)
+        try:
+            emit_stage(job_id, 'indicator_compile', f'[{i+1}/{len(sources)}] Compiling {src.name}', source=str(src))
+            job, staged, binary, meta = stage(src, mql, 'MT5', editor)
+            rel = f'MQLLibraryPreview/{job}/{binary.stem}'   # forward slash: no escaping needed
+            shot = f'MQLLibraryPreview_{job}.png'
+            sep = 'indicator_separate_window' in read_text(src).lower()
+            win = '1' if sep else '0'
+            manifest_lines.append(f'{rel}\t{shot}\t{win}')
+            plan.append((str(src), files / shot, rel))
+            # clear any stale screenshot
+            try:(files / shot).unlink(missing_ok=True)
+            except Exception:pass
+        except Exception as e:
+            results[str(src)] = {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+
+    if not plan:
+        return results  # nothing compiled
+
+    # Write manifest into MQL5\\Files (that's the sandbox for FileOpen).
+    manifest_name = f'mqllib_batch_{job_id}.txt'
+    done_marker = f'mqllib_batch_{job_id}.done'
+    (files / manifest_name).write_text('\n'.join(manifest_lines), encoding='utf-8')
+    try:(files / done_marker).unlink(missing_ok=True)
+    except Exception:pass
+
+    # Compile the batch capture script ONCE.
+    cap = scripts / f'MQLLibraryBatchCapture_{job_id}.mq5'
+    cap.write_text(mt5_batch_capture_source(manifest_name, done_marker), encoding='utf-8')
+    emit_stage(job_id, 'capture_compile', 'Compiling MT5 batch capture script.')
+    built, _, log = compile_file(editor, cap, mql)
+    if not built:
+        raise RuntimeError('Batch capture script failed to compile. ' + (log or '')[-1600:])
+
+    # Launch the terminal ONCE.
+    cfg = rt / f'mql-batch-{job_id}.ini'
+    cfg.write_text(
+        '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
+        f'[StartUp]\nSymbol={sym}\nPeriod=H1\nScript={cap.stem}\nShutdownTerminal=1\n',
+        encoding='utf-8')
+    emit_stage(job_id, 'terminal_launch', f'Launching ONE MT5 terminal for {len(plan)} indicators.')
+    proc = subprocess.Popen([str(terminal), '/portable', f'/config:{cfg}'],
+                            cwd=str(rt), creationflags=CREATE_NO_WINDOW, startupinfo=startupinfo())
+
+    # Wait for the done-marker (generous timeout scaled to batch size).
+    done_path = files / done_marker
+    timeout = 60 + 12 * len(plan)
+    end = time.time() + timeout
+    while time.time() < end:
+        if done_path.exists():
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.5)
+    terminate_tree(proc)
+
+    # Collect screenshots.
+    for src_path, shot_path, rel in plan:
+        if shot_path.exists() and shot_path.stat().st_size:
+            final = out / (hashlib.sha1(('MT5|' + str(Path(src_path).resolve()).lower()).encode()).hexdigest()[:16] + '.png')
+            out.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(shot_path, final)
+            results[src_path] = {'ok': True, 'image': str(final), 'kind': 'MT5'}
+        else:
+            results.setdefault(src_path, {'ok': False, 'error': 'No screenshot produced (indicator likely could not load on the chart).'})
+
+    emit({'ok': True, 'batch': True, 'kind': 'MT5', 'job_id': job_id,
+          'rendered': sum(1 for v in results.values() if v.get('ok')),
+          'failed': sum(1 for v in results.values() if not v.get('ok')),
+          'results': results})
+    return results
 
 def render_mt4(src,out,t,job_id):
     emit_stage(job_id,'runtime_clone','Preparing isolated MT4 runtime.')
@@ -877,11 +1050,28 @@ def self_test():
     emit({'ok':True,'checks':checks})
 
 def main():
-    a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True);s.add_parser('detect');s.add_parser('self-test');p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p=s.add_parser('open-source');p.add_argument('--source',required=True);p=s.add_parser('memory-stats');p.add_argument('--db',required=True);p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True);p=s.add_parser('archive-reset');p.add_argument('--db',required=True);x=a.parse_args()
+    a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True)
+    s.add_parser('detect');s.add_parser('self-test')
+    p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal')
+    p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
+    p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
+    p=s.add_parser('open-source');p.add_argument('--source',required=True)
+    p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
+    p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
+    p=s.add_parser('archive-reset');p.add_argument('--db',required=True)
+    x=a.parse_args()
     if x.cmd=='detect':detect()
     elif x.cmd=='self-test':self_test()
     elif x.cmd=='preflight':preflight(x.source,x.out,x.terminal)
     elif x.cmd=='render':render(x.source,x.out,x.terminal,x.job_id)
+    elif x.cmd=='render-batch':
+        srcs=json.loads(Path(x.sources).read_text(encoding='utf-8'))
+        mt5=[p for p in srcs if Path(p).suffix.lower() in ('.mq5','.ex5')]
+        job=safe_job_id(x.job_id)
+        lock_path=Path(x.out).parent/'preview-runtime'/'.render.lock'
+        with RenderLock(lock_path,timeout=5.0):
+            sel=load_runtime_cache(Path(x.out),'MT5') or choose_runtime('MT5',x.terminal)
+            render_mt5_batch(mt5,x.out,sel,job)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)
