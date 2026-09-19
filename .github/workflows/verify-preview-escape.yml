@@ -1,0 +1,22 @@
+name: Verify preview escape fix
+on:
+  push:
+    branches:
+      - fix/mql-preview-escape
+    paths:
+      - 'preview_bridge.py'
+      - '.github/workflows/verify-preview-escape.yml'
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Import preview_bridge
+        shell: pwsh
+        run: python -c "import preview_bridge"
+      - name: Run preview self-test
+        shell: pwsh
+        run: python preview_bridge.py self-test
