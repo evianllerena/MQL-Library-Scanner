@@ -441,14 +441,17 @@ fn preview_worker_pause(db_path:String, paused:bool) -> Result<Value,String> {
 fn preview_queue_stats(db_path:String) -> Result<Value,String> {
     let conn=open_db(&db_path)?;
     ensure_preview_columns(&conn)?;
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",[]).map_err(|e|e.to_string())?;
     let one=|sql:&str|->Result<i64,String>{conn.query_row(sql,[],|r|r.get(0)).map_err(|e|e.to_string())};
+    let paused=conn.query_row("SELECT value FROM meta WHERE key='preview_paused'",[],|r|r.get::<_,String>(0)).ok().map(|v|v=="1").unwrap_or(false);
     Ok(json!({
         "ok":true,
         "total":one("SELECT COUNT(*) FROM indicators")?,
         "ready":one("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'")?,
         "pending":one("SELECT COUNT(*) FROM indicators WHERE preview_status='pending'")?,
         "rendering":one("SELECT COUNT(*) FROM indicators WHERE preview_status='rendering'")?,
-        "failed":one("SELECT COUNT(*) FROM indicators WHERE preview_status='failed'")?
+        "failed":one("SELECT COUNT(*) FROM indicators WHERE preview_status='failed'")?,
+        "paused":paused
     }))
 }
 
