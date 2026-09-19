@@ -427,20 +427,35 @@ def clone_runtime(t,out,kind):
     if missing:raise RuntimeError(f'Preview sandbox initialization failed for {kind}: {", ".join(missing)}')
     return rt
 
-def stage(src,mql,kind,editor,data_dir=None):
+def stage(src,mql,kind,editor,data_dir=None,compiled_cache=None):
     ext='.ex5' if kind=='MT5' else '.ex4'; job=hashlib.sha1(str(src.resolve()).lower().encode()).hexdigest()[:14]; d=mql/'Indicators'/'MQLLibraryPreview'/job;d.mkdir(parents=True,exist_ok=True)
     staged=d/safe_name(src); shutil.copy2(src,staged)
     for dep in src.parent.glob('*.mqh'):
         try:shutil.copy2(dep,d/dep.name)
         except Exception:pass
-    binary=d/(staged.stem+ext); old=existing_binary(src,ext) or find_live_binary(src,ext,data_dir)
-    if old:shutil.copy2(old,binary);return job,staged,binary,{'used_existing_binary':True,'existing_binary':str(old)}
+    binary=d/(staged.stem+ext)
+    cache=Path(compiled_cache) if compiled_cache else None
+    if cache and cache.is_file() and cache.stat().st_size:
+        shutil.copy2(cache,binary)
+        return job,staged,binary,{'used_compiled_cache':True,'compiled_cache':str(cache)}
+    old=existing_binary(src,ext) or find_live_binary(src,ext,data_dir)
+    if old:
+        shutil.copy2(old,binary)
+        if cache:
+            cache.parent.mkdir(parents=True,exist_ok=True)
+            try:shutil.copy2(old,cache)
+            except Exception:pass
+        return job,staged,binary,{'used_existing_binary':True,'existing_binary':str(old)}
     if src.suffix.lower() not in ('.mq4','.mq5'):raise RuntimeError(f'Indicator compile failed — {kind} executable could not be staged.')
     built,cmds,log=compile_file(editor,staged,mql)
     if not built:
         if log:raise RuntimeError(f'Indicator compile failed — {kind} source produced no {ext.upper()[1:]}.\n{log[-2200:]}')
         raise RuntimeError(f'Indicator compile failed — {kind} MetaEditor produced no executable. Staged={staged}; commands={cmds}')
-    return job,staged,built,{'used_existing_binary':False}
+    if cache:
+        cache.parent.mkdir(parents=True,exist_ok=True)
+        try:shutil.copy2(built,cache)
+        except Exception:pass
+    return job,staged,built,{'used_existing_binary':False,'compiled_cache':str(cache) if cache else None}
 
 def copy_mt4_history(live,rt):
     files=[]; h=live/'history'
@@ -824,10 +839,35 @@ def mt5_batch_capture_source_v2(manifest_rel, cur_prefix, done_marker):
     )
 
 
-def _preview_final_path(dest, kind, source):
-    dest=Path(dest);dest.mkdir(parents=True,exist_ok=True)
-    digest=hashlib.sha1((kind+'|'+str(Path(source).resolve()).lower()).encode()).hexdigest()[:16]
-    return dest/(digest+('.png' if kind=='MT5' else '.gif'))
+def _cache_image_path(dest, source_hash):
+    digest=str(source_hash or '').lower().strip()
+    if not re.fullmatch(r'[0-9a-f]{64}',digest):
+        digest=hashlib.sha256(digest.encode('utf-8','ignore')).hexdigest()
+    shard=Path(dest)/digest[:2]
+    shard.mkdir(parents=True,exist_ok=True)
+    return shard/(digest+'.png')
+
+
+def _compiled_cache_path(dest, kind, source_hash):
+    digest=str(source_hash or '').lower().strip()
+    if not re.fullmatch(r'[0-9a-f]{64}',digest):
+        digest=hashlib.sha256(digest.encode('utf-8','ignore')).hexdigest()
+    ext='.ex5' if kind=='MT5' else '.ex4'
+    root=Path(dest).parent/'preview-runtime'/'compiled-cache'/kind.lower()/digest[:2]
+    root.mkdir(parents=True,exist_ok=True)
+    return root/(digest+ext)
+
+
+def _store_preview_image(source_image, dest, source_hash):
+    source_image=Path(source_image); final=_cache_image_path(dest,source_hash)
+    try:
+        from PIL import Image
+        with Image.open(source_image) as im:
+            im.convert('RGB').save(final,format='PNG',optimize=True)
+    except Exception:
+        if source_image.suffix.lower()=='.png':shutil.copy2(source_image,final)
+        else:raise
+    return final
 
 
 def _thumb_path(image):
@@ -872,11 +912,12 @@ def _render_chunk(rows, dest, sel, rt, sym, job_id, item_timeout):
         src=Path(row['path'])
         try:
             emit_stage(job_id,'indicator_compile',f'[{i+1}/{len(rows)}] Compiling {src.name}',source=str(src))
-            job,staged,binary,_meta=stage(src,mql,'MT5',editor,sel.get('data_dir'))
+            cache=_compiled_cache_path(dest,'MT5',row['sha256'])
+            job,staged,binary,_meta=stage(src,mql,'MT5',editor,sel.get('data_dir'),cache)
             rel=f'MQLLibraryPreview/{job}/{binary.stem}'
             shot=f'MQLLibraryPreview_{job}.png'
             sep='indicator_separate_window' in read_text(src).lower()
-            item={'source':str(src),'rel':rel,'shot':shot,'shot_path':files/shot,'win':'1' if sep else '0'}
+            item={'source':str(src),'sha256':row['sha256'],'rel':rel,'shot':shot,'shot_path':files/shot,'win':'1' if sep else '0'}
             for stale in (item['shot_path'],files/(shot+'.ok')):
                 try:stale.unlink(missing_ok=True)
                 except Exception:pass
@@ -941,8 +982,7 @@ def _render_chunk(rows, dest, sel, rt, sym, job_id, item_timeout):
             item=remaining[i]
             if item['source'] in results:continue
             if item['shot_path'].exists() and item['shot_path'].stat().st_size:
-                final=_preview_final_path(dest,'MT5',item['source'])
-                shutil.copy2(item['shot_path'],final)
+                final=_store_preview_image(item['shot_path'],dest,item['sha256'])
                 results[item['source']]={'ok':True,'image':str(final),'kind':'MT5'}
             else:
                 results[item['source']]={'ok':False,'error':'No screenshot produced (indicator could not load on the chart).'}
@@ -1028,8 +1068,10 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, job_i
                     if mt4_sel is None:mt4_sel=load_runtime_cache(dest,'MT4') or choose_runtime('MT4',terminal)
                     for r in mt4_rows:
                         try:
-                            image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id)
-                            results[str(r['path'])]={'ok':True,'image':str(image),'kind':'MT4'}
+                            compiled=_compiled_cache_path(dest,'MT4',r['sha256'])
+                            image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id,compiled)
+                            final=_store_preview_image(image,dest,r['sha256'])
+                            results[str(r['path'])]={'ok':True,'image':str(final),'kind':'MT4'}
                         except Exception as e:
                             results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
                 except Exception as e:
@@ -1056,12 +1098,12 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, job_i
     con.close()
     emit({'ok':True,'job_id':job_id,'finished':True})
 
-def render_mt4(src,out,t,job_id):
+def render_mt4(src,out,t,job_id,compiled_cache=None):
     emit_stage(job_id,'runtime_clone','Preparing isolated MT4 runtime.')
     rt=clone_runtime(t,out,'MT4');mql=rt/'MQL4';scripts=mql/'Scripts';templates=rt/'templates';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,templates,files)]
     editor=rt/Path(t['editor']).name;terminal=rt/Path(t['terminal']).name;sym=copy_mt4_history(Path(t['data_dir']),rt)
     emit_stage(job_id,'indicator_compile','Compiling/staging the selected MT4 indicator.')
-    job,staged,binary,meta=stage(src,mql,'MT4',editor,t.get('data_dir'));emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT4 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT4 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
+    job,staged,binary,meta=stage(src,mql,'MT4',editor,t.get('data_dir'),compiled_cache);emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT4 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT4 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
     tplname=f'MQLLibraryPreview_{job}.tpl';tpl=templates/tplname;sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0';tpl.write_text(f'<chart>\nsymbol={sym}\nperiod=60\ngraph=1\ngrid=1\n<window>\nheight=420\n<indicator>\nname=main\n</indicator>\n<indicator>\nname=Custom Indicator\n<expert>\nname={rel}\nflags=339\nwindow_num={win}\n</expert>\nshow_data=1\n</indicator>\n</window>\n</chart>\n')
     shot=f'MQLLibraryPreview_{job}.gif';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq4';cap.write_text(f'#property strict\nvoid OnStart(){{Print("MQLLIB_PREVIEW stage=onstart");Sleep(3000);WindowRedraw();ResetLastError();bool ok=WindowScreenShot("{shot}",1200,720);Print("MQLLIB_PREVIEW stage=screenshot ok=",ok," err=",GetLastError());Sleep(300);TerminalClose(ok?0:23);return;}}\n')
     emit_stage(job_id,'capture_compile','Compiling MT4 capture script.')
