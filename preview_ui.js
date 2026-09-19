@@ -129,6 +129,21 @@ function invalidatePreview(reason){
   return queueCancellation(reason);
 }
 
+window.__mqlPreviewCancelForBatch=()=>invalidatePreview('batch preview starting');
+window.addEventListener('mql-batch-preview-result',event=>{
+  const result=event.detail||{};
+  if(!result.source||detailSource()!==result.source||!result.image)return;
+  desiredSource=null;
+  previewToken++;
+  if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
+  setPreviewState(result.source,{
+    phase:'success',
+    kind:result.kind||'MT5',
+    image:convertFileSrc(result.image)+`?t=${Date.now()}`,
+    message:`Real ${result.kind||'MT5'} preview • batch render`
+  });
+});
+
 function previewStageMessage(stage,payload){
   if(payload?.message)return payload.message;
   const labels={
