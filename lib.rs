@@ -4,9 +4,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 use zip::write::SimpleFileOptions;
+
+static PREVIEW_LIBRARY_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
@@ -261,6 +264,83 @@ fn start_preview_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Value
 }
 
 #[tauri::command]
+fn start_preview_library(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, String> {
+    if args.first().map(String::as_str) != Some("render-library") {
+        return Err("Only render-library is permitted through start_preview_library".into());
+    }
+    if PREVIEW_LIBRARY_RUNNING.swap(true, Ordering::SeqCst) {
+        return Ok(json!({"started":false,"already_running":true}));
+    }
+    let db_path = args.windows(2).find(|w| w[0] == "--db").map(|w| w[1].clone()).unwrap_or_default();
+    let current = match std::env::current_exe() {
+        Ok(v)=>v,
+        Err(e)=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err(format!("Cannot resolve app executable: {}",e)); }
+    };
+    let dir = match current.parent() {
+        Some(v)=>v,
+        None=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err("Cannot resolve application folder".into()); }
+    };
+    #[cfg(target_os = "windows")]
+    let engine_path = dir.join("mql-preview.exe");
+    #[cfg(not(target_os = "windows"))]
+    let engine_path = dir.join("mql-preview");
+    if !engine_path.exists() {
+        PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst);
+        append_log(&db_path,"ERROR","preview_library_missing",json!({"path":engine_path}),None);
+        return Err(format!("Preview engine was not found at {}",engine_path.display()));
+    }
+    append_log(&db_path,"INFO","preview_library_start",json!({"engine":engine_path,"args":args}),None);
+    let mut cmd=ProcessCommand::new(&engine_path);
+    cmd.args(&args)
+        .env("PYTHONUTF8","1")
+        .env("PYTHONIOENCODING","utf-8")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let mut child=match cmd.spawn() {
+        Ok(v)=>v,
+        Err(e)=>{
+            PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst);
+            append_log(&db_path,"ERROR","preview_library_spawn_failed",json!({"error":e.to_string()}),None);
+            return Err(format!("Could not start preview library worker: {}",e));
+        }
+    };
+    let stdout=match child.stdout.take() {
+        Some(v)=>v,
+        None=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err("Could not capture preview worker output".into()); }
+    };
+    let stderr=match child.stderr.take() {
+        Some(v)=>v,
+        None=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err("Could not capture preview worker errors".into()); }
+    };
+    let app_out=app.clone();let db_out=db_path.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            append_log(&db_out,"INFO","preview_library_stdout",json!({"line":line}),None);
+            let _=app_out.emit("preview-library-line",json!({"line":line}));
+        }
+    });
+    let app_err=app.clone();let db_err=db_path.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            append_log(&db_err,"ERROR","preview_library_stderr",json!({"line":line}),None);
+            let _=app_err.emit("preview-library-stderr",json!({"line":line}));
+        }
+    });
+    std::thread::spawn(move || {
+        let code=child.wait().ok().and_then(|s|s.code()).unwrap_or(-1);
+        PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst);
+        append_log(&db_path,if code==0{"INFO"}else{"ERROR"},"preview_library_done",json!({"code":code}),None);
+        let _=app.emit("preview-library-done",json!({"code":code}));
+    });
+    Ok(json!({"started":true,"already_running":false,"engine":engine_path.to_string_lossy()}))
+}
+
+#[tauri::command]
 fn db_stats(db_path: String) -> Result<Value, String> {
     let started=Instant::now();
     let conn = open_db(&db_path)?;
@@ -467,7 +547,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,write_preview_batch_sources,app_log,export_diagnostics])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,start_preview_library,write_preview_batch_sources,app_log,export_diagnostics])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }
