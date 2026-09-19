@@ -10,6 +10,7 @@ on:
       - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
+      - 'requirements-build.txt'
       - 'preview_bridge.py'
       - 'preview_batch.py'
       - 'preview_control.py'
@@ -31,6 +32,7 @@ on:
       - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
+      - 'requirements-build.txt'
       - 'preview_bridge.py'
       - 'preview_batch.py'
       - 'preview_control.py'
@@ -75,6 +77,7 @@ jobs:
           Set-Location $env:APP_DIR
           Copy-Item "$r/engine.py" 'engine/engine.py' -Force
           Copy-Item "$r/engine_core.py" 'engine/engine_core.py' -Force
+          Copy-Item "$r/requirements-build.txt" 'engine/requirements-build.txt' -Force
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
           Copy-Item "$r/preview_batch.py" 'engine/preview_batch.py' -Force
           Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
