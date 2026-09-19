@@ -411,14 +411,11 @@ fn preview_queue_update(db_path:String, paths:Vec<String>, priority:i64, force:b
     for path in paths.iter() {
         let n=if force {
             tx.execute(
-                "UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='',"
-                "preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END "
-                "WHERE path=?",
+                "UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='',preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END WHERE path=?",
                 params![p,p,path]).map_err(|e|e.to_string())?
         } else {
             tx.execute(
-                "UPDATE indicators SET preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END "
-                "WHERE path=?",
+                "UPDATE indicators SET preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END WHERE path=?",
                 params![p,p,path]).map_err(|e|e.to_string())?
         };
         changed+=n;
