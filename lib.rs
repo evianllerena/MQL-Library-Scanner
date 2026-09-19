@@ -378,6 +378,69 @@ fn sort_sql(sort_by: &str, sort_dir: &str) -> String {
     format!("{} {}", col, dir)
 }
 
+fn ensure_preview_columns(conn:&Connection) -> Result<(),String> {
+    let mut stmt=conn.prepare("PRAGMA table_info(indicators)").map_err(|e|e.to_string())?;
+    let names=stmt.query_map([],|r|r.get::<_,String>(1)).map_err(|e|e.to_string())?;
+    let mut cols=std::collections::HashSet::new();
+    for name in names { cols.insert(name.map_err(|e|e.to_string())?); }
+    let additions=[
+        ("preview_attempts","INTEGER DEFAULT 0"),
+        ("preview_priority","INTEGER DEFAULT 0"),
+        ("preview_status","TEXT DEFAULT 'pending'"),
+        ("preview_path","TEXT"),
+        ("preview_hash","TEXT"),
+        ("preview_error","TEXT DEFAULT ''"),
+        ("preview_updated_at","TEXT")
+    ];
+    for (name,decl) in additions {
+        if !cols.contains(name) {
+            conn.execute(&format!("ALTER TABLE indicators ADD COLUMN {} {}",name,decl),[]).map_err(|e|e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn preview_queue_update(db_path:String, paths:Vec<String>, priority:i64, force:bool) -> Result<Value,String> {
+    let mut conn=open_db(&db_path)?;
+    ensure_preview_columns(&conn)?;
+    let tx=conn.transaction().map_err(|e|e.to_string())?;
+    let p=priority.clamp(0,10000);
+    let mut changed=0usize;
+    for path in paths.iter() {
+        let n=if force {
+            tx.execute(
+                "UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='',"
+                "preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END "
+                "WHERE path=?",
+                params![p,p,path]).map_err(|e|e.to_string())?
+        } else {
+            tx.execute(
+                "UPDATE indicators SET preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END "
+                "WHERE path=?",
+                params![p,p,path]).map_err(|e|e.to_string())?
+        };
+        changed+=n;
+    }
+    tx.commit().map_err(|e|e.to_string())?;
+    Ok(json!({"ok":true,"changed":changed,"force":force,"priority":p}))
+}
+
+#[tauri::command]
+fn preview_queue_stats(db_path:String) -> Result<Value,String> {
+    let conn=open_db(&db_path)?;
+    ensure_preview_columns(&conn)?;
+    let one=|sql:&str|->Result<i64,String>{conn.query_row(sql,[],|r|r.get(0)).map_err(|e|e.to_string())};
+    Ok(json!({
+        "ok":true,
+        "total":one("SELECT COUNT(*) FROM indicators")?,
+        "ready":one("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'")?,
+        "pending":one("SELECT COUNT(*) FROM indicators WHERE preview_status='pending'")?,
+        "rendering":one("SELECT COUNT(*) FROM indicators WHERE preview_status='rendering'")?,
+        "failed":one("SELECT COUNT(*) FROM indicators WHERE preview_status='failed'")?
+    }))
+}
+
 #[tauri::command]
 fn write_preview_batch_sources(sources:Vec<String>) -> Result<Value,String> {
     let path=std::env::temp_dir().join(format!("mql-preview-batch-{}-{}.json",std::process::id(),now_ms()));
@@ -547,7 +610,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,start_preview_library,write_preview_batch_sources,app_log,export_diagnostics])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,start_preview_library,preview_queue_update,preview_queue_stats,write_preview_batch_sources,app_log,export_diagnostics])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }
