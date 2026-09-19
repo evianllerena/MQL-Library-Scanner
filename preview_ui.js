@@ -367,20 +367,30 @@ function injectPreview(){
   const retry=section.querySelector('#retryPreview');
   const refresh=section.querySelector('#refreshPreview');
   const open=section.querySelector('#openPreviewSource');
-  retry.onclick=()=>{
-    previewState={source:null,phase:'idle',message:'',image:null,kind:null};
-    desiredSource=null;
-    schedulePreview(source,0,true);
-  };
-  refresh.onclick=async()=>{
-    refresh.disabled=true;
+  const queueRefresh=async(button)=>{
+    button.disabled=true;
     try{
-      await invalidatePreview('manual preview refresh');
-      previewState={source:null,phase:'idle',message:'',image:null,kind:null};
+      if(typeof window.__mqlQueuePreview==='function')await window.__mqlQueuePreview([source],1000,true);
+      if(typeof window.__mqlStartPreviewLibraryWorker==='function')void window.__mqlStartPreviewLibraryWorker();
+      const cachedPath=detail.dataset.previewPath||'';
+      detail.dataset.previewStatus='pending';
+      detail.dataset.previewError='';
       desiredSource=null;
-      schedulePreview(source,0,true);
-    }finally{refresh.disabled=false;}
+      previewToken++;
+      if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
+      previewState={
+        source,
+        phase:cachedPath?'success':'pending',
+        kind,
+        image:cachedPath?convertFileSrc(cachedPath)+`?cache=${Date.now()}`:null,
+        message:cachedPath?'Refresh queued • showing cached preview until replacement is ready':'Preview queued in background…'
+      };
+      applyPreviewState();
+      void appLog('INFO','preview_refresh_queued',{source});
+    }finally{button.disabled=false;}
   };
+  retry.onclick=()=>void queueRefresh(retry);
+  refresh.onclick=()=>void queueRefresh(refresh);
   open.onclick=()=>openSource(source,status,open);
 
   if(cached){
@@ -395,13 +405,24 @@ function injectPreview(){
     return;
   }
 
-  if(previewState.source===source){
-    applyPreviewState();
-    if(!desiredSource&&!activeJob&&previewState.phase!=='success')schedulePreview(source);
-  }else{
-    previewState={source,phase:'idle',message:'',image:null,kind};
-    schedulePreview(source);
-  }
+  desiredSource=null;
+  previewToken++;
+  if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
+  const queueStatus=detail.dataset.previewStatus||'pending';
+  const queueError=detail.dataset.previewError||'';
+  previewState={
+    source,
+    phase:queueStatus==='failed'?'failed':'pending',
+    kind,
+    image:null,
+    message:queueStatus==='rendering'
+      ?'Background preview is rendering…'
+      :queueStatus==='failed'
+        ?`Can't preview: ${queueError||'render failed after retry limit'}`
+        :'Preview queued in background…'
+  };
+  applyPreviewState();
+}
 }
 
 function armButton(button,label,confirmLabel,ms=6000){
