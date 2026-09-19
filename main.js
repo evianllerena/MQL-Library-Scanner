@@ -16,7 +16,7 @@ const categories=['Trend','Oscillator','Volume','Bill Williams','Volatility','Su
 const app=document.querySelector('#app');
 const header=(label,key)=>`<th data-sort="${key}" style="cursor:pointer;user-select:none" title="Sort by ${label}">${label} <span class="sort-mark" data-sort-mark="${key}"></span></th>`;
 app.innerHTML=`<div class="app"><aside class="sidebar"><div class="brand">MQL Indicator Library<small>0.4.0 • Evidence Engine v4</small></div><div class="nav"><button data-view="library" class="active">Library</button><button data-view="scan">Scan</button><button data-view="review">Review</button><button data-view="settings">Settings</button></div><div class="sidebar-footer" id="appStatus">Local library • Offline core</div></aside><main class="main"><div class="topbar"><input id="searchBox" class="search" placeholder="Search indicators, techniques, categories…"><button class="btn" id="refreshBtn">Refresh</button></div><div class="content">
-<section id="library" class="view active"><div class="title-row"><div><h1>Indicator Library</h1><div class="muted">Truth-first classification with explicit evidence and abstention.</div></div></div><div class="cards"><div class="card"><div class="muted">All Indicators</div><div class="n" id="statTotal">0</div></div><div class="card"><div class="muted">MQL4</div><div class="n" id="statMq4">0</div></div><div class="card"><div class="muted">MQL5</div><div class="n" id="statMq5">0</div></div><div class="card"><div class="muted">Needs Review</div><div class="n" id="statReview">0</div></div><div class="card"><div class="muted">Verified</div><div class="n" id="statVerified">0</div></div></div><div class="toolbar"><select id="platformFilter"><option>ALL</option><option>MQL4</option><option>MQL5</option></select><select id="categoryFilter"><option>ALL</option>${categories.map(x=>`<option>${x}</option>`).join('')}</select><span class="status" id="resultCount"></span></div><div class="table-wrap"><table><thead><tr>${header('Name','name')}${header('Platform','platform')}${header('Function','function')}${header('Status','status')}${header('Visual','visual')}${header('Confidence','confidence')}</tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty">No indicators yet. Add a folder from Scan.</div></div><div class="pager"><button class="btn" id="prevBtn">Previous</button><span id="pageInfo" class="status"></span><button class="btn" id="nextBtn">Next</button></div></section>
+<section id="library" class="view active"><div class="title-row"><div><h1>Indicator Library</h1><div class="muted">Truth-first classification with explicit evidence and abstention.</div></div></div><div class="cards"><div class="card"><div class="muted">All Indicators</div><div class="n" id="statTotal">0</div></div><div class="card"><div class="muted">MQL4</div><div class="n" id="statMq4">0</div></div><div class="card"><div class="muted">MQL5</div><div class="n" id="statMq5">0</div></div><div class="card"><div class="muted">Needs Review</div><div class="n" id="statReview">0</div></div><div class="card"><div class="muted">Verified</div><div class="n" id="statVerified">0</div></div></div><div class="toolbar"><select id="platformFilter"><option>ALL</option><option>MQL4</option><option>MQL5</option></select><select id="categoryFilter"><option>ALL</option>${categories.map(x=>`<option>${x}</option>`).join('')}</select><button class="btn" id="previewAllBtn">Preview all</button><span class="status" id="previewAllStatus"></span><span class="status" id="resultCount"></span></div><div class="table-wrap"><table><thead><tr>${header('Name','name')}${header('Platform','platform')}${header('Function','function')}${header('Status','status')}${header('Visual','visual')}${header('Confidence','confidence')}</tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty">No indicators yet. Add a folder from Scan.</div></div><div class="pager"><button class="btn" id="prevBtn">Previous</button><span id="pageInfo" class="status"></span><button class="btn" id="nextBtn">Next</button></div></section>
 <section id="scan" class="view"><div class="title-row"><div><h1>Scan Library</h1><div class="muted">Browse folders inside the app. Files remain visible while you choose the folder to scan.</div></div></div><div class="scan-panel"><button class="btn" id="addFolderBtn">+ Add Folder</button><div class="sources" id="sources"></div><div id="folderPreview" class="folder-preview"><div class="muted">No folder preview yet.</div></div><div style="margin-top:14px"><button class="btn primary" id="scanBtn">Scan Library</button></div><div class="progress"><div id="progressBar"></div></div><div class="status" id="scanText">Ready</div><div class="scan-stats"><div class="scan-stat"><div class="muted">Processed</div><b id="processed">0</b></div><div class="scan-stat"><div class="muted">Skipped</div><b id="skipped">0</b></div><div class="scan-stat"><div class="muted">Failed</div><b id="failed">0</b></div><div class="scan-stat"><div class="muted">Current</div><b id="current">0 / 0</b></div></div></div></section>
 <section id="review" class="view"><div class="title-row"><div><h1>Review Queue</h1><div class="muted">Only uncertain, unverified classifications appear here.</div></div></div><div class="review-note">Unknown is a valid truthful result. Verify or correct only when you know what the indicator does.</div><div class="table-wrap"><table><thead><tr>${header('Name','name')}${header('Platform','platform')}${header('Possible Function','function')}${header('Status','status')}${header('Confidence','confidence')}</tr></thead><tbody id="reviewRows"></tbody></table></div><div class="pager"><button class="btn" id="reviewPrevBtn">Previous</button><span id="reviewPageInfo" class="status"></span><button class="btn" id="reviewNextBtn">Next</button></div></section>
 <section id="settings" class="view"><div class="title-row"><div><h1>Settings</h1><div class="muted">0.4.0 keeps the core offline and stores classification evidence locally.</div></div></div><div class="scan-panel"><h3>Performance</h3><p class="muted">Library browsing uses direct Rust → SQLite queries with 250-row pages and whole-library sorting.</p><div class="diagnostic-card"><h3>Diagnostics</h3><p class="muted">Export a support bundle containing application logs, scan engine output, errors, database health, timings, delays, paths, counts and startup diagnostics. Indicator source code is not copied.</p><button class="btn primary" id="exportDiagBtn">Export Diagnostic Bundle</button><div class="status" id="diagStatus" style="margin-top:10px">Ready</div></div><h3>Data</h3><div class="muted">Database location</div><div id="dbLocation" style="margin-top:7px;word-break:break-all"></div></div></section></div></main><aside class="detail" id="detail"><button class="btn close" id="closeDetail">×</button><div id="detailBody"></div></aside></div>
@@ -28,6 +28,114 @@ const addFolderBtn=el('addFolderBtn'),scanBtn=el('scanBtn'),processed=el('proces
 async function logEvent(level,event,details={},durationMs=null){if(!dbPath)return;try{await invoke('app_log',{dbPath,level,event,details,durationMs:durationMs==null?null:Math.round(durationMs)});}catch(e){console.error('diagnostic log failed',e);}}
 async function timed(event,fn,details={}){const t=performance.now();try{const out=await fn();logEvent('INFO',event,{...details,ok:true},performance.now()-t);return out;}catch(e){logEvent('ERROR',event,{...details,ok:false,error:String(e)},performance.now()-t);throw e;}}
 async function engine(args){const cmd=Command.sidecar('binaries/mql-engine',args);const out=await cmd.execute();if(out.code!==0)throw new Error(out.stderr||`Engine exited ${out.code}`);return out.stdout.trim();}
+
+let batchPreviewRunning=false;
+
+function batchJobId(){
+  try{return crypto.randomUUID().replace(/[^A-Za-z0-9_.-]/g,'-');}
+  catch{return `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`;}
+}
+
+async function filteredIndicatorRows(){
+  const rows=[];let offset=0;
+  while(offset<state.totalRows){
+    const args={...queryArgs(false,offset),limit:500};
+    const out=await invoke('db_query',args);
+    const chunk=out.rows||[];
+    rows.push(...chunk);
+    if(!chunk.length)break;
+    offset+=chunk.length;
+  }
+  return rows;
+}
+
+function markBatchRow(source,text,ok=null){
+  const idx=state.rows.findIndex(r=>r.path===source);
+  if(idx<0)return;
+  const tr=el('rows')?.querySelector(`tr[data-idx="${idx}"]`);
+  const cell=tr?.querySelector('td');
+  if(!cell)return;
+  let tag=cell.querySelector('.batch-preview-status');
+  if(!tag){
+    tag=document.createElement('div');
+    tag.className='muted batch-preview-status';
+    tag.style.fontSize='11px';
+    tag.style.marginTop='3px';
+    cell.appendChild(tag);
+  }
+  tag.textContent=text;
+  if(ok===true)tag.style.opacity='1';
+  else if(ok===false)tag.style.opacity='.8';
+}
+
+async function previewAllFiltered(){
+  if(batchPreviewRunning)return;
+  const button=el('previewAllBtn'),status=el('previewAllStatus');
+  batchPreviewRunning=true;button.disabled=true;
+  status.textContent='Collecting filtered indicators…';
+  try{
+    const rows=await filteredIndicatorRows();
+    const mt5=rows.filter(r=>/\.(mq5|ex5)$/i.test(r.path||''));
+    if(!mt5.length){status.textContent='No MT5 indicators in the current filter.';return;}
+    const manifest=await invoke('write_preview_batch_sources',{sources:mt5.map(r=>r.path)});
+    const outDir=await join(await appDataDir(),'previews');
+    const jobId=batchJobId();
+    status.textContent=`0 of ${mt5.length} done • preparing one MT5 terminal launch…`;
+    const cmd=Command.sidecar('binaries/mql-preview',[
+      'render-batch','--sources',manifest.path,'--out',outDir,'--job-id',jobId
+    ]);
+    let stdout='',stderr='',buffer='',prepared=0;
+    cmd.stdout.on('data',data=>{
+      const chunk=String(data);stdout+=chunk+'\n';buffer+=chunk;
+      const lines=buffer.split(/\r?\n/);buffer=lines.pop()||'';
+      for(const raw of lines){
+        const line=raw.trim();if(!line)continue;
+        let ev;try{ev=JSON.parse(line);}catch{continue;}
+        if(ev.type==='stage'){
+          if(ev.stage==='indicator_compile'&&ev.source){
+            prepared=Math.min(mt5.length,prepared+1);
+            markBatchRow(ev.source,'Preparing batch preview…');
+            status.textContent=`${prepared} of ${mt5.length} prepared • rendering in one MT5 launch…`;
+          }else if(ev.stage==='item_shot'&&ev.source){
+            markBatchRow(ev.source,ev.ok===false?'Preview failed':'Preview ready',ev.ok!==false);
+          }else if(ev.stage==='item'&&ev.source&&ev.ok===false){
+            markBatchRow(ev.source,'Preview failed',false);
+          }else if(ev.message){
+            status.textContent=ev.message;
+          }
+        }
+      }
+    });
+    cmd.stderr.on('data',data=>{stderr+=String(data)+'\n';});
+    const closed=new Promise((resolve,reject)=>{cmd.on('close',resolve);cmd.on('error',reject);});
+    await cmd.spawn();
+    const closeData=await closed;
+    if(buffer.trim()){stdout+=buffer+'\n';}
+    const lines=stdout.trim().split(/\r?\n/).filter(Boolean);
+    let payload=null;
+    for(let i=lines.length-1;i>=0;i--){try{payload=JSON.parse(lines[i]);if(payload?.batch||payload?.ok!==undefined)break;}catch{}}
+    if(closeData.code!==0||!payload?.ok)throw new Error(payload?.error||stderr||`Batch preview exited ${closeData.code}`);
+    const results=payload.results||{};
+    let done=0;
+    for(const [source,result] of Object.entries(results)){
+      done++;
+      if(result?.ok){
+        markBatchRow(source,'Preview ready',true);
+        window.dispatchEvent(new CustomEvent('mql-batch-preview-result',{detail:{source,image:result.image,kind:result.kind||'MT5'}}));
+      }else{
+        markBatchRow(source,result?.error||'Preview failed',false);
+      }
+      status.textContent=`${done} of ${mt5.length} done`;
+    }
+    status.textContent=`${payload.rendered||0} rendered • ${payload.failed||0} failed • ${mt5.length} MT5 indicators processed`;
+    await logEvent('INFO','preview_batch_complete',{jobId,total:mt5.length,rendered:payload.rendered||0,failed:payload.failed||0});
+  }catch(e){
+    status.textContent=`Preview all failed: ${e.message||e}`;
+    await logEvent('ERROR','preview_batch_failed',{error:String(e)});
+  }finally{
+    batchPreviewRunning=false;button.disabled=false;
+  }
+}
 async function ensureDb(){await timed('ensure_database',()=>engine(['stats','--db',dbPath]));}
 function queryArgs(reviewOnly,offset){return{dbPath,search:reviewOnly?'':state.search,platform:reviewOnly?'ALL':state.platform,category:reviewOnly?'ALL':state.category,reviewOnly,limit:state.pageSize,offset,sortBy:state.sortBy,sortDir:state.sortDir};}
 
@@ -84,7 +192,7 @@ document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>switchView(b.d
 document.querySelectorAll('th[data-sort]').forEach(h=>h.onclick=()=>changeSort(h.dataset.sort));
 el('searchBox').oninput=()=>{clearTimeout(window.__st);window.__st=setTimeout(()=>{state.search=el('searchBox').value;state.page=0;loadRows();},180);};
 el('platformFilter').onchange=()=>{state.platform=el('platformFilter').value;state.page=0;loadRows();};el('categoryFilter').onchange=()=>{state.category=el('categoryFilter').value;state.page=0;loadRows();};
-el('refreshBtn').onclick=reloadAll;addFolderBtn.onclick=openFolderBrowser;scanBtn.onclick=startScan;el('exportDiagBtn').onclick=exportDiagnostics;el('closeDetail').onclick=()=>el('detail').classList.remove('open');
+el('refreshBtn').onclick=reloadAll;el('previewAllBtn').onclick=previewAllFiltered;addFolderBtn.onclick=openFolderBrowser;scanBtn.onclick=startScan;el('exportDiagBtn').onclick=exportDiagnostics;el('closeDetail').onclick=()=>el('detail').classList.remove('open');
 el('prevBtn').onclick=()=>{if(state.page>0){state.page--;loadRows();}};el('nextBtn').onclick=()=>{if((state.page+1)*state.pageSize<state.totalRows){state.page++;loadRows();}};
 el('reviewPrevBtn').onclick=()=>{if(state.reviewPage>0){state.reviewPage--;loadReview();}};el('reviewNextBtn').onclick=()=>{if((state.reviewPage+1)*state.pageSize<state.totalReview){state.reviewPage++;loadReview();}};
 el('browserClose').onclick=closeFolderBrowser;el('browserCancel').onclick=closeFolderBrowser;el('browserPc').onclick=()=>browseTo(null);el('browserUp').onclick=()=>{if(state.browserData?.parent)browseTo(state.browserData.parent);else browseTo(null);};el('browserUse').onclick=useBrowserFolder;
