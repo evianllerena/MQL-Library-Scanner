@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterable
 from engine_core import Analysis, analyze
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 JSON_FIELDS = ['draw_types','standard_indicators','custom_dependencies','secondary_categories','behavior_tags','techniques','evidence','warnings','user_tags']
 
 # Windows/PyInstaller can otherwise inherit a legacy ANSI console encoding even
