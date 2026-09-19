@@ -229,7 +229,9 @@ jobs:
           if($bundle -notmatch 'Clear Application / Start Fresh'){throw 'Clear application control was not bundled into frontend'}
           if($bundle -match 'Create Archive Backup'){throw 'Archive UI was bundled unexpectedly'}
           if($bundle -notmatch 'mql-preview-control'){throw 'Preview control sidecar was not bundled into frontend'}
-          if($bundle -notmatch 'preview_cancel_result'){throw 'Verified preview cancellation logic was not bundled'}
+          if($bundle -notmatch 'preview_cache_hit'){throw 'Cache-first preview click path was not bundled'}
+          if($bundle -notmatch 'preview_queue_update'){throw 'SQLite preview queue controls were not bundled'}
+          if($bundle -notmatch 'start_preview_library'){throw 'Background preview library worker launcher was not bundled'}
           if($bundle -notmatch 'ui_event_loop_stall'){throw 'UI stall watchdog was not bundled'}
           if($bundle -notmatch 'preview_engine_stage'){throw 'Preview engine stage diagnostics were not bundled'}
           if($bundle -notmatch 'preview_preflight_start' -or $bundle -notmatch 'preview_preflight_failed' -or $bundle -notmatch 'preview_discovery_stage'){throw 'Preview runtime preflight/discovery diagnostics were not bundled'}
