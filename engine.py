@@ -89,8 +89,6 @@ def migrate(conn):
     conn.execute("UPDATE indicators SET preview_status='pending' WHERE preview_status='rendering'")
     conn.execute("UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='' "
                  "WHERE preview_status='ready' AND COALESCE(preview_hash,'')!=COALESCE(sha256,'')")
-    conn.execute("UPDATE indicators SET preview_status='failed' "
-                 "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)>=2")
     conn.execute("INSERT INTO meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(SCHEMA_VERSION),))
     conn.commit()
 
