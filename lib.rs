@@ -57,6 +57,7 @@ fn app_log(db_path: String, level: String, event: String, details: Value, durati
 fn open_db(path: &str) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;").map_err(|e|e.to_string())?;
     Ok(conn)
 }
 
@@ -427,6 +428,16 @@ fn preview_queue_update(db_path:String, paths:Vec<String>, priority:i64, force:b
 }
 
 #[tauri::command]
+fn preview_worker_pause(db_path:String, paused:bool) -> Result<Value,String> {
+    let conn=open_db(&db_path)?;
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",[]).map_err(|e|e.to_string())?;
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('preview_paused',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![if paused {"1"} else {"0"}]).map_err(|e|e.to_string())?;
+    Ok(json!({"ok":true,"paused":paused}))
+}
+
+#[tauri::command]
 fn preview_queue_stats(db_path:String) -> Result<Value,String> {
     let conn=open_db(&db_path)?;
     ensure_preview_columns(&conn)?;
@@ -610,7 +621,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,start_preview_library,preview_queue_update,preview_queue_stats,write_preview_batch_sources,app_log,export_diagnostics])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,start_preview_library,preview_queue_update,preview_queue_stats,preview_worker_pause,write_preview_batch_sources,app_log,export_diagnostics])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }
