@@ -11,6 +11,7 @@ on:
       - 'engine.py'
       - 'engine_core.py'
       - 'preview_bridge.py'
+      - 'preview_batch.py'
       - 'preview_control.py'
       - 'main.js'
       - 'preview_ui.js'
@@ -31,6 +32,7 @@ on:
       - 'engine.py'
       - 'engine_core.py'
       - 'preview_bridge.py'
+      - 'preview_batch.py'
       - 'preview_control.py'
       - 'main.js'
       - 'preview_ui.js'
@@ -74,6 +76,7 @@ jobs:
           Copy-Item "$r/engine.py" 'engine/engine.py' -Force
           Copy-Item "$r/engine_core.py" 'engine/engine_core.py' -Force
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
+          Copy-Item "$r/preview_batch.py" 'engine/preview_batch.py' -Force
           Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
           Copy-Item "$r/main.js" 'ui/main.js' -Force
           Copy-Item "$r/preview_ui.js" 'ui/preview_ui.js' -Force
@@ -102,7 +105,7 @@ jobs:
         shell: pwsh
         run: |
           Set-Location $env:APP_DIR
-          python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_control.py
+          python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py
           node --check ui/main.js
           node --check ui/preview_ui.js
           python engine/preview_bridge.py self-test
@@ -116,10 +119,12 @@ jobs:
           python -m pip install -r engine/requirements-build.txt
           python -m PyInstaller --noconfirm --clean --onefile --name mql-engine --distpath build-sidecar --workpath build-pyinstaller-engine --specpath build-pyinstaller-engine engine/engine.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview --distpath build-sidecar --workpath build-pyinstaller-preview --specpath build-pyinstaller-preview engine/preview_bridge.py
+          python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-batch --distpath build-sidecar --workpath build-pyinstaller-preview-batch --specpath build-pyinstaller-preview-batch engine/preview_batch.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-control --distpath build-sidecar --workpath build-pyinstaller-control --specpath build-pyinstaller-control engine/preview_control.py
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
           Copy-Item build-sidecar/mql-engine.exe src-tauri/binaries/mql-engine-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview.exe src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe -Force
+          Copy-Item build-sidecar/mql-preview-batch.exe src-tauri/binaries/mql-preview-batch-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview-control.exe src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe -Force
 
       - name: Install frontend dependencies
