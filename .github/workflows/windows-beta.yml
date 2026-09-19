@@ -233,10 +233,11 @@ jobs:
           if($bundle -notmatch 'preview_queue_update'){throw 'SQLite preview queue controls were not bundled'}
           if($bundle -notmatch 'start_preview_library'){throw 'Background preview library worker launcher was not bundled'}
           if($bundle -notmatch 'ui_event_loop_stall'){throw 'UI stall watchdog was not bundled'}
-          if($bundle -notmatch 'preview_engine_stage'){throw 'Preview engine stage diagnostics were not bundled'}
-          if($bundle -notmatch 'preview_preflight_start' -or $bundle -notmatch 'preview_preflight_failed' -or $bundle -notmatch 'preview_discovery_stage'){throw 'Preview runtime preflight/discovery diagnostics were not bundled'}
-          if($bundle -notmatch 'mt5_full_recompile'){throw 'MT5 first-use initialization status was not bundled'}
-          if($bundle -notmatch 'terminal_selected'){throw 'Bound terminal data-folder status was not bundled'}
+          if($bundle -notmatch 'preview_library_done_ui'){throw 'Background preview completion handling was not bundled'}
+          if($bundle -notmatch 'preview_refresh_queued'){throw 'Explicit preview refresh queueing was not bundled'}
+          if($bundle -notmatch 'preview_queue_stats'){throw 'Preview queue progress/statistics were not bundled'}
+          if($bundle -notmatch 'preview_worker_pause'){throw 'Preview worker pause/resume control was not bundled'}
+          if($bundle -match 'preview_scheduled'){throw 'Old synchronous click-preview scheduler was bundled unexpectedly'}
 
       - name: Frontend readiness smoke test
         shell: pwsh
