@@ -164,9 +164,11 @@ jobs:
           if($bridge -notmatch "add_argument\('--static-fast-fail',action='store_true',default=False\)"){throw 'Static MT5 fast-fail opt-in CLI setting missing'}
           $lib=Get-Content src-tauri/src/lib.rs -Raw
           if($lib -notmatch 'preview_library_heartbeat_timeout' -or $lib -notmatch 'preview_library_restart'){throw 'Supervisor heartbeat restart missing'}
-          if($lib -notmatch 'AtomicUsize' -or $lib -notmatch 'worker_count'){throw 'Parallel worker supervisor missing'}
+          if($lib -notmatch 'run_preview_worker_supervisor' -or $lib -notmatch 'run_compile_pool_process'){throw 'Resident render-server + compile-pool supervisor missing'}
+          if($lib -notmatch '"render_server":1' -or $lib -notmatch '"compile_workers"'){throw 'One warm render server / compile worker split missing'}
           $main=Get-Content ui/main.js -Raw
-          if($main -notmatch 'preview.workers' -or $main -notmatch 'defaultPreviewWorkers'){throw 'Adaptive worker settings missing'}
+          if($main -notmatch 'preview.workers' -or $main -notmatch 'defaultPreviewWorkers'){throw 'Compile worker settings missing'}
+          if($main -notmatch "'render-server'" -or $main -match "'render-library','--db'"){throw 'UI is not switched to resident render-server path'}
           $req=Get-Content engine/requirements-build.txt -Raw
           if($req -notmatch '(?m)^psutil'){throw 'psutil build dependency missing'}
           python engine/preview_control.py self-test
