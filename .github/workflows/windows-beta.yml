@@ -164,13 +164,20 @@ jobs:
           if($bridge -notmatch 'def render_server' -or $bridge -notmatch "add_parser\('render-server'\)"){throw 'Resident render-server command missing'}
           if($bridge -notmatch 'def compile_pool' -or $bridge -notmatch "add_parser\('compile-pool'\)"){throw 'Parallel compile-pool command missing'}
           if($bridge -notmatch '_resident_indicator_rel' -or $bridge -notmatch "MQLLibraryPreview/"){throw 'Forward-slash resident iCustom path missing'}
+          if($bridge -notmatch 'resolve_mt5_render_data_dir' -or $bridge -notmatch 'seed_render_runtime_from_data_dir'){throw 'FIX 1 logged-in MT5 render seed missing'}
+          if($bridge -notmatch 'AllowLiveTrading=1' -or $bridge -notmatch "add_argument\('--mt5-data-dir'"){throw 'FIX 1 render account/algo setting missing'}
+          if($bridge -notmatch 'RENDER_STARTUP_EXIT=42' -or $bridge -notmatch 'def _wait_for_resident_startup'){throw 'FIX 2 first-heartbeat handshake missing'}
+          if($bridge -notmatch 'resident_ea_ready' -or $bridge -notmatch 'relaunch_cap=3'){throw 'FIX 2 ready/hang recovery guard missing'}
           $lib=Get-Content src-tauri/src/lib.rs -Raw
           if($lib -notmatch 'preview_library_heartbeat_timeout' -or $lib -notmatch 'preview_library_restart'){throw 'Supervisor heartbeat restart missing'}
           if($lib -notmatch 'run_preview_worker_supervisor' -or $lib -notmatch 'run_compile_pool_process'){throw 'Resident render-server + compile-pool supervisor missing'}
           if($lib -notmatch '"render_server":1' -or $lib -notmatch '"compile_workers"'){throw 'One warm render server / compile worker split missing'}
+          if($lib -notmatch 'final_code==42' -or $lib -notmatch 'preview-library-config-error'){throw 'FIX 2 non-restarting startup configuration failure missing'}
           $main=Get-Content ui/main.js -Raw
           if($main -notmatch 'preview.workers' -or $main -notmatch 'defaultPreviewWorkers'){throw 'Compile worker settings missing'}
           if($main -notmatch "'render-server'" -or $main -match "'render-library','--db'"){throw 'UI is not switched to resident render-server path'}
+          if($main -notmatch 'mt5DataDir' -or $main -notmatch 'preview.mt5DataDir'){throw 'FIX 1 mt5_data_dir Settings control missing'}
+          if($main -notmatch 'preview-library-config-error' -or $main -notmatch 'render_startup_config'){throw 'FIX 2 startup configuration error UI missing'}
           $req=Get-Content engine/requirements-build.txt -Raw
           if($req -notmatch '(?m)^psutil'){throw 'psutil build dependency missing'}
           python engine/preview_control.py self-test
