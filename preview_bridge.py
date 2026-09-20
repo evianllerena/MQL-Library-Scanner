@@ -1184,64 +1184,130 @@ def _mt5_static_fast_fail(path):
     return None
 
 
-def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_attempts=2, job_id=None):
-    job_id=safe_job_id(job_id);dest=Path(out)
-    emit_heartbeat(job_id,0,None,stage='worker_start')
+def _propagate_existing_ready(con):
+    try:
+        ready=con.execute(
+            "SELECT sha256,preview_path,preview_hash,preview_updated_at FROM indicators "
+            "WHERE preview_status='ready' AND COALESCE(sha256,'')<>'' GROUP BY sha256"
+        ).fetchall()
+        for r in ready:
+            con.execute(
+                "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,preview_error='',"
+                "preview_updated_at=?,worker_id=NULL WHERE sha256=? AND preview_status!='ready'",
+                (r['preview_path'],r['preview_hash'],r['preview_updated_at'],r['sha256']))
+        con.commit()
+    except Exception:pass
+
+
+def _claim_preview_rows(con,chunk_size,attempts,worker_id):
+    size=max(1,min(int(chunk_size),200))
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        con.execute(
+            "UPDATE indicators SET preview_status='failed',worker_id=NULL "
+            "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)>=?",
+            (attempts,))
+        rows=con.execute(
+            """
+            WITH grouped AS (
+              SELECT sha256,MIN(id) AS id,MAX(COALESCE(preview_priority,0)) AS pr,
+                     MAX(COALESCE(user_favorite,0)) AS fav
+              FROM indicators i
+              WHERE preview_status='pending'
+                AND COALESCE(preview_attempts,0)<?
+                AND COALESCE(sha256,'')<>''
+                AND NOT EXISTS(
+                  SELECT 1 FROM indicators x
+                  WHERE x.sha256=i.sha256 AND x.preview_status IN ('rendering','ready')
+                )
+              GROUP BY sha256
+              ORDER BY pr DESC,fav DESC,id
+              LIMIT ?
+            )
+            SELECT i.id,i.path,i.platform,i.sha256,COALESCE(i.preview_attempts,0) AS preview_attempts
+            FROM grouped g JOIN indicators i ON i.id=g.id
+            ORDER BY g.pr DESC,g.fav DESC,i.id
+            """,
+            (attempts,size)).fetchall()
+        if len(rows)<size:
+            extra=con.execute(
+                "SELECT id,path,platform,sha256,COALESCE(preview_attempts,0) AS preview_attempts "
+                "FROM indicators WHERE preview_status='pending' AND COALESCE(preview_attempts,0)<? "
+                "AND COALESCE(sha256,'')='' ORDER BY COALESCE(preview_priority,0) DESC,user_favorite DESC,id LIMIT ?",
+                (attempts,size-len(rows))).fetchall()
+            rows=list(rows)+list(extra)
+        for r in rows:
+            con.execute(
+                "UPDATE indicators SET preview_status='rendering',worker_id=?,"
+                "preview_attempts=COALESCE(preview_attempts,0)+1 WHERE id=? AND preview_status='pending'",
+                (worker_id,r['id']))
+        con.commit()
+        return rows
+    except Exception:
+        con.rollback();raise
+
+
+def render_library(db, out, terminal=None, chunk_size=70, item_timeout=30, max_attempts=2, job_id=None, worker_id=None):
+    job_id=safe_job_id(job_id);worker_id=safe_job_id(worker_id or 'w1');dest=Path(out)
+    emit_heartbeat(job_id,0,None,stage='worker_start',worker_id=worker_id)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
-    con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=30000')
-    _ensure_preview_queue_schema(con)
+    con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
+    _ensure_preview_queue_schema(con,worker_id)
+    _propagate_existing_ready(con)
     _migrate_ready_cache(con,dest)
     _backfill_thumbnails(con)
     mt5_sel=mt5_rt=mt5_sym=None
     mt4_sel=None
-    lock=dest.parent/'preview-runtime'/'.render.lock'
+    lock=dest.parent/'preview-runtime'/f'.render-{worker_id}.lock'
     with RenderLock(lock,timeout=5.0):
         while True:
             ready_now=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
-            emit_heartbeat(job_id,ready_now,None,stage='queue')
+            emit_heartbeat(job_id,ready_now,None,stage='queue',worker_id=worker_id)
             pause_reason=_worker_pause_reason(con,dest)
             if pause_reason:
-                emit({'ok':True,'job_id':job_id,'paused':True,'reason':pause_reason})
+                emit({'ok':True,'job_id':job_id,'worker_id':worker_id,'paused':True,'reason':pause_reason})
                 break
             attempts=max(1,min(int(max_attempts),10))
-            con.execute("UPDATE indicators SET preview_status='failed' WHERE preview_status='pending' AND COALESCE(preview_attempts,0)>=?",(attempts,))
-            con.commit()
-            rows=con.execute(
-                "SELECT id,path,platform,sha256 FROM indicators "
-                "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)<? "
-                "ORDER BY COALESCE(preview_priority,0) DESC,user_favorite DESC,id LIMIT ?",
-                (attempts,max(1,min(int(chunk_size),200)))).fetchall()
+            rows=_claim_preview_rows(con,chunk_size,attempts,worker_id)
             if not rows:break
-            ids=[r['id'] for r in rows]
-            con.executemany(
-                "UPDATE indicators SET preview_status='rendering',"
-                "preview_attempts=COALESCE(preview_attempts,0)+1 WHERE id=?",
-                [(i,) for i in ids]);con.commit()
+
             results={};chunk_meta={'untouched':[],'hung_source':None,'timeout_reason':None}
-            mt5_rows=[r for r in rows if str(r['platform']).upper() in ('MQL5','MT5') or Path(r['path']).suffix.lower() in ('.mq5','.ex5')]
-            mt4_rows=[r for r in rows if r not in mt5_rows]
+            mt5_rows=[];mt4_rows=[]
+            for r in rows:
+                is_mt5=str(r['platform']).upper() in ('MQL5','MT5') or Path(r['path']).suffix.lower() in ('.mq5','.ex5')
+                if is_mt5:
+                    reason=_mt5_static_fast_fail(r['path'])
+                    if reason:
+                        results[str(r['path'])]={'ok':False,'error':reason,'fast_fail':True}
+                        emit_stage(job_id,'static_fast_fail',f'Skipping obvious incompatible MT5 source: {Path(r["path"]).name}',source=str(r['path']),reason=reason)
+                    else:
+                        mt5_rows.append(r)
+                else:
+                    mt4_rows.append(r)
+
             if mt5_rows:
                 try:
                     if mt5_sel is None:
                         mt5_sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
-                        mt5_rt=clone_runtime(mt5_sel,dest,'MT5')
+                        mt5_rt=clone_runtime(mt5_sel,dest,'MT5',worker_id)
                         mt5_sym=copy_mt5_history(Path(mt5_sel['data_dir']),mt5_rt)
                         prime_mt5_runtime(mt5_rt,mt5_rt/Path(mt5_sel['terminal']).name,mt5_sym,job_id)
                     chunk_results,chunk_meta=_render_chunk(mt5_rows,dest,mt5_sel,mt5_rt,mt5_sym,job_id,item_timeout)
                     results.update(chunk_results)
                 except Exception as e:
                     for r in mt5_rows:results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
+
             if mt4_rows:
                 try:
                     if mt4_sel is None:mt4_sel=load_runtime_cache(dest,'MT4') or choose_runtime('MT4',terminal)
                     for r in mt4_rows:
                         try:
-                            emit_heartbeat(job_id,0,str(r['path']),stage='mt4_render')
+                            emit_heartbeat(job_id,0,str(r['path']),stage='mt4_render',worker_id=worker_id)
                             compiled=_compiled_cache_path(dest,'MT4',r['sha256'])
-                            image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id,compiled)
+                            image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id,compiled,worker_id)
                             final=_store_preview_image(image,dest,r['sha256'])
                             results[str(r['path'])]={'ok':True,'image':str(final),'kind':'MT4'}
-                            emit_heartbeat(job_id,0,str(r['path']),stage='mt4_done')
+                            emit_heartbeat(job_id,0,str(r['path']),stage='mt4_done',worker_id=worker_id)
                         except Exception as e:
                             results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
                 except Exception as e:
@@ -1249,31 +1315,48 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_a
 
             untouched=set(chunk_meta.get('untouched') or [])
             for r in rows:
-                if str(r['path']) in untouched:
+                path=str(r['path']);sha=r['sha256']
+                if path in untouched:
                     con.execute(
-                        "UPDATE indicators SET preview_status='pending',preview_attempts=CASE WHEN COALESCE(preview_attempts,0)>0 THEN preview_attempts-1 ELSE 0 END,preview_error='watchdog deferred untouched item' WHERE id=?",
-                        (r['id'],))
+                        "UPDATE indicators SET preview_status='pending',worker_id=NULL,"
+                        "preview_attempts=CASE WHEN COALESCE(preview_attempts,0)>0 THEN preview_attempts-1 ELSE 0 END,"
+                        "preview_error='watchdog deferred untouched item' WHERE id=? AND worker_id=?",
+                        (r['id'],worker_id))
                     continue
-                res=results.get(str(r['path']))
+                res=results.get(path)
+                attempt_num=int(r['preview_attempts'] or 0)+1
                 if res and res.get('ok'):
                     _make_thumb(res['image'])
-                    con.execute(
-                        "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,"
-                        "preview_error='',preview_updated_at=datetime('now'),preview_priority=0 WHERE id=?",
-                        (res['image'],r['sha256'],r['id']))
+                    if sha:
+                        con.execute(
+                            "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,preview_error='',"
+                            "preview_updated_at=datetime('now'),preview_priority=0,worker_id=NULL WHERE sha256=?",
+                            (res['image'],sha,sha))
+                    else:
+                        con.execute(
+                            "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,preview_error='',"
+                            "preview_updated_at=datetime('now'),preview_priority=0,worker_id=NULL WHERE id=?",
+                            (res['image'],sha,r['id']))
                 else:
                     err=(res or {}).get('error','render timeout/hang')
-                    con.execute(
-                        "UPDATE indicators SET preview_status=CASE WHEN COALESCE(preview_attempts,0)>=? "
-                        "THEN 'failed' ELSE 'pending' END,preview_error=? WHERE id=?",
-                        (attempts,str(err)[:800],r['id']))
+                    final_fail=bool((res or {}).get('fast_fail')) or attempt_num>=attempts
+                    if final_fail and sha:
+                        con.execute(
+                            "UPDATE indicators SET preview_status='failed',preview_error=?,preview_updated_at=datetime('now'),"
+                            "worker_id=NULL WHERE sha256=?",
+                            (str(err)[:800],sha))
+                    else:
+                        con.execute(
+                            "UPDATE indicators SET preview_status=?,preview_error=?,worker_id=NULL WHERE id=?",
+                            ('failed' if final_fail else 'pending',str(err)[:800],r['id']))
             con.commit()
             ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
             total=con.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
-            emit({'type':'progress','job_id':job_id,'done':ready,'total':total})
+            emit({'type':'progress','job_id':job_id,'worker_id':worker_id,'done':ready,'total':total})
+
     _cleanup_cache_files(con,dest)
     con.close()
-    emit({'ok':True,'job_id':job_id,'finished':True})
+    emit({'ok':True,'job_id':job_id,'worker_id':worker_id,'finished':True})
 
 def render_mt4(src,out,t,job_id,compiled_cache=None):
     emit_stage(job_id,'runtime_clone','Preparing isolated MT4 runtime.')
@@ -1537,7 +1620,7 @@ def main():
     p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal')
     p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
-    p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=40);p.add_argument('--timeout',type=int,default=45);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id')
+    p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=70);p.add_argument('--timeout',type=int,default=30);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id');p.add_argument('--worker-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
     p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
@@ -1555,7 +1638,7 @@ def main():
         with RenderLock(lock_path,timeout=5.0):
             sel=load_runtime_cache(Path(x.out),'MT5') or choose_runtime('MT5',x.terminal)
             render_mt5_batch(mt5,x.out,sel,job)
-    elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id)
+    elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id,x.worker_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)
