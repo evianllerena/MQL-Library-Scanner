@@ -145,35 +145,35 @@ jobs:
           $main=Get-Content ui/main.js -Raw
           if($main -notmatch 'mt5DataDir' -or $main -notmatch 'preview.mt5DataDir'){throw 'FIX 1 mt5_data_dir UI setting missing'}
           @'
-import os, tempfile, time
-from pathlib import Path
-import preview_bridge as p
-with tempfile.TemporaryDirectory() as td:
-    base=Path(td)/'appdata'/'MetaQuotes'/'Terminal'
-    old=base/'OLD'; new=base/'NEW'
-    for root in (old,new):
-        (root/'config').mkdir(parents=True)
-        (root/'config'/'accounts.dat').write_bytes(b'account')
-        (root/'config'/'servers.dat').write_bytes(b'servers')
-        (root/'config'/'common.ini').write_text('common',encoding='utf-8')
-        (root/'config'/'terminal.ini').write_text('algo=1',encoding='utf-8')
-        hist=root/'bases'/'broker'/'history'/'EURUSD'
-        hist.mkdir(parents=True)
-        (hist/'2026.hcc').write_bytes(b'bars')
-    now=time.time()
-    os.utime(old/'config'/'accounts.dat',(now-100,now-100))
-    os.utime(new/'config'/'accounts.dat',(now,now))
-    os.environ['APPDATA']=str(Path(td)/'appdata')
-    assert p.resolve_mt5_render_data_dir()==new
-    rt=Path(td)/'rt';(rt/'config').mkdir(parents=True)
-    sym,copied=p.seed_render_runtime_from_data_dir(new,rt)
-    assert sym=='EURUSD'
-    assert (rt/'config'/'accounts.dat').read_bytes()==b'account'
-    assert (rt/'config'/'terminal.ini').is_file()
-    assert (rt/'bases'/'broker'/'history'/'EURUSD'/'2026.hcc').is_file()
-    assert 'accounts.dat' in copied and 'terminal.ini' in copied
-print('render-seed-ok')
-'@ | Set-Content "$env:RUNNER_TEMP\verify_render_seed.py" -Encoding UTF8
+          import os, tempfile, time
+          from pathlib import Path
+          import preview_bridge as p
+          with tempfile.TemporaryDirectory() as td:
+              base=Path(td)/'appdata'/'MetaQuotes'/'Terminal'
+              old=base/'OLD'; new=base/'NEW'
+              for root in (old,new):
+                  (root/'config').mkdir(parents=True)
+                  (root/'config'/'accounts.dat').write_bytes(b'account')
+                  (root/'config'/'servers.dat').write_bytes(b'servers')
+                  (root/'config'/'common.ini').write_text('common',encoding='utf-8')
+                  (root/'config'/'terminal.ini').write_text('algo=1',encoding='utf-8')
+                  hist=root/'bases'/'broker'/'history'/'EURUSD'
+                  hist.mkdir(parents=True)
+                  (hist/'2026.hcc').write_bytes(b'bars')
+              now=time.time()
+              os.utime(old/'config'/'accounts.dat',(now-100,now-100))
+              os.utime(new/'config'/'accounts.dat',(now,now))
+              os.environ['APPDATA']=str(Path(td)/'appdata')
+              assert p.resolve_mt5_render_data_dir()==new
+              rt=Path(td)/'rt';(rt/'config').mkdir(parents=True)
+              sym,copied=p.seed_render_runtime_from_data_dir(new,rt)
+              assert sym=='EURUSD'
+              assert (rt/'config'/'accounts.dat').read_bytes()==b'account'
+              assert (rt/'config'/'terminal.ini').is_file()
+              assert (rt/'bases'/'broker'/'history'/'EURUSD'/'2026.hcc').is_file()
+              assert 'accounts.dat' in copied and 'terminal.ini' in copied
+          print('render-seed-ok')
+          '@ | Set-Content "$env:RUNNER_TEMP\verify_render_seed.py" -Encoding UTF8
           $env:PYTHONPATH="$env:APP_DIR\engine"
           python "$env:RUNNER_TEMP\verify_render_seed.py"
           if($LASTEXITCODE -ne 0){throw 'FIX 1 render seed behavior validation failed'}
