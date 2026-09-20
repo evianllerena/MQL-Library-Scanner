@@ -1,4 +1,4 @@
-name: Verify Render Terminal Seed
+name: Verify Render Seed and Startup Handshake
 # PR validation sync
 
 on:
@@ -177,6 +177,45 @@ jobs:
           $env:PYTHONPATH="$env:APP_DIR\engine"
           python "$env:RUNNER_TEMP\verify_render_seed.py"
           if($LASTEXITCODE -ne 0){throw 'FIX 1 render seed behavior validation failed'}
+          $bridge=Get-Content engine/preview_bridge.py -Raw
+          if($bridge -notmatch 'RENDER_STARTUP_EXIT=42' -or $bridge -notmatch 'def _wait_for_resident_startup'){throw 'FIX 2 startup handshake missing'}
+          if($bridge -notmatch 'Resident capture EA heartbeat received' -or $bridge -notmatch 'resident_ea_ready'){throw 'FIX 2 ready handshake stage missing'}
+          if($bridge -notmatch 'relaunch_cap=3' -or $bridge -notmatch 'resident_job_hang'){throw 'FIX 2 poison-job relaunch cap missing'}
+          $lib=Get-Content src-tauri/src/lib.rs -Raw
+          if($lib -notmatch 'final_code==42' -or $lib -notmatch 'preview-library-config-error'){throw 'FIX 2 non-restarting config failure missing'}
+          $main=Get-Content ui/main.js -Raw
+          if($main -notmatch 'preview-library-config-error' -or $main -notmatch 'render_startup_config'){throw 'FIX 2 startup error UI missing'}
+          @'
+          import tempfile, threading, time
+          from pathlib import Path
+          import preview_bridge as p
+
+          class LiveProc:
+              returncode=None
+              def poll(self): return None
+
+          with tempfile.TemporaryDirectory() as td:
+              hb=Path(td)/'heartbeat.txt'
+              def writer():
+                  time.sleep(.3)
+                  hb.write_text('1\t\t0',encoding='utf-8')
+              t=threading.Thread(target=writer);t.start()
+              beat=p._wait_for_resident_startup(hb,LiveProc(),timeout=2)
+              t.join()
+              assert beat['beat']=='1'
+
+          with tempfile.TemporaryDirectory() as td:
+              hb=Path(td)/'heartbeat.txt'
+              try:
+                  p._wait_for_resident_startup(hb,LiveProc(),timeout=1)
+                  raise AssertionError('expected RenderStartupError')
+              except p.RenderStartupError as e:
+                  assert 'capture EA is not running' in str(e)
+          print('startup-handshake-ok')
+          '@ | Set-Content "$env:RUNNER_TEMP\verify_render_handshake.py" -Encoding UTF8
+          $env:PYTHONPATH="$env:APP_DIR\engine"
+          python "$env:RUNNER_TEMP\verify_render_handshake.py"
+          if($LASTEXITCODE -ne 0){throw 'FIX 2 startup handshake behavior validation failed'}
           $bridge=Get-Content engine/preview_bridge.py -Raw
           if($bridge -notmatch 'mt5-preview-prime-v3'){throw 'MT5 prime v3 readiness marker missing'}
           if($bridge -notmatch 'seed-v5'){throw 'Minimum runtime seed v5 missing'}
