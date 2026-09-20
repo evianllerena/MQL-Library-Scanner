@@ -427,6 +427,19 @@ fn run_preview_worker_supervisor(
             break;
         }
 
+        if worker_id=="render-server" && final_code==42 {
+            group_failed.store(true,Ordering::SeqCst);
+            append_log(&db_path,"ERROR","preview_library_config_error",json!({
+                "code":final_code,"worker_id":worker_id,
+                "message":"Render terminal started but the capture EA did not heartbeat. Check MT5 data folder/account and Algo Trading."
+            }),None);
+            let _=app.emit("preview-library-config-error",json!({
+                "code":final_code,"worker_id":worker_id,
+                "message":"Render terminal started but the capture EA is not running. Usually means the MT5 clone has no account or Algo Trading is off. Set your MT5 data folder in Settings."
+            }));
+            break;
+        }
+
         if restarts>=MAX_RESTARTS {
             group_failed.store(true,Ordering::SeqCst);
             append_log(&db_path,"ERROR","preview_library_restart_cap",json!({

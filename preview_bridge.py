@@ -5,6 +5,11 @@ from pathlib import Path
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
 SW_HIDE=0
 
+RENDER_STARTUP_EXIT=42
+
+class RenderStartupError(RuntimeError):
+    pass
+
 def mql_dir_name(kind):
     """MetaTrader source directory name for a platform kind.
 
@@ -888,6 +893,20 @@ def _read_resident_heartbeat(hb):
     except Exception:return None
 
 
+def _wait_for_resident_startup(hb,proc,timeout=60):
+    start=time.time()
+    while time.time()-start<max(1,int(timeout)):
+        if proc.poll() is not None:
+            raise RenderStartupError(f'Render terminal exited before resident EA heartbeat (exit={proc.returncode}).')
+        beat=_read_resident_heartbeat(hb)
+        if beat and beat.get('beat'):
+            return beat
+        time.sleep(.5)
+    raise RenderStartupError(
+        'Render terminal started but the capture EA is not running. Usually means '
+        'the MT5 clone has no account (login wizard is blocking) or Algo Trading is off. '
+        'Set your MT5 data folder in Settings.')
+
 def _install_resident_ea(mql,editor,job_id):
     experts=Path(mql)/'Experts';experts.mkdir(parents=True,exist_ok=True)
     src=experts/'MQLLibRenderServer.mq5';built=src.with_suffix('.ex5')
@@ -907,12 +926,17 @@ def _install_resident_ea(mql,editor,job_id):
 
 def _launch_resident_terminal(rt,terminalexe,sym,job_id):
     _prepare_render_runtime(rt)
+    ea=Path(rt)/'MQL5'/'Experts'/'MQLLibRenderServer.ex5'
+    if not ea.is_file() or not ea.stat().st_size:
+        raise RenderStartupError(f'Resident capture EA is missing or empty: {ea}')
     cfg=Path(rt)/f'render-server-{safe_job_id(job_id)}.ini'
-    cfg.write_text(
+    cfg_text=(
         '[Common]\nNewsEnable=0\n\n'
         '[Experts]\nEnabled=1\nAllowLiveTrading=1\nAllowDllImport=0\n\n'
-        f'[StartUp]\nSymbol={sym}\nPeriod=H1\nExpert=MQLLibRenderServer\nShutdownTerminal=0\n',
-        encoding='utf-8')
+        f'[StartUp]\nSymbol={sym}\nPeriod=H1\nExpert=MQLLibRenderServer\nShutdownTerminal=0\n')
+    if 'Expert=MQLLibRenderServer' not in cfg_text:
+        raise RenderStartupError('Render startup config does not reference MQLLibRenderServer exactly.')
+    cfg.write_text(cfg_text,encoding='utf-8')
     return subprocess.Popen(
         [str(terminalexe),'/portable',f'/config:{cfg}'],
         cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
@@ -1071,35 +1095,53 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
     _propagate_existing_ready(con)
 
     sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
-    render_data=resolve_mt5_render_data_dir(mt5_data_dir)
-    rt=clone_runtime(sel,dest,'MT5','render-server')
-    hard_kill(None,rt)
-    sym,copied_cfg=seed_render_runtime_from_data_dir(render_data,rt)
-    emit_stage(job_id,'render_runtime_seeded','Seeded render runtime from logged-in MT5 data folder.',
-               data_dir=str(render_data),symbol=sym,config_files=copied_cfg)
-    mql=rt/'MQL5'
-    files,cur,done,hb=_resident_job_paths(mql)
-    editor=rt/Path(sel['editor']).name
-    terminalexe=rt/Path(sel['terminal']).name
-    _install_resident_ea(mql,editor,job_id)
+    try:
+        render_data=resolve_mt5_render_data_dir(mt5_data_dir)
+        rt=clone_runtime(sel,dest,'MT5','render-server')
+        hard_kill(None,rt)
+        sym,copied_cfg=seed_render_runtime_from_data_dir(render_data,rt)
+        emit_stage(job_id,'render_runtime_seeded','Seeded render runtime from logged-in MT5 data folder.',
+                   data_dir=str(render_data),symbol=sym,config_files=copied_cfg)
+        mql=rt/'MQL5'
+        files,cur,done,hb=_resident_job_paths(mql)
+        editor=rt/Path(sel['editor']).name
+        terminalexe=rt/Path(sel['terminal']).name
+        resident_ex5=_install_resident_ea(mql,editor,job_id)
+        if not resident_ex5 or not Path(resident_ex5).is_file() or not Path(resident_ex5).stat().st_size:
+            raise RenderStartupError('Resident capture EA did not compile to MQLLibRenderServer.ex5.')
+    except Exception as e:
+        msg=str(e)
+        emit({'type':'fatal','job_id':job_id,'component':'render-server',
+              'fatal_kind':'render_startup_config','exit_code':RENDER_STARTUP_EXIT,'error':msg})
+        con.close()
+        raise SystemExit(RENDER_STARTUP_EXIT)
 
     for p in (cur,done,hb):
         try:p.unlink(missing_ok=True)
         except Exception:pass
 
     def launch():
-        for p in (cur,done,hb):
-            try:p.unlink(missing_ok=True)
+        for path in (cur,done,hb):
+            try:path.unlink(missing_ok=True)
             except Exception:pass
         proc=_launch_resident_terminal(rt,terminalexe,sym,job_id)
-        emit_stage(job_id,'resident_terminal_launch','Launching warm MT5 render terminal.',runtime=str(rt))
+        emit_stage(job_id,'resident_terminal_launch','Launching warm MT5 render terminal; waiting for resident EA heartbeat.',runtime=str(rt))
+        try:
+            beat=_wait_for_resident_startup(hb,proc,60)
+        except RenderStartupError:
+            hard_kill(proc,rt)
+            raise
+        emit_stage(job_id,'resident_ea_ready','Resident capture EA heartbeat received; render server is ready.',
+                   ea_beat=beat.get('beat'),inflight=beat.get('inflight'))
         return proc
 
-    proc=launch()
+    proc=None
     last_host_heartbeat=0.0
     idle_since=time.time()
+    relaunch_counts={}
 
     try:
+        proc=launch()
         while True:
             pause_reason=_worker_pause_reason(con,dest)
             if pause_reason:
@@ -1179,19 +1221,37 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
                     "preview_updated_at=datetime('now'),preview_priority=0,worker_id=NULL WHERE sha256=?",
                     (str(final),sha,sha));con.commit()
             else:
-                err='render hang/timeout'
                 if done_payload and not done_payload.get('ok'):
                     err=f"render failed err={done_payload.get('err')}"
-                _render_server_fail(con,row,err,max_attempts)
-                hard_kill(proc,rt)
-                try:cur.unlink(missing_ok=True)
-                except Exception:pass
-                proc=launch()
+                    _render_server_fail(con,row,err,max_attempts)
+                    emit_stage(job_id,'resident_job_failed',f'Resident EA completed with failure: {src.name}',
+                               source=str(src),error=err)
+                else:
+                    err='render hang/timeout'
+                    _render_server_fail(con,row,err,max_attempts)
+                    relaunch_counts[sha]=relaunch_counts.get(sha,0)+1
+                    count=relaunch_counts[sha]
+                    if count>=3:
+                        con.execute(
+                            "UPDATE indicators SET preview_status='failed',preview_error=?,worker_id=NULL,"
+                            "preview_updated_at=datetime('now') WHERE sha256=?",
+                            (f'{err}; relaunch cap reached ({count}/3)',sha));con.commit()
+                    emit_stage(job_id,'resident_job_hang',f'Resident EA heartbeat froze mid-job: {src.name}',
+                               source=str(src),relaunch_count=count,relaunch_cap=3)
+                    hard_kill(proc,rt)
+                    try:cur.unlink(missing_ok=True)
+                    except Exception:pass
+                    proc=launch()
 
             ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
             total=con.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
             emit({'type':'progress','job_id':job_id,'done':ready,'total':total})
             idle_since=time.time()
+    except RenderStartupError as e:
+        msg=str(e)
+        emit({'type':'fatal','job_id':job_id,'component':'render-server',
+              'fatal_kind':'render_startup_config','exit_code':RENDER_STARTUP_EXIT,'error':msg})
+        raise SystemExit(RENDER_STARTUP_EXIT)
     finally:
         hard_kill(proc,rt)
         con.close()
