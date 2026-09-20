@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, ctypes, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, zipfile
+import argparse, concurrent.futures, ctypes, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, zipfile
 from pathlib import Path
 
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
@@ -835,7 +835,7 @@ def _render_server_claim(con,max_attempts=2):
         """
         SELECT MIN(id) AS id,path,platform,sha256,MAX(COALESCE(preview_priority,0)) AS pr
         FROM indicators i
-        WHERE preview_status IN ('compiled','pending')
+        WHERE preview_status='compiled'
           AND COALESCE(preview_attempts,0)<?
           AND COALESCE(sha256,'')<>''
           AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')
@@ -850,12 +850,115 @@ def _render_server_claim(con,max_attempts=2):
     return row
 
 
+
+def _compile_pool_claim(con,limit):
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        rows=con.execute(
+            """
+            WITH grouped AS (
+              SELECT sha256,MIN(id) AS id,MAX(COALESCE(preview_priority,0)) AS pr
+              FROM indicators i
+              WHERE preview_status='pending'
+                AND COALESCE(sha256,'')<>''
+                AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')
+                AND NOT EXISTS(
+                  SELECT 1 FROM indicators x
+                  WHERE x.sha256=i.sha256 AND x.preview_status IN ('compiling','compiled','rendering','ready')
+                )
+              GROUP BY sha256
+              ORDER BY pr DESC,id
+              LIMIT ?
+            )
+            SELECT i.id,i.path,i.platform,i.sha256
+            FROM grouped g JOIN indicators i ON i.id=g.id
+            ORDER BY g.pr DESC,i.id
+            """,(max(1,int(limit)),)).fetchall()
+        for r in rows:
+            con.execute(
+                "UPDATE indicators SET preview_status='compiling',worker_id='compile-pool',preview_error='' "
+                "WHERE sha256=? AND preview_status='pending'",
+                (r['sha256'],))
+        con.commit()
+        return rows
+    except Exception:
+        con.rollback();raise
+
+
+def compile_pool(db,out,terminal=None,workers=4,job_id=None):
+    job_id=safe_job_id(job_id);dest=Path(out);workers=max(1,min(int(workers),8))
+    con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
+    con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
+    _ensure_preview_queue_schema(con,None)
+    con.execute(
+        "UPDATE indicators SET preview_status='pending',worker_id=NULL "
+        "WHERE preview_status='compiling' AND worker_id='compile-pool'")
+    con.execute(
+        "UPDATE indicators SET preview_status='pending',preview_error='',preview_attempts=0,worker_id=NULL "
+        "WHERE preview_status='failed' AND preview_error LIKE 'MT4 source in .mq5:%'")
+    con.commit()
+
+    sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
+    rt=clone_runtime(sel,dest,'MT5','compile-pool')
+    mql=rt/'MQL5'
+    editor=rt/Path(sel['editor']).name
+    emit_stage(job_id,'compile_pool_start',f'Starting MT5 compile pool with {workers} workers.',workers=workers)
+
+    def compile_one(row):
+        src=Path(row['path']);sha=row['sha256']
+        cache=_compiled_cache_path(dest,'MT5',sha)
+        if cache.exists() and cache.stat().st_size:
+            return sha,True,'',str(cache),str(src)
+        try:
+            _job,_staged,binary,_meta=stage(src,mql,'MT5',editor,sel.get('data_dir'),cache)
+            if not binary or not Path(binary).is_file() or not Path(binary).stat().st_size:
+                return sha,False,'compile produced no EX5',None,str(src)
+            return sha,True,'',str(cache),str(src)
+        except Exception as e:
+            return sha,False,f'{type(e).__name__}: {e}',None,str(src)
+
+    completed=0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers,thread_name_prefix='mql-compile') as ex:
+        while True:
+            pause_reason=_worker_pause_reason(con,dest)
+            if pause_reason:
+                emit({'ok':True,'job_id':job_id,'paused':True,'reason':pause_reason,'component':'compile_pool'})
+                break
+            rows=_compile_pool_claim(con,max(workers*2,workers))
+            if not rows:break
+            futures=[ex.submit(compile_one,r) for r in rows]
+            for fut in concurrent.futures.as_completed(futures):
+                sha,ok,err,cache,source=fut.result()
+                completed+=1
+                if ok:
+                    con.execute(
+                        "UPDATE indicators SET preview_status='compiled',preview_error='',worker_id=NULL "
+                        "WHERE sha256=? AND preview_status='compiling'",
+                        (sha,))
+                    emit_stage(job_id,'compile_ready',f'Compiled {Path(source).name}',source=source,sha256=sha,cache=cache)
+                else:
+                    con.execute(
+                        "UPDATE indicators SET preview_status='failed',preview_error=?,worker_id=NULL,"
+                        "preview_updated_at=datetime('now') WHERE sha256=?",
+                        (('compile: '+err)[:800],sha))
+                    emit_stage(job_id,'compile_failed',f'Compile failed: {Path(source).name}',source=source,sha256=sha,error=err[:800])
+                con.commit()
+                emit_heartbeat(job_id,completed,source,stage='compile_pool')
+                pending=con.execute(
+                    "SELECT COUNT(*) FROM indicators WHERE preview_status IN ('pending','compiling') "
+                    "AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')"
+                ).fetchone()[0]
+                emit({'type':'compile_progress','job_id':job_id,'done':completed,'remaining':pending})
+
+    con.close()
+    emit({'ok':True,'job_id':job_id,'component':'compile_pool','finished':True,'compiled_done':completed})
+
+
 def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2):
     job_id=safe_job_id(job_id);dest=Path(out)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
     _ensure_preview_queue_schema(con,None)
-    con.execute("UPDATE indicators SET preview_status='pending',worker_id=NULL WHERE preview_status='compiling'")
     con.execute("UPDATE indicators SET preview_status='compiled',worker_id=NULL WHERE preview_status='rendering' AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')")
     con.execute(
         "UPDATE indicators SET preview_status='pending',preview_error='',preview_attempts=0,worker_id=NULL "
@@ -913,19 +1016,16 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
 
             src=Path(row['path']);sha=row['sha256']
             cache=_compiled_cache_path(dest,'MT5',sha)
+            if row['id'] is None:raise RuntimeError('Render claim returned no representative row.')
+            if not cache.exists() or not cache.stat().st_size:
+                con.execute("UPDATE indicators SET preview_status='pending',worker_id=NULL,preview_error='compiled cache missing; returned to compile pool' WHERE sha256=?",(sha,));con.commit()
+                continue
             try:
-                if row['id'] is None:raise RuntimeError('Render claim returned no representative row.')
-                if not cache.exists() or not cache.stat().st_size:
-                    con.execute("UPDATE indicators SET preview_status='compiling',worker_id='render-server' WHERE sha256=?",(sha,));con.commit()
-                    job,staged,binary,_meta=stage(src,mql,'MT5',editor,sel.get('data_dir'),cache)
-                    con.execute("UPDATE indicators SET preview_status='compiled',preview_error='',worker_id=NULL WHERE sha256=?",(sha,));con.commit()
-                else:
-                    job,staged,binary,_meta=stage(src,mql,'MT5',editor,sel.get('data_dir'),cache)
+                job,staged,binary,_meta=stage(src,mql,'MT5',editor,sel.get('data_dir'),cache)
             except Exception as e:
                 con.execute(
-                    "UPDATE indicators SET preview_status='failed',preview_error=?,worker_id=NULL,preview_updated_at=datetime('now') WHERE sha256=?",
-                    (('compile: '+str(e))[:800],sha));con.commit()
-                emit_stage(job_id,'compile_failed',f'Compile failed: {src.name}',source=str(src),error=str(e)[:800])
+                    "UPDATE indicators SET preview_status='pending',preview_error=?,worker_id=NULL WHERE sha256=?",
+                    (('stage compiled cache: '+str(e))[:800],sha));con.commit()
                 continue
 
             rel=f'MQLLibraryPreview/{job}/{binary.stem}'
@@ -1926,6 +2026,7 @@ def main():
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=70);p.add_argument('--timeout',type=int,default=30);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id');p.add_argument('--worker-id');p.add_argument('--static-fast-fail',action='store_true',default=False)
     p=s.add_parser('render-server');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--attempts',type=int,default=2)
+    p=s.add_parser('compile-pool');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--workers',type=int,default=4);p.add_argument('--job-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
     p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
@@ -1945,6 +2046,7 @@ def main():
             render_mt5_batch(mt5,x.out,sel,job)
     elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id,x.worker_id,x.static_fast_fail)
     elif x.cmd=='render-server':render_server(x.db,x.out,x.terminal,x.job_id,x.hang_timeout,x.attempts)
+    elif x.cmd=='compile-pool':compile_pool(x.db,x.out,x.terminal,x.workers,x.job_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)
