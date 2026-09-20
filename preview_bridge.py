@@ -791,11 +791,13 @@ def _read_resident_heartbeat(hb):
 
 def _install_resident_ea(mql,editor,job_id):
     experts=Path(mql)/'Experts';experts.mkdir(parents=True,exist_ok=True)
-    src=experts/'MQLLibRenderServer.mq5'
-    if read_text(src)!=RESIDENT_EA_SOURCE:
+    src=experts/'MQLLibRenderServer.mq5';built=src.with_suffix('.ex5')
+    changed=read_text(src)!=RESIDENT_EA_SOURCE
+    if changed:
         src.write_text(RESIDENT_EA_SOURCE,encoding='utf-8')
-    built=src.with_suffix('.ex5')
-    if built.exists() and built.stat().st_size:
+        try:built.unlink(missing_ok=True)
+        except Exception:pass
+    if built.exists() and built.stat().st_size and built.stat().st_mtime_ns>=src.stat().st_mtime_ns:
         return built
     emit_stage(job_id,'resident_ea_compile','Compiling resident MQL5 render server EA.')
     built,_cmds,log=compile_file(editor,src,Path(mql))
@@ -831,23 +833,26 @@ def _render_server_fail(con,row,err,max_attempts=2):
 
 
 def _render_server_claim(con,max_attempts=2):
-    row=con.execute(
+    return con.execute(
         """
-        SELECT MIN(id) AS id,path,platform,sha256,MAX(COALESCE(preview_priority,0)) AS pr
-        FROM indicators i
-        WHERE preview_status='compiled'
-          AND COALESCE(preview_attempts,0)<?
-          AND COALESCE(sha256,'')<>''
-          AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')
-          AND NOT EXISTS(
-            SELECT 1 FROM indicators x
-            WHERE x.sha256=i.sha256 AND x.preview_status IN ('rendering','ready')
-          )
-        GROUP BY sha256
-        ORDER BY pr DESC,id
-        LIMIT 1
+        WITH grouped AS (
+          SELECT sha256,MIN(id) AS id,MAX(COALESCE(preview_priority,0)) AS pr
+          FROM indicators i
+          WHERE preview_status='compiled'
+            AND COALESCE(preview_attempts,0)<?
+            AND COALESCE(sha256,'')<>''
+            AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')
+            AND NOT EXISTS(
+              SELECT 1 FROM indicators x
+              WHERE x.sha256=i.sha256 AND x.preview_status IN ('rendering','ready')
+            )
+          GROUP BY sha256
+          ORDER BY pr DESC,id
+          LIMIT 1
+        )
+        SELECT i.id,i.path,i.platform,i.sha256,g.pr
+        FROM grouped g JOIN indicators i ON i.id=g.id
         """,(max_attempts,)).fetchone()
-    return row
 
 
 
@@ -968,6 +973,7 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
 
     sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
     rt=clone_runtime(sel,dest,'MT5','render-server')
+    hard_kill(None,rt)
     mql=rt/'MQL5'
     files,cur,done,hb=_resident_job_paths(mql)
     sym=copy_mt5_history(Path(sel['data_dir']),rt)
