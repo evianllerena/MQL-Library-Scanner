@@ -105,7 +105,12 @@ def emit_heartbeat(job_id,done=0,inflight=None,**details):
 def _prepare_offline_runtime(rt):
     """Suppress cloned-runtime UI/network distractions that can block unattended batches."""
     rt=Path(rt)
-    for p in (rt/'profiles'/'lastprofile.ini',rt/'config'/'lastprofile.ini'):
+    for p in (
+        rt/'profiles'/'lastprofile.ini',
+        rt/'config'/'lastprofile.ini',
+        rt/'config'/'accounts.dat',
+        rt/'config'/'community.ini'
+    ):
         try:p.unlink(missing_ok=True)
         except Exception:pass
     for base in (rt/'bases',):
