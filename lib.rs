@@ -368,7 +368,7 @@ fn run_preview_worker_supervisor(
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     if let Ok(v)=serde_json::from_str::<Value>(&line) {
-                        if v.get("type").and_then(Value::as_str)==Some("heartbeat") {
+                        if matches!(v.get("type").and_then(Value::as_str),Some("heartbeat")|Some("progress")) {
                             hb.store(now_secs(),Ordering::SeqCst);
                         }
                     }
