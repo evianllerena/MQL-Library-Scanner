@@ -2019,6 +2019,11 @@ def self_test():
         'mql_dir_name_mt4':mql_dir_name('MT4')=='MQL4',
         'origin_utf8_decode':decode_origin_bytes(b'C:\\Program Files\\OANDA TMS MT5')=='C:\\Program Files\\OANDA TMS MT5',
         'origin_utf16_decode':decode_origin_bytes(('C:\\Program Files\\MetaTrader 4').encode('utf-16'))=='C:\\Program Files\\MetaTrader 4',
+        'mql_str_backslash_escape':_mql_str(r'MQLLibraryPreview\\abc\\demo')==r'MQLLibraryPreview\\\\abc\\\\demo',
+        'resident_ea_timer':'EventSetMillisecondTimer(150)' in RESIDENT_EA_SOURCE,
+        'resident_ea_job_protocol':all(x in RESIDENT_EA_SOURCE for x in ('current.job','current.done','heartbeat.txt')),
+        'resident_ea_warm_terminal':'TerminalClose' not in RESIDENT_EA_SOURCE,
+        'resident_ea_forward_path_host':"rel=f'MQLLibraryPreview/{job}/{binary.stem}'" in read_text(Path(__file__)),
     }
     checks.update(self_test_discovery())
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
