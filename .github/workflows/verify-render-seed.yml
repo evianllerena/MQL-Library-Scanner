@@ -217,6 +217,36 @@ jobs:
           python "$env:RUNNER_TEMP\verify_render_handshake.py"
           if($LASTEXITCODE -ne 0){throw 'FIX 2 startup handshake behavior validation failed'}
           $bridge=Get-Content engine/preview_bridge.py -Raw
+          if($bridge -notmatch "runtime_path\(sel,dest,'MT5','render-server'\)" -or $bridge -notmatch '_wait_for_render_runtime'){throw '4802 fix: compile pool is not targeting the shared render runtime'}
+          if($bridge -notmatch 'render_artifact_missing' -or $bridge -notmatch 'ex5 missing in render runtime'){throw '4802 fix: pre-queue EX5 assertion missing'}
+          if($bridge -notmatch "add_argument\('--runtime-id'"){throw '4802 fix: runtime generation CLI guard missing'}
+          $lib=Get-Content src-tauri/src/lib.rs -Raw
+          if($lib -notmatch '"--runtime-id"' -or $lib -notmatch 'render_args.push'){throw '4802 fix: Rust shared runtime generation wiring missing'}
+          @'
+          import tempfile
+          from pathlib import Path
+          import preview_bridge as p
+
+          fake={
+              'data_dir':r'C:\\Users\\tester\\AppData\\Roaming\\MetaQuotes\\Terminal\\ABC',
+              'terminal':r'C:\\Program Files\\MT5\\terminal64.exe'
+          }
+          with tempfile.TemporaryDirectory() as td:
+              out=Path(td)/'previews'
+              rt=p.runtime_path(fake,out,'MT5','render-server')
+              assert rt.name.startswith('mt5-') and rt.name.endswith('-render-server')
+              rid='run-123'
+              marker=p._render_runtime_ready_marker(rt,rid)
+              marker.parent.mkdir(parents=True,exist_ok=True)
+              (rt/'MQL5'/'Indicators').mkdir(parents=True,exist_ok=True)
+              marker.write_text('ready',encoding='utf-8')
+              assert p._wait_for_render_runtime(rt,rid,timeout=1)==marker
+          print('shared-render-runtime-ok')
+          '@ | Set-Content "$env:RUNNER_TEMP\verify_shared_render_runtime.py" -Encoding UTF8
+          $env:PYTHONPATH="$env:APP_DIR\engine"
+          python "$env:RUNNER_TEMP\verify_shared_render_runtime.py"
+          if($LASTEXITCODE -ne 0){throw '4802 shared render runtime behavior validation failed'}
+          $bridge=Get-Content engine/preview_bridge.py -Raw
           if($bridge -notmatch 'mt5-preview-prime-v3'){throw 'MT5 prime v3 readiness marker missing'}
           if($bridge -notmatch 'seed-v5'){throw 'Minimum runtime seed v5 missing'}
           if($bridge -notmatch 'terminal_selected'){throw 'Terminal data-folder selection stage missing'}
