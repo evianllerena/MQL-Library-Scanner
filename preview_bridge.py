@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, ctypes, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, zipfile
+import argparse, concurrent.futures, ctypes, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, zipfile
 from pathlib import Path
 
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
@@ -696,6 +696,410 @@ def mt5_capture_source(rel, shot, win):
     )
 
 
+
+RESIDENT_EA_SOURCE = r'''#property strict
+input string Dir = "MQLLibRender";
+long g_beat = 0;
+
+int OnInit(){ EventSetMillisecondTimer(150); return(INIT_SUCCEEDED); }
+void OnDeinit(const int r){ EventKillTimer(); }
+
+void beat(string inflight){
+  g_beat++;
+  int f=FileOpen(Dir+"\\heartbeat.txt",FILE_WRITE|FILE_TXT|FILE_ANSI);
+  if(f!=INVALID_HANDLE){
+    FileWrite(f,(string)g_beat+"\t"+inflight+"\t"+(string)(long)TimeCurrent());
+    FileClose(f);
+  }
+}
+
+void clearChart(){
+  for(int w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL)-1; w>=0; w--){
+    int tt=ChartIndicatorsTotal(0,w);
+    for(int i=tt-1;i>=0;i--){
+      string nm=ChartIndicatorName(0,w,i);
+      ChartIndicatorDelete(0,w,nm);
+    }
+  }
+  ChartRedraw();
+}
+
+void writeDone(string id,bool ok,int err,string shot){
+  int f=FileOpen(Dir+"\\current.done",FILE_WRITE|FILE_TXT|FILE_ANSI);
+  if(f!=INVALID_HANDLE){
+    FileWrite(f,id+"\t"+(ok?"ok":"fail")+"\t"+(string)err+"\t"+shot);
+    FileClose(f);
+  }
+}
+
+void OnTimer(){
+  if(!FileIsExist(Dir+"\\current.job")){ beat(""); return; }
+  int f=FileOpen(Dir+"\\current.job",FILE_READ|FILE_TXT|FILE_ANSI);
+  if(f==INVALID_HANDLE){ beat(""); return; }
+  string line=FileReadString(f); FileClose(f);
+  string p[]; int n=StringSplit(line,(ushort)9,p);
+  if(n<3){ FileDelete(Dir+"\\current.job"); beat(""); return; }
+  string id=p[0], rel=p[1], shot=p[2];
+  int win=(n>=4)?(int)StringToInteger(p[3]):0;
+
+  beat(id);
+  clearChart();
+  ResetLastError();
+  int h=iCustom(_Symbol,_Period,rel);
+  int err=GetLastError();
+  bool ok=false;
+  if(h!=INVALID_HANDLE){
+    int w=win;
+    if(w==1) w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);
+    if(ChartIndicatorAdd(0,w,h)){
+      ChartRedraw();
+      for(int i=0;i<15;i++){ if(BarsCalculated(h)>=0) break; Sleep(150); }
+      Sleep(400);
+      ok=ChartScreenShot(0,shot,1200,720,ALIGN_RIGHT);
+      err=GetLastError();
+    }
+    IndicatorRelease(h);
+  }
+  writeDone(id,ok,err,shot);
+  FileDelete(Dir+"\\current.job");
+  beat("");
+}
+'''
+
+
+def _resident_indicator_rel(job,binary):
+    return f'MQLLibraryPreview/{safe_job_id(job)}/{Path(binary).stem}'
+
+
+def _resident_job_paths(mql):
+    root=Path(mql)/'Files'/'MQLLibRender'
+    root.mkdir(parents=True,exist_ok=True)
+    return root,root/'current.job',root/'current.done',root/'heartbeat.txt'
+
+
+def _read_resident_done(done):
+    try:
+        parts=done.read_text(encoding='utf-8',errors='ignore').strip().split('\t')
+        if len(parts)<4:return None
+        return {'id':parts[0],'ok':parts[1].lower()=='ok','err':parts[2],'shot':parts[3]}
+    except Exception:return None
+
+
+def _read_resident_heartbeat(hb):
+    try:
+        parts=hb.read_text(encoding='utf-8',errors='ignore').strip().split('\t')
+        if not parts:return None
+        return {'beat':parts[0],'inflight':parts[1] if len(parts)>1 else '','epoch':parts[2] if len(parts)>2 else ''}
+    except Exception:return None
+
+
+def _install_resident_ea(mql,editor,job_id):
+    experts=Path(mql)/'Experts';experts.mkdir(parents=True,exist_ok=True)
+    src=experts/'MQLLibRenderServer.mq5';built=src.with_suffix('.ex5')
+    changed=read_text(src)!=RESIDENT_EA_SOURCE
+    if changed:
+        src.write_text(RESIDENT_EA_SOURCE,encoding='utf-8')
+        try:built.unlink(missing_ok=True)
+        except Exception:pass
+    if built.exists() and built.stat().st_size and built.stat().st_mtime_ns>=src.stat().st_mtime_ns:
+        return built
+    emit_stage(job_id,'resident_ea_compile','Compiling resident MQL5 render server EA.')
+    built,_cmds,log=compile_file(editor,src,Path(mql))
+    if not built:
+        raise RuntimeError('Resident render EA failed to compile. '+(log or '')[-1800:])
+    return built
+
+
+def _launch_resident_terminal(rt,terminalexe,sym,job_id):
+    _prepare_offline_runtime(rt)
+    cfg=Path(rt)/f'render-server-{safe_job_id(job_id)}.ini'
+    cfg.write_text(
+        '[Common]\nNewsEnable=0\n\n'
+        '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
+        f'[StartUp]\nSymbol={sym}\nPeriod=H1\nExpert=MQLLibRenderServer\nShutdownTerminal=0\n',
+        encoding='utf-8')
+    return subprocess.Popen(
+        [str(terminalexe),'/portable',f'/config:{cfg}'],
+        cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
+
+
+def _render_server_fail(con,row,err,max_attempts=2):
+    sha=row['sha256']
+    current=con.execute(
+        "SELECT MAX(COALESCE(preview_attempts,0)) FROM indicators WHERE sha256=?",
+        (sha,)).fetchone()[0] or 0
+    status='failed' if current>=max_attempts else 'compiled'
+    con.execute(
+        "UPDATE indicators SET preview_status=?,preview_error=?,worker_id=NULL,"
+        "preview_updated_at=datetime('now') WHERE sha256=?",
+        (status,str(err)[:800],sha))
+    con.commit()
+
+
+def _render_server_claim(con,max_attempts=2):
+    return con.execute(
+        """
+        WITH grouped AS (
+          SELECT sha256,MIN(id) AS id,MAX(COALESCE(preview_priority,0)) AS pr
+          FROM indicators i
+          WHERE preview_status='compiled'
+            AND COALESCE(preview_attempts,0)<?
+            AND COALESCE(sha256,'')<>''
+            AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')
+            AND NOT EXISTS(
+              SELECT 1 FROM indicators x
+              WHERE x.sha256=i.sha256 AND x.preview_status IN ('rendering','ready')
+            )
+          GROUP BY sha256
+          ORDER BY pr DESC,id
+          LIMIT 1
+        )
+        SELECT i.id,i.path,i.platform,i.sha256,g.pr
+        FROM grouped g JOIN indicators i ON i.id=g.id
+        """,(max_attempts,)).fetchone()
+
+
+
+def _compile_pool_claim(con,limit):
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        rows=con.execute(
+            """
+            WITH grouped AS (
+              SELECT sha256,MIN(id) AS id,MAX(COALESCE(preview_priority,0)) AS pr
+              FROM indicators i
+              WHERE preview_status='pending'
+                AND COALESCE(sha256,'')<>''
+                AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')
+                AND NOT EXISTS(
+                  SELECT 1 FROM indicators x
+                  WHERE x.sha256=i.sha256 AND x.preview_status IN ('compiling','compiled','rendering','ready')
+                )
+              GROUP BY sha256
+              ORDER BY pr DESC,id
+              LIMIT ?
+            )
+            SELECT i.id,i.path,i.platform,i.sha256
+            FROM grouped g JOIN indicators i ON i.id=g.id
+            ORDER BY g.pr DESC,i.id
+            """,(max(1,int(limit)),)).fetchall()
+        for r in rows:
+            con.execute(
+                "UPDATE indicators SET preview_status='compiling',worker_id='compile-pool',preview_error='' "
+                "WHERE sha256=? AND preview_status='pending'",
+                (r['sha256'],))
+        con.commit()
+        return rows
+    except Exception:
+        con.rollback();raise
+
+
+def compile_pool(db,out,terminal=None,workers=4,job_id=None):
+    job_id=safe_job_id(job_id);dest=Path(out);workers=max(1,min(int(workers),8))
+    con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
+    con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
+    _ensure_preview_queue_schema(con,None)
+    con.execute(
+        "UPDATE indicators SET preview_status='pending',worker_id=NULL "
+        "WHERE preview_status='compiling' AND worker_id='compile-pool'")
+    con.execute(
+        "UPDATE indicators SET preview_status='pending',preview_error='',preview_attempts=0,worker_id=NULL "
+        "WHERE preview_status='failed' AND preview_error LIKE 'MT4 source in .mq5:%'")
+    con.commit()
+
+    sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
+    rt=clone_runtime(sel,dest,'MT5','compile-pool')
+    mql=rt/'MQL5'
+    editor=rt/Path(sel['editor']).name
+    emit_stage(job_id,'compile_pool_start',f'Starting MT5 compile pool with {workers} workers.',workers=workers)
+
+    def compile_one(row):
+        src=Path(row['path']);sha=row['sha256']
+        cache=_compiled_cache_path(dest,'MT5',sha)
+        if cache.exists() and cache.stat().st_size:
+            return sha,True,'',str(cache),str(src)
+        try:
+            _job,_staged,binary,_meta=stage(src,mql,'MT5',editor,sel.get('data_dir'),cache)
+            if not binary or not Path(binary).is_file() or not Path(binary).stat().st_size:
+                return sha,False,'compile produced no EX5',None,str(src)
+            return sha,True,'',str(cache),str(src)
+        except Exception as e:
+            return sha,False,f'{type(e).__name__}: {e}',None,str(src)
+
+    completed=0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers,thread_name_prefix='mql-compile') as ex:
+        while True:
+            pause_reason=_worker_pause_reason(con,dest)
+            if pause_reason:
+                emit({'ok':True,'job_id':job_id,'paused':True,'reason':pause_reason,'component':'compile_pool'})
+                break
+            rows=_compile_pool_claim(con,max(workers*2,workers))
+            if not rows:break
+            futures=[ex.submit(compile_one,r) for r in rows]
+            for fut in concurrent.futures.as_completed(futures):
+                sha,ok,err,cache,source=fut.result()
+                completed+=1
+                if ok:
+                    con.execute(
+                        "UPDATE indicators SET preview_status='compiled',preview_error='',worker_id=NULL "
+                        "WHERE sha256=? AND preview_status='compiling'",
+                        (sha,))
+                    emit_stage(job_id,'compile_ready',f'Compiled {Path(source).name}',source=source,sha256=sha,cache=cache)
+                else:
+                    con.execute(
+                        "UPDATE indicators SET preview_status='failed',preview_error=?,worker_id=NULL,"
+                        "preview_updated_at=datetime('now') WHERE sha256=?",
+                        (('compile: '+err)[:800],sha))
+                    emit_stage(job_id,'compile_failed',f'Compile failed: {Path(source).name}',source=source,sha256=sha,error=err[:800])
+                con.commit()
+                emit_heartbeat(job_id,completed,source,stage='compile_pool')
+                pending=con.execute(
+                    "SELECT COUNT(*) FROM indicators WHERE preview_status IN ('pending','compiling') "
+                    "AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')"
+                ).fetchone()[0]
+                emit({'type':'compile_progress','job_id':job_id,'done':completed,'remaining':pending})
+
+    con.close()
+    emit({'ok':True,'job_id':job_id,'component':'compile_pool','finished':True,'compiled_done':completed})
+
+
+def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2):
+    job_id=safe_job_id(job_id);dest=Path(out)
+    con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
+    con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
+    _ensure_preview_queue_schema(con,None)
+    con.execute("UPDATE indicators SET preview_status='compiled',worker_id=NULL WHERE preview_status='rendering' AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')")
+    con.execute(
+        "UPDATE indicators SET preview_status='pending',preview_error='',preview_attempts=0,worker_id=NULL "
+        "WHERE preview_status='failed' AND preview_error LIKE 'MT4 source in .mq5:%'")
+    con.commit()
+    _propagate_existing_ready(con)
+
+    sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
+    rt=clone_runtime(sel,dest,'MT5','render-server')
+    hard_kill(None,rt)
+    mql=rt/'MQL5'
+    files,cur,done,hb=_resident_job_paths(mql)
+    sym=copy_mt5_history(Path(sel['data_dir']),rt)
+    editor=rt/Path(sel['editor']).name
+    terminalexe=rt/Path(sel['terminal']).name
+    _install_resident_ea(mql,editor,job_id)
+
+    for p in (cur,done,hb):
+        try:p.unlink(missing_ok=True)
+        except Exception:pass
+
+    def launch():
+        for p in (cur,done,hb):
+            try:p.unlink(missing_ok=True)
+            except Exception:pass
+        proc=_launch_resident_terminal(rt,terminalexe,sym,job_id)
+        emit_stage(job_id,'resident_terminal_launch','Launching warm MT5 render terminal.',runtime=str(rt))
+        return proc
+
+    proc=launch()
+    last_host_heartbeat=0.0
+    idle_since=time.time()
+
+    try:
+        while True:
+            pause_reason=_worker_pause_reason(con,dest)
+            if pause_reason:
+                emit({'ok':True,'job_id':job_id,'paused':True,'reason':pause_reason})
+                break
+
+            row=_render_server_claim(con,max_attempts)
+            if not row:
+                remaining=con.execute(
+                    "SELECT COUNT(*) FROM indicators WHERE preview_status IN ('pending','compiling','compiled') "
+                    "AND (UPPER(platform) IN ('MQL5','MT5') OR LOWER(path) LIKE '%.mq5' OR LOWER(path) LIKE '%.ex5')"
+                ).fetchone()[0]
+                now=time.time()
+                if now-last_host_heartbeat>=5:
+                    ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
+                    emit_heartbeat(job_id,ready,None,stage='render_server_idle',remaining=remaining)
+                    last_host_heartbeat=now
+                if remaining<=0:break
+                if proc.poll() is not None:
+                    hard_kill(proc,rt);proc=launch()
+                time.sleep(.5);continue
+
+            src=Path(row['path']);sha=row['sha256']
+            cache=_compiled_cache_path(dest,'MT5',sha)
+            if row['id'] is None:raise RuntimeError('Render claim returned no representative row.')
+            if not cache.exists() or not cache.stat().st_size:
+                con.execute("UPDATE indicators SET preview_status='pending',worker_id=NULL,preview_error='compiled cache missing; returned to compile pool' WHERE sha256=?",(sha,));con.commit()
+                continue
+            try:
+                job,staged,binary,_meta=stage(src,mql,'MT5',editor,sel.get('data_dir'),cache)
+            except Exception as e:
+                con.execute(
+                    "UPDATE indicators SET preview_status='pending',preview_error=?,worker_id=NULL WHERE sha256=?",
+                    (('stage compiled cache: '+str(e))[:800],sha));con.commit()
+                continue
+
+            rel=_resident_indicator_rel(job,binary)
+            shot=f'MQLLibRender/out_{job}.png'
+            shotfile=mql/'Files'/shot
+            shotfile.parent.mkdir(parents=True,exist_ok=True)
+            try:shotfile.unlink(missing_ok=True)
+            except Exception:pass
+            win='1' if 'indicator_separate_window' in read_text(src).lower() else '0'
+            con.execute(
+                "UPDATE indicators SET preview_status='rendering',worker_id='render-server',"
+                "preview_attempts=COALESCE(preview_attempts,0)+1 WHERE sha256=?",
+                (sha,));con.commit()
+
+            try:done.unlink(missing_ok=True)
+            except Exception:pass
+            cur.write_text(f"{row['id']}\t{rel}\t{shot}\t{win}",encoding='utf-8')
+            emit_stage(job_id,'resident_job_queued',f'Rendering {src.name} in warm MT5 terminal.',source=str(src),rel=rel)
+
+            deadline=time.time()+max(10,int(hang_timeout))
+            last_beat=None;last_change=time.time();result=None;done_payload=None
+            while time.time()<deadline:
+                done_payload=_read_resident_done(done) if done.exists() else None
+                if done_payload and done_payload.get('id')==str(row['id']):
+                    result=bool(done_payload.get('ok'));break
+                beat=_read_resident_heartbeat(hb)
+                beat_key=(beat or {}).get('beat')
+                if beat_key!=last_beat:
+                    last_beat=beat_key;last_change=time.time()
+                now=time.time()
+                if now-last_host_heartbeat>=5:
+                    ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
+                    emit_heartbeat(job_id,ready,str(src),stage='render_server',ea_beat=beat_key)
+                    last_host_heartbeat=now
+                if now-last_change>max(5,int(hang_timeout)):break
+                if proc.poll() is not None:break
+                time.sleep(.4)
+
+            if result and shotfile.exists() and shotfile.stat().st_size:
+                final=_store_preview_image(shotfile,dest,sha);_make_thumb(final)
+                con.execute(
+                    "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,preview_error='',"
+                    "preview_updated_at=datetime('now'),preview_priority=0,worker_id=NULL WHERE sha256=?",
+                    (str(final),sha,sha));con.commit()
+            else:
+                err='render hang/timeout'
+                if done_payload and not done_payload.get('ok'):
+                    err=f"render failed err={done_payload.get('err')}"
+                _render_server_fail(con,row,err,max_attempts)
+                hard_kill(proc,rt)
+                try:cur.unlink(missing_ok=True)
+                except Exception:pass
+                proc=launch()
+
+            ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
+            total=con.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
+            emit({'type':'progress','job_id':job_id,'done':ready,'total':total})
+            idle_since=time.time()
+    finally:
+        hard_kill(proc,rt)
+        con.close()
+    emit({'ok':True,'job_id':job_id,'finished':True})
+
+
 def mt5_batch_capture_source(manifest_rel, done_marker):
     """One script that renders every indicator listed in a manifest file.
 
@@ -1252,12 +1656,17 @@ def _claim_preview_rows(con,chunk_size,attempts,worker_id):
         con.rollback();raise
 
 
-def render_library(db, out, terminal=None, chunk_size=70, item_timeout=30, max_attempts=2, job_id=None, worker_id=None):
+def render_library(db, out, terminal=None, chunk_size=70, item_timeout=30, max_attempts=2, job_id=None, worker_id=None, static_fast_fail=False):
     job_id=safe_job_id(job_id);worker_id=safe_job_id(worker_id or 'w1');dest=Path(out)
     emit_heartbeat(job_id,0,None,stage='worker_start',worker_id=worker_id)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
     _ensure_preview_queue_schema(con,worker_id)
+    if not static_fast_fail:
+        con.execute(
+            "UPDATE indicators SET preview_status='pending',preview_error='',preview_attempts=0,worker_id=NULL "
+            "WHERE preview_status='failed' AND preview_error LIKE 'MT4 source in .mq5:%'")
+        con.commit()
     _propagate_existing_ready(con)
     _migrate_ready_cache(con,dest)
     _backfill_thumbnails(con)
@@ -1281,7 +1690,7 @@ def render_library(db, out, terminal=None, chunk_size=70, item_timeout=30, max_a
             for r in rows:
                 is_mt5=str(r['platform']).upper() in ('MQL5','MT5') or Path(r['path']).suffix.lower() in ('.mq5','.ex5')
                 if is_mt5:
-                    reason=_mt5_static_fast_fail(r['path'])
+                    reason=_mt5_static_fast_fail(r['path']) if static_fast_fail else None
                     if reason:
                         results[str(r['path'])]={'ok':False,'error':reason,'fast_fail':True}
                         emit_stage(job_id,'static_fast_fail',f'Skipping obvious incompatible MT5 source: {Path(r["path"]).name}',source=str(r['path']),reason=reason)
@@ -1614,6 +2023,11 @@ def self_test():
         'mql_dir_name_mt4':mql_dir_name('MT4')=='MQL4',
         'origin_utf8_decode':decode_origin_bytes(b'C:\\Program Files\\OANDA TMS MT5')=='C:\\Program Files\\OANDA TMS MT5',
         'origin_utf16_decode':decode_origin_bytes(('C:\\Program Files\\MetaTrader 4').encode('utf-16'))=='C:\\Program Files\\MetaTrader 4',
+        'mql_str_backslash_escape':_mql_str(r'MQLLibraryPreview\\abc\\demo')==r'MQLLibraryPreview\\\\abc\\\\demo',
+        'resident_ea_timer':'EventSetMillisecondTimer(150)' in RESIDENT_EA_SOURCE,
+        'resident_ea_job_protocol':all(x in RESIDENT_EA_SOURCE for x in ('current.job','current.done','heartbeat.txt')),
+        'resident_ea_warm_terminal':'TerminalClose' not in RESIDENT_EA_SOURCE,
+        'resident_ea_forward_path_host':_resident_indicator_rel('abc',Path('demo.ex5'))=='MQLLibraryPreview/abc/demo',
     }
     checks.update(self_test_discovery())
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
@@ -1625,7 +2039,9 @@ def main():
     p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal')
     p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
-    p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=70);p.add_argument('--timeout',type=int,default=30);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id');p.add_argument('--worker-id')
+    p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=70);p.add_argument('--timeout',type=int,default=30);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id');p.add_argument('--worker-id');p.add_argument('--static-fast-fail',action='store_true',default=False)
+    p=s.add_parser('render-server');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--attempts',type=int,default=2)
+    p=s.add_parser('compile-pool');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--workers',type=int,default=4);p.add_argument('--job-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
     p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
@@ -1643,7 +2059,9 @@ def main():
         with RenderLock(lock_path,timeout=5.0):
             sel=load_runtime_cache(Path(x.out),'MT5') or choose_runtime('MT5',x.terminal)
             render_mt5_batch(mt5,x.out,sel,job)
-    elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id,x.worker_id)
+    elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id,x.worker_id,x.static_fast_fail)
+    elif x.cmd=='render-server':render_server(x.db,x.out,x.terminal,x.job_id,x.hang_timeout,x.attempts)
+    elif x.cmd=='compile-pool':compile_pool(x.db,x.out,x.terminal,x.workers,x.job_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)

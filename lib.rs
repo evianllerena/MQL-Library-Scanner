@@ -368,7 +368,7 @@ fn run_preview_worker_supervisor(
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     if let Ok(v)=serde_json::from_str::<Value>(&line) {
-                        if v.get("type").and_then(Value::as_str)==Some("heartbeat") {
+                        if matches!(v.get("type").and_then(Value::as_str),Some("heartbeat")|Some("progress")) {
                             hb.store(now_secs(),Ordering::SeqCst);
                         }
                     }
@@ -464,15 +464,94 @@ fn run_preview_worker_supervisor(
     }
 }
 
+fn cli_arg(args:&[String],name:&str)->Option<String> {
+    args.windows(2).find(|w|w[0]==name).map(|w|w[1].clone())
+}
+
+fn run_compile_pool_process(
+    app:tauri::AppHandle,
+    engine_path:PathBuf,
+    args:Vec<String>,
+    db_path:String,
+    remaining:Arc<AtomicUsize>,
+    group_failed:Arc<AtomicBool>
+) {
+    let mut attempts=0u32;
+    let mut final_code=-1i32;
+    loop {
+        attempts+=1;
+        append_log(&db_path,"INFO","preview_compile_pool_start",json!({"args":args,"attempt":attempts}),None);
+        let mut cmd=ProcessCommand::new(&engine_path);
+        cmd.args(&args)
+            .env("PYTHONUTF8","1")
+            .env("PYTHONIOENCODING","utf-8")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let mut child=match cmd.spawn() {
+            Ok(v)=>v,
+            Err(e)=>{
+                append_log(&db_path,"ERROR","preview_compile_pool_spawn_failed",json!({"error":e.to_string(),"attempt":attempts}),None);
+                if attempts>=5 { group_failed.store(true,Ordering::SeqCst); break; }
+                std::thread::sleep(Duration::from_secs(2));continue;
+            }
+        };
+        let stdout=child.stdout.take();
+        let stderr=child.stderr.take();
+        let out_thread=stdout.map(|stdout|{
+            let app_out=app.clone();let db_out=db_path.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    append_log(&db_out,"INFO","preview_compile_pool_stdout",json!({"line":line}),None);
+                    let _=app_out.emit("preview-library-line",json!({"line":line,"component":"compile-pool"}));
+                }
+            })
+        });
+        let err_thread=stderr.map(|stderr|{
+            let app_err=app.clone();let db_err=db_path.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    append_log(&db_err,"ERROR","preview_compile_pool_stderr",json!({"line":line}),None);
+                    let _=app_err.emit("preview-library-stderr",json!({"line":line,"component":"compile-pool"}));
+                }
+            })
+        });
+        final_code=child.wait().ok().and_then(|s|s.code()).unwrap_or(-1);
+        if let Some(t)=out_thread { let _=t.join(); }
+        if let Some(t)=err_thread { let _=t.join(); }
+        if final_code==0 { break; }
+        append_log(&db_path,"WARN","preview_compile_pool_restart",json!({"code":final_code,"attempt":attempts}),None);
+        let _=app.emit("preview-library-restart",json!({"component":"compile-pool","reason":"worker_exit","restart_count":attempts}));
+        if attempts>=5 { group_failed.store(true,Ordering::SeqCst); break; }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let _=app.emit("preview-library-worker-done",json!({"component":"compile-pool","code":final_code}));
+    if final_code!=0 { group_failed.store(true,Ordering::SeqCst); }
+    if remaining.fetch_sub(1,Ordering::SeqCst)==1 {
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
+        let code=if group_failed.load(Ordering::SeqCst){-2}else{0};
+        let _=app.emit("preview-library-done",json!({"code":code}));
+    }
+}
+
 #[tauri::command]
 fn start_preview_library(app: tauri::AppHandle, args: Vec<String>, workers: Option<u32>) -> Result<Value, String> {
-    if args.first().map(String::as_str) != Some("render-library") {
-        return Err("Only render-library is permitted through start_preview_library".into());
+    if args.first().map(String::as_str) != Some("render-server") {
+        return Err("Only render-server is permitted through start_preview_library".into());
     }
     if PREVIEW_LIBRARY_RUNNING.swap(true, Ordering::SeqCst) {
         return Ok(json!({"started":false,"already_running":true}));
     }
-    let db_path=args.windows(2).find(|w|w[0]=="--db").map(|w|w[1].clone()).unwrap_or_default();
+    let db_path=cli_arg(&args,"--db").unwrap_or_default();
+    let out_path=cli_arg(&args,"--out").unwrap_or_default();
+    if db_path.is_empty() || out_path.is_empty() {
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
+        return Err("render-server requires --db and --out".into());
+    }
     let current=match std::env::current_exe() {
         Ok(v)=>v,
         Err(e)=>{PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);return Err(format!("Cannot resolve app executable: {}",e));}
@@ -491,28 +570,53 @@ fn start_preview_library(app: tauri::AppHandle, args: Vec<String>, workers: Opti
         return Err(format!("Preview engine was not found at {}",engine_path.display()));
     }
 
-    let worker_count=workers.unwrap_or(3).clamp(1,4) as usize;
-    let remaining=Arc::new(AtomicUsize::new(worker_count));
+    let compile_workers=workers.unwrap_or(4).clamp(1,8);
+    let job_id=cli_arg(&args,"--job-id").unwrap_or_else(||format!("library-{}",now_ms()));
+    let terminal=cli_arg(&args,"--terminal");
+    let mut compile_args=vec![
+        "compile-pool".to_string(),
+        "--db".to_string(),db_path.clone(),
+        "--out".to_string(),out_path.clone(),
+        "--workers".to_string(),compile_workers.to_string(),
+        "--job-id".to_string(),format!("{}-compile",job_id)
+    ];
+    if let Some(t)=terminal { compile_args.push("--terminal".into());compile_args.push(t); }
+
+    let remaining=Arc::new(AtomicUsize::new(2));
     let group_failed=Arc::new(AtomicBool::new(false));
-    for idx in 0..worker_count {
-        let worker_id=format!("w{}",idx+1);
-        let worker_args=preview_worker_args(&args,&worker_id);
-        let app_worker=app.clone();
-        let engine_worker=engine_path.clone();
-        let db_worker=db_path.clone();
-        let remaining_worker=remaining.clone();
-        let failed_worker=group_failed.clone();
+
+    {
+        let app_render=app.clone();
+        let engine_render=engine_path.clone();
+        let args_render=args.clone();
+        let db_render=db_path.clone();
+        let remaining_render=remaining.clone();
+        let failed_render=group_failed.clone();
         std::thread::spawn(move || {
             run_preview_worker_supervisor(
-                app_worker,engine_worker,worker_args,db_worker,worker_id,
-                remaining_worker,failed_worker
+                app_render,engine_render,args_render,db_render,"render-server".into(),
+                remaining_render,failed_render
+            );
+        });
+    }
+    {
+        let app_compile=app.clone();
+        let engine_compile=engine_path.clone();
+        let db_compile=db_path.clone();
+        let remaining_compile=remaining.clone();
+        let failed_compile=group_failed.clone();
+        std::thread::spawn(move || {
+            run_compile_pool_process(
+                app_compile,engine_compile,compile_args,db_compile,
+                remaining_compile,failed_compile
             );
         });
     }
 
     Ok(json!({
         "started":true,"already_running":false,"engine":engine_path.to_string_lossy(),
-        "workers":worker_count,"heartbeat_timeout_seconds":120,"max_restarts":20
+        "render_server":1,"compile_workers":compile_workers,
+        "heartbeat_timeout_seconds":120,"max_render_restarts":20
     }))
 }
 
@@ -622,6 +726,8 @@ fn preview_queue_stats(db_path:String) -> Result<Value,String> {
         "total":one("SELECT COUNT(*) FROM indicators")?,
         "ready":one("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'")?,
         "pending":one("SELECT COUNT(*) FROM indicators WHERE preview_status='pending'")?,
+        "compiling":one("SELECT COUNT(*) FROM indicators WHERE preview_status='compiling'")?,
+        "compiled":one("SELECT COUNT(*) FROM indicators WHERE preview_status='compiled'")?,
         "rendering":one("SELECT COUNT(*) FROM indicators WHERE preview_status='rendering'")?,
         "failed":one("SELECT COUNT(*) FROM indicators WHERE preview_status='failed'")?,
         "paused":paused
