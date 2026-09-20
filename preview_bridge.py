@@ -1167,6 +1167,7 @@ def _ensure_preview_queue_schema(con):
 
 def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_attempts=2, job_id=None):
     job_id=safe_job_id(job_id);dest=Path(out)
+    emit_heartbeat(job_id,0,None,stage='worker_start')
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=30000')
     _ensure_preview_queue_schema(con)
@@ -1177,6 +1178,8 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_a
     lock=dest.parent/'preview-runtime'/'.render.lock'
     with RenderLock(lock,timeout=5.0):
         while True:
+            ready_now=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
+            emit_heartbeat(job_id,ready_now,None,stage='queue')
             pause_reason=_worker_pause_reason(con,dest)
             if pause_reason:
                 emit({'ok':True,'job_id':job_id,'paused':True,'reason':pause_reason})
@@ -1214,10 +1217,12 @@ def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_a
                     if mt4_sel is None:mt4_sel=load_runtime_cache(dest,'MT4') or choose_runtime('MT4',terminal)
                     for r in mt4_rows:
                         try:
+                            emit_heartbeat(job_id,0,str(r['path']),stage='mt4_render')
                             compiled=_compiled_cache_path(dest,'MT4',r['sha256'])
                             image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id,compiled)
                             final=_store_preview_image(image,dest,r['sha256'])
                             results[str(r['path'])]={'ok':True,'image':str(final),'kind':'MT4'}
+                            emit_heartbeat(job_id,0,str(r['path']),stage='mt4_done')
                         except Exception as e:
                             results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
                 except Exception as e:
