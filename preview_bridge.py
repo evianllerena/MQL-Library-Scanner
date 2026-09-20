@@ -74,6 +74,51 @@ def terminate_tree(proc):
             try:proc.kill()
             except Exception:pass
 
+def hard_kill(proc,runtime_dir):
+    """Force-reap the isolated MetaTrader tree without touching the user's live terminal."""
+    pid=getattr(proc,'pid',None)
+    try:terminate_tree(proc)
+    except Exception:pass
+    if os.name=='nt' and pid:
+        try:
+            subprocess.run(['taskkill','/F','/T','/PID',str(pid)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=CREATE_NO_WINDOW,timeout=8)
+        except Exception:pass
+    try:
+        import psutil
+        rd=str(Path(runtime_dir).resolve()).lower().rstrip('\\/')+os.sep
+        names={'terminal64.exe','terminal.exe','metaeditor64.exe','metaeditor.exe'}
+        for p in psutil.process_iter(['pid','name','exe']):
+            try:
+                exe=str(p.info.get('exe') or '').lower()
+                name=str(p.info.get('name') or '').lower()
+                if exe and exe.startswith(rd) and name in names:
+                    p.kill()
+            except Exception:pass
+    except Exception:pass
+
+
+def emit_heartbeat(job_id,done=0,inflight=None,**details):
+    payload={'type':'heartbeat','job_id':job_id,'ts':time.time(),'done':int(done or 0),'inflight':str(inflight) if inflight else None}
+    payload.update(details);emit(payload)
+
+
+def _prepare_offline_runtime(rt):
+    """Suppress cloned-runtime UI/network distractions that can block unattended batches."""
+    rt=Path(rt)
+    for p in (
+        rt/'profiles'/'lastprofile.ini',
+        rt/'config'/'lastprofile.ini',
+        rt/'config'/'accounts.dat',
+        rt/'config'/'community.ini'
+    ):
+        try:p.unlink(missing_ok=True)
+        except Exception:pass
+    for base in (rt/'bases',):
+        if not base.exists():continue
+        for child in list(base.glob('*/news'))+list(base.glob('*/mail')):
+            try:shutil.rmtree(child,ignore_errors=True)
+            except Exception:pass
+
 def compile_has_errors(text):
     for m in re.finditer(r'(?i)(?:result\s*:\s*)?(\d+)\s+errors?\b',text or ''):
         try:
@@ -395,13 +440,14 @@ def seed_mql_runtime(t,rt,kind):
     if preview_dir.exists():shutil.rmtree(preview_dir,ignore_errors=True)
     return not marker_valid
 
-def clone_runtime(t,out,kind):
+def clone_runtime(t,out,kind,worker_id=None):
     install=Path(t['install_dir'])
     live=Path(t['data_dir'])
     terminal_src=Path(t['terminal'])
     editor_src=Path(t['editor'])
     token=hashlib.sha1((str(terminal_src)+'|'+str(live)).lower().encode()).hexdigest()[:10]
-    rt=out.parent/'preview-runtime'/'v5'/f'{kind.lower()}-{token}'
+    worker_suffix=('-'+safe_job_id(worker_id)) if worker_id else ''
+    rt=out.parent/'preview-runtime'/'v5'/f'{kind.lower()}-{token}{worker_suffix}'
     stamp=f'v5:{terminal_src.stat().st_size}:{terminal_src.stat().st_mtime_ns}:{editor_src.stat().st_size}:{editor_src.stat().st_mtime_ns}:{str(live).lower()}'
     marker=rt/'.stamp'
     if not rt.exists() or not marker.exists() or marker.read_text(errors='ignore')!=stamp:
@@ -518,8 +564,9 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
     if marker.exists():
         emit_stage(job_id,'mt5_prime_cached','MT5 preview runtime is already initialized.')
         return
+    _prepare_offline_runtime(rt)
     cfg=rt/f'mql-prime-{safe_job_id(job_id)}.ini'
-    cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={symbol}\nPeriod=H1\n',encoding='utf-8')
+    cfg.write_text(f'[Common]\nNewsEnable=0\n\n[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={symbol}\nPeriod=H1\n',encoding='utf-8')
     emit_stage(job_id,'mt5_prime_start','Initializing isolated MT5 runtime. First use can take longer while MetaTrader prepares its MQL5 files.')
     proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
     start=time.monotonic()
@@ -531,9 +578,13 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
     saw_meta_activity_after_recompile=False
     settled=False
     announced_recompile=False
+    last_heartbeat=start-10
     try:
         while time.monotonic()-start<120:
             now=time.monotonic()
+            if now-last_heartbeat>=5:
+                emit_heartbeat(job_id,0,None,stage='mt5_prime')
+                last_heartbeat=now
             hide_pid(proc.pid)
             if proc.poll() is not None and now-start<5:
                 break
@@ -575,7 +626,7 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
             else:
                 time.sleep(.5)
     finally:
-        terminate_tree(proc)
+        hard_kill(proc,rt)
     if not settled:
         emit_stage(job_id,'mt5_prime_timeout','MT5 runtime initialization did not reach a verified idle state.',elapsed_ms=round((time.monotonic()-start)*1000))
         raise RuntimeError('MT5 preview runtime initialization timed out before MetaTrader became idle.')
@@ -828,7 +879,7 @@ def mt5_batch_capture_source_v2(manifest_rel, cur_prefix, done_marker):
         '   int h=iCustom(_Symbol,_Period,rel);\n'
         '   if(h!=INVALID_HANDLE){int w=win; if(w==1)w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);\n'
         '     if(ChartIndicatorAdd(0,w,h)){ChartRedraw();\n'
-        '       for(int i=0;i<20;i++){if(BarsCalculated(h)>=0)break;Sleep(200);} Sleep(800);\n'
+        '       for(int i=0;i<10;i++){if(BarsCalculated(h)>=0)break;Sleep(150);} Sleep(400);\n'
         '       ChartScreenShot(0,shot,1200,720,ALIGN_RIGHT);} IndicatorRelease(h);}\n'
         f'  _mark(shot+".ok");\n'
         '   idx++; Sleep(120);\n'
@@ -973,6 +1024,7 @@ def _render_chunk(rows, dest, sel, rt, sym, job_id, item_timeout):
     results={};plan=[]
     for i,row in enumerate(rows):
         src=Path(row['path'])
+        emit_heartbeat(job_id,i,str(src),stage='compile')
         try:
             emit_stage(job_id,'indicator_compile',f'[{i+1}/{len(rows)}] Compiling {src.name}',source=str(src))
             cache=_compiled_cache_path(dest,'MT5',row['sha256'])
@@ -988,191 +1040,328 @@ def _render_chunk(rows, dest, sel, rt, sym, job_id, item_timeout):
         except Exception as e:
             results[str(src)]={'ok':False,'error':f'{type(e).__name__}: {e}'}
 
-    if not plan:return results
+    meta={'untouched':[],'hung_source':None,'timeout_reason':None}
+    if not plan:return results,meta
+
     manifest_name=f'mqllib_chunk_{job_id}.txt'
     cur_prefix=f'mqllib_chunk_{job_id}_'
     done_marker=f'mqllib_chunk_{job_id}.done'
     cap=scripts/f'MQLLibraryChunkCapture_{job_id}.mq5'
-    cap.write_text(mt5_batch_capture_source_v2(manifest_name,cur_prefix,done_marker),encoding='utf-8')
-    emit_stage(job_id,'capture_compile','Compiling watchdog-enabled MT5 batch capture script.')
-    built,_,log=compile_file(editor,cap,mql)
-    if not built:
-        err='Batch capture script failed to compile. '+(log or '')[-1600:]
-        for item in plan:results.setdefault(item['source'],{'ok':False,'error':err})
-        return results
+    cap_source=mt5_batch_capture_source_v2(manifest_name,cur_prefix,done_marker)
+    built=cap.with_suffix('.ex5')
+    if not built.exists() or not built.stat().st_size or read_text(cap)!=cap_source:
+        cap.write_text(cap_source,encoding='utf-8')
+        emit_stage(job_id,'capture_compile','Compiling watchdog-enabled MT5 batch capture script.')
+        built,_,log=compile_file(editor,cap,mql)
+        if not built:
+            err='Batch capture script failed to compile. '+(log or '')[-1600:]
+            for item in plan:results.setdefault(item['source'],{'ok':False,'error':err})
+            return results,meta
+    else:
+        emit_stage(job_id,'capture_compile_cached','Reusing compiled MT5 batch capture script.')
 
-    remaining=list(plan);restart=0
-    while remaining:
-        restart+=1
-        (files/manifest_name).write_text('\n'.join(f"{x['rel']}\t{x['shot']}\t{x['win']}" for x in remaining),encoding='utf-8')
-        for p in files.glob(cur_prefix+'*.cur'):
-            try:p.unlink()
-            except Exception:pass
-        for item in remaining:
-            for p in (files/(item['shot']+'.ok'),item['shot_path']):
-                try:p.unlink(missing_ok=True)
-                except Exception:pass
-        done_path=files/done_marker
-        try:done_path.unlink(missing_ok=True)
+    (files/manifest_name).write_text('\n'.join(f"{x['rel']}\t{x['shot']}\t{x['win']}" for x in plan),encoding='utf-8')
+    for p in files.glob(cur_prefix+'*.cur'):
+        try:p.unlink()
         except Exception:pass
-        cfg=rt/f'mql-chunk-{job_id}-{restart}.ini'
-        cfg.write_text(
-            '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
-            f'[StartUp]\nSymbol={sym}\nPeriod=H1\nScript={cap.stem}\nShutdownTerminal=1\n',
-            encoding='utf-8')
-        emit_stage(job_id,'terminal_launch',f'Launching MT5 for preview chunk ({len(remaining)} items).',chunk_size=len(remaining),restart=restart)
-        proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
-        active_idx=None;active_since=time.monotonic();done_count=0;timed_out=False
-        while True:
-            completed=[i for i,x in enumerate(remaining) if (files/(x['shot']+'.ok')).exists()]
-            if len(completed)!=done_count:
-                done_count=len(completed);active_since=time.monotonic()
-                emit_stage(job_id,'item_progress',f'{done_count}/{len(remaining)} items completed in current chunk.',done=done_count,total=len(remaining))
-            started=[]
-            for i in range(len(remaining)):
-                if (files/f'{cur_prefix}{i}.cur').exists():started.append(i)
-            newest=max(started) if started else None
-            if newest!=active_idx:
-                active_idx=newest;active_since=time.monotonic()
-            if done_path.exists() or proc.poll() is not None:break
-            if active_idx is not None and active_idx not in completed and time.monotonic()-active_since>=max(5,int(item_timeout)):
-                timed_out=True;break
-            time.sleep(.35)
-        terminate_tree(proc)
+    for item in plan:
+        for p in (files/(item['shot']+'.ok'),item['shot_path']):
+            try:p.unlink(missing_ok=True)
+            except Exception:pass
+    done_path=files/done_marker
+    try:done_path.unlink(missing_ok=True)
+    except Exception:pass
 
-        completed_idx={i for i,x in enumerate(remaining) if (files/(x['shot']+'.ok')).exists()}
-        for i in sorted(completed_idx):
-            item=remaining[i]
-            if item['source'] in results:continue
-            if item['shot_path'].exists() and item['shot_path'].stat().st_size:
-                final=_store_preview_image(item['shot_path'],dest,item['sha256'])
-                results[item['source']]={'ok':True,'image':str(final),'kind':'MT5'}
-            else:
-                results[item['source']]={'ok':False,'error':'No screenshot produced (indicator could not load on the chart).'}
+    _prepare_offline_runtime(rt)
+    cfg=rt/f'mql-chunk-{job_id}.ini'
+    cfg.write_text(
+        '[Common]\nNewsEnable=0\n\n'
+        '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
+        f'[StartUp]\nSymbol={sym}\nPeriod=H1\nScript={cap.stem}\nShutdownTerminal=1\n',
+        encoding='utf-8')
+    emit_stage(job_id,'terminal_launch',f'Launching MT5 for preview chunk ({len(plan)} items).',chunk_size=len(plan))
+    proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
 
-        if done_path.exists():
-            for i,item in enumerate(remaining):
-                results.setdefault(item['source'],{'ok':False,'error':'No completion marker was produced.'})
-            break
+    timeout=max(5,int(item_timeout))
+    chunk_budget=max(timeout+10,8*len(plan)+30)
+    deadline=time.time()+chunk_budget
+    last_shot=time.time()
+    last_heartbeat=0.0
+    done_count=0
+    active_idx=None
+    timeout_reason=None
+    terminal_exited=False
 
-        if timed_out:
-            bad=active_idx if active_idx is not None else 0
-            bad=max(0,min(bad,len(remaining)-1))
-            hung=remaining[bad]
-            results[hung['source']]={'ok':False,'error':f'Preview watchdog timeout after {item_timeout}s.'}
-            emit_stage(job_id,'item_timeout',f'Watchdog stopped a hung preview: {Path(hung["source"]).name}',source=hung['source'],timeout=item_timeout)
-            remaining=remaining[bad+1:]
-            continue
+    while time.time()<deadline:
+        now=time.time()
+        completed=[i for i,x in enumerate(plan) if (files/(x['shot']+'.ok')).exists()]
+        if len(completed)>done_count:
+            done_count=len(completed);last_shot=now
+            emit_stage(job_id,'item_progress',f'{done_count}/{len(plan)} items completed in current chunk.',done=done_count,total=len(plan))
+        started=[i for i in range(len(plan)) if (files/f'{cur_prefix}{i}.cur').exists()]
+        newest=max(started) if started else None
+        if newest is not None:active_idx=newest
+        inflight=plan[active_idx]['source'] if active_idx is not None and active_idx<len(plan) else None
+        if now-last_heartbeat>=5:
+            emit_heartbeat(job_id,done_count,inflight,stage='render',chunk_size=len(plan))
+            last_heartbeat=now
+        if done_path.exists():break
+        if proc.poll() is not None:
+            terminal_exited=True;break
+        if now-last_shot>timeout:
+            timeout_reason='item_timeout';break
+        time.sleep(.5)
+    else:
+        timeout_reason='chunk_deadline'
 
-        pending=[i for i in range(len(remaining)) if i not in completed_idx]
-        if not pending:break
-        bad=pending[0]
-        item=remaining[bad]
+    hard_kill(proc,rt)
+
+    completed_idx={i for i,x in enumerate(plan) if (files/(x['shot']+'.ok')).exists()}
+    for i in sorted(completed_idx):
+        item=plan[i]
+        if item['source'] in results:continue
+        if item['shot_path'].exists() and item['shot_path'].stat().st_size:
+            final=_store_preview_image(item['shot_path'],dest,item['sha256'])
+            results[item['source']]={'ok':True,'image':str(final),'kind':'MT5'}
+        else:
+            results[item['source']]={'ok':False,'error':'No screenshot produced (indicator could not load on the chart).'}
+
+    pending=[i for i in range(len(plan)) if i not in completed_idx]
+    if timeout_reason and pending:
+        if active_idx is not None and active_idx in pending:bad=active_idx
+        else:bad=pending[0]
+        hung=plan[bad]
+        results[hung['source']]={'ok':False,'error':f'Preview watchdog {timeout_reason} after {timeout if timeout_reason=="item_timeout" else chunk_budget}s.'}
+        meta['hung_source']=hung['source'];meta['timeout_reason']=timeout_reason
+        meta['untouched']=[plan[i]['source'] for i in pending if i>bad]
+        emit_stage(job_id,'item_timeout',f'Watchdog hard-killed hung preview: {Path(hung["source"]).name}',source=hung['source'],timeout=timeout,reason=timeout_reason,untouched=len(meta['untouched']))
+    elif terminal_exited and pending:
+        bad=pending[0];item=plan[bad]
         results[item['source']]={'ok':False,'error':'MetaTrader exited before the preview completed.'}
-        remaining=remaining[bad+1:]
+        meta['untouched']=[plan[i]['source'] for i in pending if i>bad]
+    elif done_path.exists():
+        for i in pending:
+            item=plan[i]
+            results.setdefault(item['source'],{'ok':False,'error':'No screenshot produced before batch completion.'})
+    elif pending:
+        bad=pending[0];item=plan[bad]
+        results[item['source']]={'ok':False,'error':'Preview chunk ended before the item completed.'}
+        meta['untouched']=[plan[i]['source'] for i in pending if i>bad]
 
     try:
         preview_tree=mql/'Indicators'/'MQLLibraryPreview'
         shutil.rmtree(preview_tree,ignore_errors=True)
         preview_tree.mkdir(parents=True,exist_ok=True)
     except Exception:pass
-    return results
+    return results,meta
 
-
-def _ensure_preview_queue_schema(con):
+def _ensure_preview_queue_schema(con,worker_id=None):
     cols={r[1] for r in con.execute('PRAGMA table_info(indicators)')}
     additions={
         'preview_status':"TEXT DEFAULT 'pending'",
         'preview_path':'TEXT','preview_hash':'TEXT',
         'preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT',
-        'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0'
+        'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0','worker_id':'TEXT'
     }
     for name,decl in additions.items():
         if name not in cols:con.execute(f'ALTER TABLE indicators ADD COLUMN {name} {decl}')
-    con.execute("UPDATE indicators SET preview_status='pending' WHERE preview_status='rendering'")
-    con.execute("UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='' "
+    if worker_id:
+        con.execute("UPDATE indicators SET preview_status='pending',worker_id=NULL WHERE preview_status='rendering' AND (worker_id=? OR worker_id IS NULL)",(worker_id,))
+    else:
+        con.execute("UPDATE indicators SET preview_status='pending',worker_id=NULL WHERE preview_status='rendering' AND worker_id IS NULL")
+    con.execute("UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='',worker_id=NULL "
                 "WHERE preview_status='ready' AND COALESCE(preview_hash,'')!=COALESCE(sha256,'')")
     con.commit()
 
 
-def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_attempts=2, job_id=None):
-    job_id=safe_job_id(job_id);dest=Path(out)
+def _mt5_static_fast_fail(path):
+    src=Path(path)
+    if src.suffix.lower()!='.mq5':return None
+    text=read_text(src)
+    market=bool(re.search(r'\bMarketInfo\s*\(',text))
+    mode=bool(re.search(r'\bMODE_(?:BID|ASK|POINT|DIGITS|SPREAD|STOPLEVEL|TICKVALUE|TICKSIZE|LOTSIZE|MINLOT|MAXLOT|LOTSTEP)\b',text))
+    bare=bool(re.search(r'\b(?:Open|High|Low|Close|Volume)\s*\[',text))
+    extmap=bool(re.search(r'\bExtMapBuffer\w*\b',text))
+    if market and (mode or bare):
+        return 'MT4 source in .mq5: MarketInfo/MODE or bare-series pattern'
+    if extmap and market:
+        return 'MT4 source in .mq5: decompiled MT4 buffer/MarketInfo pattern'
+    return None
+
+
+def _propagate_existing_ready(con):
+    try:
+        ready=con.execute(
+            "SELECT sha256,preview_path,preview_hash,preview_updated_at FROM indicators "
+            "WHERE preview_status='ready' AND COALESCE(sha256,'')<>'' GROUP BY sha256"
+        ).fetchall()
+        for r in ready:
+            con.execute(
+                "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,preview_error='',"
+                "preview_updated_at=?,worker_id=NULL WHERE sha256=? AND preview_status!='ready'",
+                (r['preview_path'],r['preview_hash'],r['preview_updated_at'],r['sha256']))
+        con.commit()
+    except Exception:pass
+
+
+def _claim_preview_rows(con,chunk_size,attempts,worker_id):
+    size=max(1,min(int(chunk_size),200))
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        con.execute(
+            "UPDATE indicators SET preview_status='failed',worker_id=NULL "
+            "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)>=?",
+            (attempts,))
+        rows=con.execute(
+            """
+            WITH grouped AS (
+              SELECT sha256,MIN(id) AS id,MAX(COALESCE(preview_priority,0)) AS pr,
+                     MAX(COALESCE(user_favorite,0)) AS fav
+              FROM indicators i
+              WHERE preview_status='pending'
+                AND COALESCE(preview_attempts,0)<?
+                AND COALESCE(sha256,'')<>''
+                AND NOT EXISTS(
+                  SELECT 1 FROM indicators x
+                  WHERE x.sha256=i.sha256 AND x.preview_status IN ('rendering','ready')
+                )
+              GROUP BY sha256
+              ORDER BY pr DESC,fav DESC,id
+              LIMIT ?
+            )
+            SELECT i.id,i.path,i.platform,i.sha256,COALESCE(i.preview_attempts,0) AS preview_attempts
+            FROM grouped g JOIN indicators i ON i.id=g.id
+            ORDER BY g.pr DESC,g.fav DESC,i.id
+            """,
+            (attempts,size)).fetchall()
+        if len(rows)<size:
+            extra=con.execute(
+                "SELECT id,path,platform,sha256,COALESCE(preview_attempts,0) AS preview_attempts "
+                "FROM indicators WHERE preview_status='pending' AND COALESCE(preview_attempts,0)<? "
+                "AND COALESCE(sha256,'')='' ORDER BY COALESCE(preview_priority,0) DESC,user_favorite DESC,id LIMIT ?",
+                (attempts,size-len(rows))).fetchall()
+            rows=list(rows)+list(extra)
+        for r in rows:
+            con.execute(
+                "UPDATE indicators SET preview_status='rendering',worker_id=?,"
+                "preview_attempts=COALESCE(preview_attempts,0)+1 WHERE id=? AND preview_status='pending'",
+                (worker_id,r['id']))
+        con.commit()
+        return rows
+    except Exception:
+        con.rollback();raise
+
+
+def render_library(db, out, terminal=None, chunk_size=70, item_timeout=30, max_attempts=2, job_id=None, worker_id=None):
+    job_id=safe_job_id(job_id);worker_id=safe_job_id(worker_id or 'w1');dest=Path(out)
+    emit_heartbeat(job_id,0,None,stage='worker_start',worker_id=worker_id)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
-    con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=30000')
-    _ensure_preview_queue_schema(con)
+    con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
+    _ensure_preview_queue_schema(con,worker_id)
+    _propagate_existing_ready(con)
     _migrate_ready_cache(con,dest)
     _backfill_thumbnails(con)
     mt5_sel=mt5_rt=mt5_sym=None
     mt4_sel=None
-    lock=dest.parent/'preview-runtime'/'.render.lock'
+    lock=dest.parent/'preview-runtime'/f'.render-{worker_id}.lock'
     with RenderLock(lock,timeout=5.0):
         while True:
+            ready_now=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
+            emit_heartbeat(job_id,ready_now,None,stage='queue',worker_id=worker_id)
             pause_reason=_worker_pause_reason(con,dest)
             if pause_reason:
-                emit({'ok':True,'job_id':job_id,'paused':True,'reason':pause_reason})
+                emit({'ok':True,'job_id':job_id,'worker_id':worker_id,'paused':True,'reason':pause_reason})
                 break
             attempts=max(1,min(int(max_attempts),10))
-            con.execute("UPDATE indicators SET preview_status='failed' WHERE preview_status='pending' AND COALESCE(preview_attempts,0)>=?",(attempts,))
-            con.commit()
-            rows=con.execute(
-                "SELECT id,path,platform,sha256 FROM indicators "
-                "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)<? "
-                "ORDER BY COALESCE(preview_priority,0) DESC,user_favorite DESC,id LIMIT ?",
-                (attempts,max(1,min(int(chunk_size),200)))).fetchall()
+            rows=_claim_preview_rows(con,chunk_size,attempts,worker_id)
             if not rows:break
-            ids=[r['id'] for r in rows]
-            con.executemany(
-                "UPDATE indicators SET preview_status='rendering',"
-                "preview_attempts=COALESCE(preview_attempts,0)+1 WHERE id=?",
-                [(i,) for i in ids]);con.commit()
-            results={}
-            mt5_rows=[r for r in rows if str(r['platform']).upper() in ('MQL5','MT5') or Path(r['path']).suffix.lower() in ('.mq5','.ex5')]
-            mt4_rows=[r for r in rows if r not in mt5_rows]
+
+            results={};chunk_meta={'untouched':[],'hung_source':None,'timeout_reason':None}
+            mt5_rows=[];mt4_rows=[]
+            for r in rows:
+                is_mt5=str(r['platform']).upper() in ('MQL5','MT5') or Path(r['path']).suffix.lower() in ('.mq5','.ex5')
+                if is_mt5:
+                    reason=_mt5_static_fast_fail(r['path'])
+                    if reason:
+                        results[str(r['path'])]={'ok':False,'error':reason,'fast_fail':True}
+                        emit_stage(job_id,'static_fast_fail',f'Skipping obvious incompatible MT5 source: {Path(r["path"]).name}',source=str(r['path']),reason=reason)
+                    else:
+                        mt5_rows.append(r)
+                else:
+                    mt4_rows.append(r)
+
             if mt5_rows:
                 try:
                     if mt5_sel is None:
                         mt5_sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
-                        mt5_rt=clone_runtime(mt5_sel,dest,'MT5')
+                        mt5_rt=clone_runtime(mt5_sel,dest,'MT5',worker_id)
                         mt5_sym=copy_mt5_history(Path(mt5_sel['data_dir']),mt5_rt)
                         prime_mt5_runtime(mt5_rt,mt5_rt/Path(mt5_sel['terminal']).name,mt5_sym,job_id)
-                    results.update(_render_chunk(mt5_rows,dest,mt5_sel,mt5_rt,mt5_sym,job_id,item_timeout))
+                    chunk_results,chunk_meta=_render_chunk(mt5_rows,dest,mt5_sel,mt5_rt,mt5_sym,job_id,item_timeout)
+                    results.update(chunk_results)
                 except Exception as e:
                     for r in mt5_rows:results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
+
             if mt4_rows:
                 try:
                     if mt4_sel is None:mt4_sel=load_runtime_cache(dest,'MT4') or choose_runtime('MT4',terminal)
                     for r in mt4_rows:
                         try:
+                            emit_heartbeat(job_id,0,str(r['path']),stage='mt4_render',worker_id=worker_id)
                             compiled=_compiled_cache_path(dest,'MT4',r['sha256'])
-                            image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id,compiled)
+                            image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id,compiled,worker_id)
                             final=_store_preview_image(image,dest,r['sha256'])
                             results[str(r['path'])]={'ok':True,'image':str(final),'kind':'MT4'}
+                            emit_heartbeat(job_id,0,str(r['path']),stage='mt4_done',worker_id=worker_id)
                         except Exception as e:
                             results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
                 except Exception as e:
                     for r in mt4_rows:results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
 
+            untouched=set(chunk_meta.get('untouched') or [])
             for r in rows:
-                res=results.get(str(r['path']))
+                path=str(r['path']);sha=r['sha256']
+                if path in untouched:
+                    con.execute(
+                        "UPDATE indicators SET preview_status='pending',worker_id=NULL,"
+                        "preview_attempts=CASE WHEN COALESCE(preview_attempts,0)>0 THEN preview_attempts-1 ELSE 0 END,"
+                        "preview_error='watchdog deferred untouched item' WHERE id=? AND worker_id=?",
+                        (r['id'],worker_id))
+                    continue
+                res=results.get(path)
+                attempt_num=int(r['preview_attempts'] or 0)+1
                 if res and res.get('ok'):
                     _make_thumb(res['image'])
-                    con.execute(
-                        "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,"
-                        "preview_error='',preview_updated_at=datetime('now'),preview_priority=0 WHERE id=?",
-                        (res['image'],r['sha256'],r['id']))
+                    if sha:
+                        con.execute(
+                            "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,preview_error='',"
+                            "preview_updated_at=datetime('now'),preview_priority=0,worker_id=NULL WHERE sha256=?",
+                            (res['image'],sha,sha))
+                    else:
+                        con.execute(
+                            "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,preview_error='',"
+                            "preview_updated_at=datetime('now'),preview_priority=0,worker_id=NULL WHERE id=?",
+                            (res['image'],sha,r['id']))
                 else:
                     err=(res or {}).get('error','render timeout/hang')
-                    con.execute(
-                        "UPDATE indicators SET preview_status=CASE WHEN COALESCE(preview_attempts,0)>=? "
-                        "THEN 'failed' ELSE 'pending' END,preview_error=? WHERE id=?",
-                        (attempts,str(err)[:800],r['id']))
+                    final_fail=bool((res or {}).get('fast_fail')) or attempt_num>=attempts
+                    if final_fail and sha:
+                        con.execute(
+                            "UPDATE indicators SET preview_status='failed',preview_error=?,preview_updated_at=datetime('now'),"
+                            "worker_id=NULL WHERE sha256=?",
+                            (str(err)[:800],sha))
+                    else:
+                        con.execute(
+                            "UPDATE indicators SET preview_status=?,preview_error=?,worker_id=NULL WHERE id=?",
+                            ('failed' if final_fail else 'pending',str(err)[:800],r['id']))
             con.commit()
             ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
             total=con.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
-            emit({'type':'progress','job_id':job_id,'done':ready,'total':total})
+            emit({'type':'progress','job_id':job_id,'worker_id':worker_id,'done':ready,'total':total})
+
     _cleanup_cache_files(con,dest)
     con.close()
-    emit({'ok':True,'job_id':job_id,'finished':True})
+    emit({'ok':True,'job_id':job_id,'worker_id':worker_id,'finished':True})
 
 def render_mt4(src,out,t,job_id,compiled_cache=None):
     emit_stage(job_id,'runtime_clone','Preparing isolated MT4 runtime.')
@@ -1436,7 +1625,7 @@ def main():
     p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal')
     p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
-    p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=40);p.add_argument('--timeout',type=int,default=45);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id')
+    p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=70);p.add_argument('--timeout',type=int,default=30);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id');p.add_argument('--worker-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
     p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
@@ -1454,7 +1643,7 @@ def main():
         with RenderLock(lock_path,timeout=5.0):
             sel=load_runtime_cache(Path(x.out),'MT5') or choose_runtime('MT5',x.terminal)
             render_mt5_batch(mt5,x.out,sel,job)
-    elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id)
+    elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id,x.worker_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)

@@ -150,6 +150,19 @@ jobs:
           if($bridge -match "copytree\(src,dst,dirs_exist_ok=True,ignore=ign\)"){throw 'Whole MQL tree seed must not return'}
           if($bridge -notmatch 'ShutdownTerminal=1'){throw 'MT5 shutdown config must use numeric documented value'}
           if($bridge -notmatch 'preview_engine_stage' -and $ui -notmatch 'preview_engine_stage'){throw 'Preview stage logging missing'}
+          if($bridge -notmatch 'def hard_kill' -or $bridge -notmatch 'psutil.process_iter'){throw 'Runtime-scoped MetaTrader hard kill missing'}
+          if($bridge -notmatch 'chunk_budget' -or $bridge -notmatch 'last_shot'){throw 'Hard chunk/no-progress deadline missing'}
+          if($bridge -notmatch 'emit_heartbeat' -or $bridge -notmatch "'type':'heartbeat'"){throw 'Preview worker heartbeat missing'}
+          if($bridge -notmatch 'BEGIN IMMEDIATE' -or $bridge -notmatch 'GROUP BY sha256'){throw 'Atomic SHA256 dedup claim missing'}
+          if($bridge -notmatch 'worker_id' -or $bridge -notmatch 'clone_runtime\(mt5_sel,dest,''MT5'',worker_id\)'){throw 'Worker-owned isolated runtime missing'}
+          if($bridge -notmatch '_mt5_static_fast_fail'){throw 'Known-bad MT5 static prefilter missing'}
+          $lib=Get-Content src-tauri/src/lib.rs -Raw
+          if($lib -notmatch 'preview_library_heartbeat_timeout' -or $lib -notmatch 'preview_library_restart'){throw 'Supervisor heartbeat restart missing'}
+          if($lib -notmatch 'AtomicUsize' -or $lib -notmatch 'worker_count'){throw 'Parallel worker supervisor missing'}
+          $main=Get-Content ui/main.js -Raw
+          if($main -notmatch 'preview.workers' -or $main -notmatch 'defaultPreviewWorkers'){throw 'Adaptive worker settings missing'}
+          $req=Get-Content engine/requirements-build.txt -Raw
+          if($req -notmatch '(?m)^psutil'){throw 'psutil build dependency missing'}
           python engine/preview_control.py self-test
           if($LASTEXITCODE -ne 0){throw 'Preview control self-test failed'}
 
