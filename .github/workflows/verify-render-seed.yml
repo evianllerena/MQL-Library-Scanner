@@ -1,0 +1,355 @@
+name: Verify Render Terminal Seed
+# PR validation sync
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [fix/render-terminal-seed-handshake]
+    paths:
+      - '.github/workflows/windows-beta.yml'
+      - '.github/workflows/verify-render-seed.yml'
+      - 'MQL-Indicator-Library-Repo-Ready.zip'
+      - 'engine.py'
+      - 'engine_core.py'
+      - 'requirements-build.txt'
+      - 'preview_bridge.py'
+      - 'preview_batch.py'
+      - 'preview_control.py'
+      - 'main.js'
+      - 'preview_ui.js'
+      - 'index.html'
+      - 'styles.css'
+      - 'Cargo.toml'
+      - 'lib.rs'
+      - 'main.rs'
+      - 'default.json'
+      - 'package.json'
+      - 'tauri.conf.json'
+      - 'windows/**'
+  push:
+    branches: [fix/render-terminal-seed-handshake]
+    paths:
+      - '.github/workflows/windows-beta.yml'
+      - '.github/workflows/verify-render-seed.yml'
+      - 'MQL-Indicator-Library-Repo-Ready.zip'
+      - 'engine.py'
+      - 'engine_core.py'
+      - 'requirements-build.txt'
+      - 'preview_bridge.py'
+      - 'preview_batch.py'
+      - 'preview_control.py'
+      - 'main.js'
+      - 'preview_ui.js'
+      - 'index.html'
+      - 'styles.css'
+      - 'Cargo.toml'
+      - 'lib.rs'
+      - 'main.rs'
+      - 'default.json'
+      - 'package.json'
+      - 'tauri.conf.json'
+      - 'windows/**'
+
+concurrency:
+  group: windows-beta-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract baseline
+        shell: pwsh
+        run: |
+          $work=Join-Path $env:RUNNER_TEMP 'mql-indicator-library-build'
+          if(Test-Path $work){Remove-Item -Recurse -Force $work}
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Expand-Archive 'MQL-Indicator-Library-Repo-Ready.zip' $work -Force
+          $app=Get-ChildItem $work -Directory | Select-Object -First 1
+          if(-not $app){throw 'Baseline app folder missing'}
+          "APP_DIR=$($app.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Apply 0.5.14 source
+        shell: pwsh
+        run: |
+          $r=$env:GITHUB_WORKSPACE
+          Set-Location $env:APP_DIR
+          Copy-Item "$r/engine.py" 'engine/engine.py' -Force
+          Copy-Item "$r/engine_core.py" 'engine/engine_core.py' -Force
+          Copy-Item "$r/requirements-build.txt" 'engine/requirements-build.txt' -Force
+          Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
+          Copy-Item "$r/preview_batch.py" 'engine/preview_batch.py' -Force
+          Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
+          Copy-Item "$r/main.js" 'ui/main.js' -Force
+          Copy-Item "$r/preview_ui.js" 'ui/preview_ui.js' -Force
+          Copy-Item "$r/index.html" 'index.html' -Force
+          Copy-Item "$r/styles.css" 'ui/styles.css' -Force
+          Copy-Item "$r/Cargo.toml" 'src-tauri/Cargo.toml' -Force
+          Copy-Item "$r/lib.rs" 'src-tauri/src/lib.rs' -Force
+          Copy-Item "$r/main.rs" 'src-tauri/src/main.rs' -Force
+          Copy-Item "$r/default.json" 'src-tauri/capabilities/default.json' -Force
+          Copy-Item "$r/package.json" 'package.json' -Force
+          Copy-Item "$r/tauri.conf.json" 'src-tauri/tauri.conf.json' -Force
+          if(Test-Path "$r/windows"){
+            New-Item -ItemType Directory -Force -Path 'src-tauri/windows' | Out-Null
+            Copy-Item "$r/windows/*" 'src-tauri/windows/' -Force
+          }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate source
+        shell: pwsh
+        run: |
+          Set-Location $env:APP_DIR
+          python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py
+          if($LASTEXITCODE -ne 0){throw 'Python source validation failed'}
+          node --check ui/main.js
+          if($LASTEXITCODE -ne 0){throw 'main.js syntax validation failed'}
+          node --check ui/preview_ui.js
+          if($LASTEXITCODE -ne 0){throw 'preview_ui.js syntax validation failed'}
+          $packageVersion=(Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion=[regex]::Match((Get-Content src-tauri/Cargo.toml -Raw),'(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if($packageVersion -ne '0.5.14' -or $tauriVersion -ne '0.5.14' -or $cargoVersion -ne '0.5.14'){throw "Version mismatch package=$packageVersion tauri=$tauriVersion cargo=$cargoVersion"}
+          $ui=Get-Content ui/preview_ui.js -Raw
+          if($ui -notmatch 'Clear Application / Start Fresh'){throw 'Clear application control source missing'}
+          if($ui -match 'Create Archive Backup'){throw 'Archive UI must not ship'}
+          if($ui -match '\bconfirm\s*\('){throw 'Native confirm dialog remains in preview UI'}
+          if($ui -notmatch 'existing\?\.dataset\.source===source'){throw 'Preview reinjection guard missing'}
+          if($ui -notmatch 'queueCancellation'){throw 'Single-flight cancellation barrier missing'}
+          if($ui -notmatch 'preview_cancel_result'){throw 'Verified cancellation diagnostics missing'}
+          if($ui -notmatch 'ui_event_loop_stall'){throw 'UI stall watchdog missing'}
+          if($ui -notmatch '--job-id'){throw 'Per-job preview identity missing'}
+          if($ui -notmatch 'preview_engine_stage'){throw 'Preview engine stage diagnostics missing'}
+          if($ui -notmatch 'preview_preflight_start' -or $ui -notmatch 'preview_preflight_failed' -or $ui -notmatch 'preview_discovery_stage'){throw 'Preview runtime preflight/discovery logging missing'}
+          if($ui -notmatch 'mt5_full_recompile'){throw 'MT5 initialization stage UI missing'}
+          if($ui -notmatch 'terminal_selected'){throw 'Bound terminal selection status missing'}
+          python engine/preview_bridge.py detect
+          if($LASTEXITCODE -ne 0){throw 'Preview detector failed'}
+          python engine/preview_bridge.py self-test
+          if($LASTEXITCODE -ne 0){throw 'Preview self-test failed'}
+          $bridge=Get-Content engine/preview_bridge.py -Raw
+          if($bridge -notmatch 'resolve_mt5_render_data_dir' -or $bridge -notmatch 'seed_render_runtime_from_data_dir'){throw 'FIX 1 render seed helpers missing'}
+          if($bridge -notmatch "accounts.dat" -or $bridge -notmatch "servers.dat" -or $bridge -notmatch "terminal.ini"){throw 'FIX 1 MT5 account/config seed missing'}
+          if($bridge -notmatch 'AllowLiveTrading=1'){throw 'FIX 1 render Algo Trading enable missing'}
+          if($bridge -notmatch "add_argument\('--mt5-data-dir'"){throw 'FIX 1 mt5_data_dir CLI setting missing'}
+          $main=Get-Content ui/main.js -Raw
+          if($main -notmatch 'mt5DataDir' -or $main -notmatch 'preview.mt5DataDir'){throw 'FIX 1 mt5_data_dir UI setting missing'}
+          @'
+import os, tempfile, time
+from pathlib import Path
+import preview_bridge as p
+with tempfile.TemporaryDirectory() as td:
+    base=Path(td)/'appdata'/'MetaQuotes'/'Terminal'
+    old=base/'OLD'; new=base/'NEW'
+    for root in (old,new):
+        (root/'config').mkdir(parents=True)
+        (root/'config'/'accounts.dat').write_bytes(b'account')
+        (root/'config'/'servers.dat').write_bytes(b'servers')
+        (root/'config'/'common.ini').write_text('common',encoding='utf-8')
+        (root/'config'/'terminal.ini').write_text('algo=1',encoding='utf-8')
+        hist=root/'bases'/'broker'/'history'/'EURUSD'
+        hist.mkdir(parents=True)
+        (hist/'2026.hcc').write_bytes(b'bars')
+    now=time.time()
+    os.utime(old/'config'/'accounts.dat',(now-100,now-100))
+    os.utime(new/'config'/'accounts.dat',(now,now))
+    os.environ['APPDATA']=str(Path(td)/'appdata')
+    assert p.resolve_mt5_render_data_dir()==new
+    rt=Path(td)/'rt';(rt/'config').mkdir(parents=True)
+    sym,copied=p.seed_render_runtime_from_data_dir(new,rt)
+    assert sym=='EURUSD'
+    assert (rt/'config'/'accounts.dat').read_bytes()==b'account'
+    assert (rt/'config'/'terminal.ini').is_file()
+    assert (rt/'bases'/'broker'/'history'/'EURUSD'/'2026.hcc').is_file()
+    assert 'accounts.dat' in copied and 'terminal.ini' in copied
+print('render-seed-ok')
+'@ | Set-Content "$env:RUNNER_TEMP\verify_render_seed.py" -Encoding UTF8
+          $env:PYTHONPATH="$env:APP_DIR\engine"
+          python "$env:RUNNER_TEMP\verify_render_seed.py"
+          if($LASTEXITCODE -ne 0){throw 'FIX 1 render seed behavior validation failed'}
+          $bridge=Get-Content engine/preview_bridge.py -Raw
+          if($bridge -notmatch 'mt5-preview-prime-v3'){throw 'MT5 prime v3 readiness marker missing'}
+          if($bridge -notmatch 'seed-v5'){throw 'Minimum runtime seed v5 missing'}
+          if($bridge -notmatch 'terminal_selected'){throw 'Terminal data-folder selection stage missing'}
+          if($bridge -notmatch 'def preflight' -or $bridge -notmatch "add_parser\('preflight'\)"){throw 'Preview runtime preflight command missing'}
+          if($bridge -notmatch 'decode_origin_bytes'){throw 'origin.txt byte-aware decoder missing'}
+          if($bridge -notmatch 'discover_installations' -or $bridge -notmatch 'discover_data_dirs' -or $bridge -notmatch 'pair_runtime_candidates'){throw 'Separated terminal/data discovery missing'}
+          if($bridge -notmatch 'find_editor' -or $bridge -notmatch 'terminal-install-dir'){throw 'MetaEditor resolution from terminal install missing'}
+          if($bridge -notmatch 'platform-fallback'){throw 'Independent platform data pairing missing'}
+          if($bridge -notmatch 'selection-v5.json'){throw 'Validated runtime selection cache missing'}
+          if($bridge -notmatch 'Preview sandbox initialization failed'){throw 'Preview sandbox validation missing'}
+          if($bridge -notmatch 'indicator_staged' -or $bridge -notmatch 'indicator_compile_success'){throw 'Detailed preview render diagnostics missing'}
+          if($bridge -match "copytree\(src,dst,dirs_exist_ok=True,ignore=ign\)"){throw 'Whole MQL tree seed must not return'}
+          if($bridge -notmatch 'ShutdownTerminal=1'){throw 'MT5 shutdown config must use numeric documented value'}
+          if($bridge -notmatch 'preview_engine_stage' -and $ui -notmatch 'preview_engine_stage'){throw 'Preview stage logging missing'}
+          if($bridge -notmatch 'def hard_kill' -or $bridge -notmatch 'psutil.process_iter'){throw 'Runtime-scoped MetaTrader hard kill missing'}
+          if($bridge -notmatch 'chunk_budget' -or $bridge -notmatch 'last_shot'){throw 'Hard chunk/no-progress deadline missing'}
+          if($bridge -notmatch 'emit_heartbeat' -or $bridge -notmatch "'type':'heartbeat'"){throw 'Preview worker heartbeat missing'}
+          if($bridge -notmatch 'BEGIN IMMEDIATE' -or $bridge -notmatch 'GROUP BY sha256'){throw 'Atomic SHA256 dedup claim missing'}
+          if($bridge -notmatch 'worker_id' -or $bridge -notmatch 'clone_runtime\(mt5_sel,dest,''MT5'',worker_id\)'){throw 'Worker-owned isolated runtime missing'}
+          if($bridge -notmatch '_mt5_static_fast_fail'){throw 'Known-bad MT5 static prefilter missing'}
+          if($bridge -notmatch 'static_fast_fail=False'){throw 'Static MT5 fast-fail must default OFF'}
+          if($bridge -notmatch "reason=_mt5_static_fast_fail\(r\['path'\]\) if static_fast_fail else None"){throw 'Static MT5 fast-fail is not guarded by opt-in setting'}
+          if($bridge -notmatch "preview_error LIKE 'MT4 source in .mq5:%'"){throw 'Legacy static-fast-fail rows are not recovered'}
+          if($bridge -notmatch "add_argument\('--static-fast-fail',action='store_true',default=False\)"){throw 'Static MT5 fast-fail opt-in CLI setting missing'}
+          if($bridge -notmatch 'RESIDENT_EA_SOURCE' -or $bridge -notmatch 'current.job' -or $bridge -notmatch 'current.done' -or $bridge -notmatch 'heartbeat.txt'){throw 'Resident EA file protocol missing'}
+          if($bridge -notmatch 'def render_server' -or $bridge -notmatch "add_parser\('render-server'\)"){throw 'Resident render-server command missing'}
+          if($bridge -notmatch 'def compile_pool' -or $bridge -notmatch "add_parser\('compile-pool'\)"){throw 'Parallel compile-pool command missing'}
+          if($bridge -notmatch '_resident_indicator_rel' -or $bridge -notmatch "MQLLibraryPreview/"){throw 'Forward-slash resident iCustom path missing'}
+          $lib=Get-Content src-tauri/src/lib.rs -Raw
+          if($lib -notmatch 'preview_library_heartbeat_timeout' -or $lib -notmatch 'preview_library_restart'){throw 'Supervisor heartbeat restart missing'}
+          if($lib -notmatch 'run_preview_worker_supervisor' -or $lib -notmatch 'run_compile_pool_process'){throw 'Resident render-server + compile-pool supervisor missing'}
+          if($lib -notmatch '"render_server":1' -or $lib -notmatch '"compile_workers"'){throw 'One warm render server / compile worker split missing'}
+          $main=Get-Content ui/main.js -Raw
+          if($main -notmatch 'preview.workers' -or $main -notmatch 'defaultPreviewWorkers'){throw 'Compile worker settings missing'}
+          if($main -notmatch "'render-server'" -or $main -match "'render-library','--db'"){throw 'UI is not switched to resident render-server path'}
+          $req=Get-Content engine/requirements-build.txt -Raw
+          if($req -notmatch '(?m)^psutil'){throw 'psutil build dependency missing'}
+          python engine/preview_control.py self-test
+          if($LASTEXITCODE -ne 0){throw 'Preview control self-test failed'}
+
+      - name: Build bundled engines
+        shell: pwsh
+        run: |
+          Set-Location $env:APP_DIR
+          python -m pip install --upgrade pip
+          python -m pip install -r engine/requirements-build.txt
+          python -m PyInstaller --noconfirm --clean --onefile --name mql-engine --distpath build-sidecar --workpath build-pyinstaller-engine --specpath build-pyinstaller-engine engine/engine.py
+          python -m PyInstaller --noconfirm --clean --onefile --name mql-preview --distpath build-sidecar --workpath build-pyinstaller-preview --specpath build-pyinstaller-preview engine/preview_bridge.py
+          python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-batch --distpath build-sidecar --workpath build-pyinstaller-preview-batch --specpath build-pyinstaller-preview-batch engine/preview_batch.py
+          python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-control --distpath build-sidecar --workpath build-pyinstaller-control --specpath build-pyinstaller-control engine/preview_control.py
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          Copy-Item build-sidecar/mql-engine.exe src-tauri/binaries/mql-engine-x86_64-pc-windows-msvc.exe -Force
+          Copy-Item build-sidecar/mql-preview.exe src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe -Force
+          Copy-Item build-sidecar/mql-preview-batch.exe src-tauri/binaries/mql-preview-batch-x86_64-pc-windows-msvc.exe -Force
+          Copy-Item build-sidecar/mql-preview-control.exe src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe -Force
+
+      - name: Validate packaged engines
+        shell: pwsh
+        run: |
+          Set-Location $env:APP_DIR
+          $p=& 'build-sidecar/mql-preview.exe' detect 2>&1
+          $p | ForEach-Object {Write-Host $_}
+          if($LASTEXITCODE -ne 0 -or ($p -join "`n") -notmatch '"ok": true'){throw 'Packaged preview detector failed'}
+          $pst=& 'build-sidecar/mql-preview.exe' self-test 2>&1
+          $pst | ForEach-Object {Write-Host $_}
+          if($LASTEXITCODE -ne 0 -or ($pst -join "`n") -notmatch '"ok": true'){throw 'Packaged preview self-test failed'}
+          $c=& 'build-sidecar/mql-preview-control.exe' self-test 2>&1
+          $c | ForEach-Object {Write-Host $_}
+          if($LASTEXITCODE -ne 0 -or ($c -join "`n") -notmatch '"ok": true'){throw 'Packaged preview control failed'}
+
+          $sample=Join-Path $env:RUNNER_TEMP 'mql-unicode'
+          New-Item -ItemType Directory -Force -Path $sample | Out-Null
+          '#property indicator_chart_window`nint OnInit(){return(INIT_SUCCEEDED);}' | Set-Content "$sample/Unicode_测试_Δ_é.mq4" -Encoding utf8
+          $s=& 'build-sidecar/mql-engine.exe' scan --db "$sample/test.sqlite3" --source $sample 2>&1
+          $s | ForEach-Object {Write-Host $_}
+          if($LASTEXITCODE -ne 0 -or ($s -join "`n") -notmatch 'scan_complete'){throw 'Packaged scanner validation failed'}
+
+          $clearRoot=Join-Path $env:RUNNER_TEMP 'mql-clear-test'
+          $outside=Join-Path $env:RUNNER_TEMP 'source-file-must-survive.mq5'
+          Remove-Item $clearRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $outside -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$clearRoot/diagnostics" | Out-Null
+          '' | Set-Content "$clearRoot/library.sqlite3"
+          'diagnostic' | Set-Content "$clearRoot/diagnostics/test.log"
+          'source' | Set-Content $outside
+          $clear=& 'build-sidecar/mql-preview-control.exe' clear-app --db "$clearRoot/library.sqlite3" 2>&1
+          $clear | ForEach-Object {Write-Host $_}
+          if($LASTEXITCODE -ne 0 -or ($clear -join "`n") -notmatch '"ok": true'){throw 'Clear application control failed'}
+          if((Get-ChildItem $clearRoot -Force | Measure-Object).Count -ne 0){throw 'Clear application left app data behind'}
+          if(-not(Test-Path $outside)){throw 'Clear application touched a source file outside app data'}
+
+      - name: Install frontend dependencies
+        shell: pwsh
+        run: |
+          Set-Location $env:APP_DIR
+          npm install
+
+      - name: Ensure icon
+        shell: pwsh
+        run: |
+          Set-Location $env:APP_DIR
+          if(-not(Test-Path 'src-tauri/icons/icon.ico')){
+            python -m pip install pillow
+            New-Item -ItemType Directory -Force -Path 'src-tauri/icons' | Out-Null
+            python -c "from PIL import Image,ImageDraw;from pathlib import Path;p=Path(r'src-tauri/icons/icon.ico');im=Image.new('RGBA',(256,256),(24,24,27,255));d=ImageDraw.Draw(im);d.rounded_rectangle((28,28,228,228),radius=44,fill=(37,99,235,255));d.text((78,92),'MQL',fill=(255,255,255,255));im.save(p,format='ICO',sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+          }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          Set-Location $env:APP_DIR
+          npm run tauri build
+          $bundle=(Get-ChildItem dist/assets -Filter '*.js' | Get-Content -Raw) -join "`n"
+          if($bundle -notmatch 'Clear Application / Start Fresh'){throw 'Clear application control was not bundled into frontend'}
+          if($bundle -match 'Create Archive Backup'){throw 'Archive UI was bundled unexpectedly'}
+          if($bundle -notmatch 'mql-preview-control'){throw 'Preview control sidecar was not bundled into frontend'}
+          if($bundle -notmatch 'preview_cache_hit'){throw 'Cache-first preview click path was not bundled'}
+          if($bundle -notmatch 'preview_queue_update'){throw 'SQLite preview queue controls were not bundled'}
+          if($bundle -notmatch 'start_preview_library'){throw 'Background preview library worker launcher was not bundled'}
+          if($bundle -notmatch 'ui_event_loop_stall'){throw 'UI stall watchdog was not bundled'}
+          if($bundle -notmatch 'preview_library_done_ui'){throw 'Background preview completion handling was not bundled'}
+          if($bundle -notmatch 'preview_refresh_queued'){throw 'Explicit preview refresh queueing was not bundled'}
+          if($bundle -notmatch 'preview_queue_stats'){throw 'Preview queue progress/statistics were not bundled'}
+          if($bundle -notmatch 'preview_worker_pause'){throw 'Preview worker pause/resume control was not bundled'}
+          if($bundle -match 'preview_scheduled'){throw 'Old synchronous click-preview scheduler was bundled unexpectedly'}
+
+      - name: Frontend readiness smoke test
+        shell: pwsh
+        run: |
+          Set-Location $env:APP_DIR
+          $exe='src-tauri/target/release/mql-indicator-library.exe'
+          if(-not(Test-Path $exe)){throw 'Built application executable missing'}
+          $startupLog=Join-Path $env:TEMP 'mql-indicator-library-startup-error.txt'
+          $appData=Join-Path $env:APPDATA 'com.mqlindicatorlibrary.app'
+          $diag=Join-Path $appData 'diagnostics/application.jsonl'
+          Remove-Item $startupLog -Force -ErrorAction SilentlyContinue
+          Remove-Item $appData -Recurse -Force -ErrorAction SilentlyContinue
+          $p=Start-Process -FilePath $exe -PassThru
+          $ready=$false
+          for($i=0;$i -lt 25;$i++){
+            Start-Sleep -Seconds 1
+            if($p.HasExited){break}
+            if(Test-Path $diag){
+              $txt=Get-Content $diag -Raw -ErrorAction SilentlyContinue
+              if($txt -match '"event"\s*:\s*"app_ready"'){$ready=$true;break}
+            }
+          }
+          if(-not $ready){
+            if(Test-Path $startupLog){Write-Host '--- startup log ---';Get-Content $startupLog | ForEach-Object {Write-Host $_}}
+            if(Test-Path $diag){Write-Host '--- application diagnostics ---';Get-Content $diag | Select-Object -Last 100 | ForEach-Object {Write-Host $_}}
+            if(-not $p.HasExited){Stop-Process -Id $p.Id -Force}
+            throw 'Frontend never reached app_ready; installer will not be published.'
+          }
+          Write-Host "Frontend reached app_ready. PID=$($p.Id)"
+          Stop-Process -Id $p.Id -Force
+
+      - name: Verify installer
+        shell: pwsh
+        run: |
+          Set-Location $env:APP_DIR
+          $i=Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          if(-not $i){throw 'Installer missing'}
+          if($i.Name -notmatch '0.5.14'){throw "Wrong installer version: $($i.Name)"}
+          if(-not(Test-Path 'src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe')){throw 'Preview sidecar missing'}
+          if(-not(Test-Path 'src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe')){throw 'Preview control sidecar missing'}
+          if(-not(Test-Path 'src-tauri/binaries/mql-preview-batch-x86_64-pc-windows-msvc.exe')){throw 'Preview batch sidecar missing'}
+          Write-Host "Installer $($i.FullName)"
+
+      - name: Upload finished Setup.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: MQL-Indicator-Library-0.5.14-Windows-Setup
+          path: ${{ env.APP_DIR }}/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
