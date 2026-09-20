@@ -4,9 +4,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 use zip::write::SimpleFileOptions;
+
+static PREVIEW_LIBRARY_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
@@ -54,6 +57,7 @@ fn app_log(db_path: String, level: String, event: String, details: Value, durati
 fn open_db(path: &str) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;").map_err(|e|e.to_string())?;
     Ok(conn)
 }
 
@@ -261,6 +265,83 @@ fn start_preview_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Value
 }
 
 #[tauri::command]
+fn start_preview_library(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, String> {
+    if args.first().map(String::as_str) != Some("render-library") {
+        return Err("Only render-library is permitted through start_preview_library".into());
+    }
+    if PREVIEW_LIBRARY_RUNNING.swap(true, Ordering::SeqCst) {
+        return Ok(json!({"started":false,"already_running":true}));
+    }
+    let db_path = args.windows(2).find(|w| w[0] == "--db").map(|w| w[1].clone()).unwrap_or_default();
+    let current = match std::env::current_exe() {
+        Ok(v)=>v,
+        Err(e)=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err(format!("Cannot resolve app executable: {}",e)); }
+    };
+    let dir = match current.parent() {
+        Some(v)=>v,
+        None=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err("Cannot resolve application folder".into()); }
+    };
+    #[cfg(target_os = "windows")]
+    let engine_path = dir.join("mql-preview.exe");
+    #[cfg(not(target_os = "windows"))]
+    let engine_path = dir.join("mql-preview");
+    if !engine_path.exists() {
+        PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst);
+        append_log(&db_path,"ERROR","preview_library_missing",json!({"path":engine_path}),None);
+        return Err(format!("Preview engine was not found at {}",engine_path.display()));
+    }
+    append_log(&db_path,"INFO","preview_library_start",json!({"engine":engine_path,"args":args}),None);
+    let mut cmd=ProcessCommand::new(&engine_path);
+    cmd.args(&args)
+        .env("PYTHONUTF8","1")
+        .env("PYTHONIOENCODING","utf-8")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let mut child=match cmd.spawn() {
+        Ok(v)=>v,
+        Err(e)=>{
+            PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst);
+            append_log(&db_path,"ERROR","preview_library_spawn_failed",json!({"error":e.to_string()}),None);
+            return Err(format!("Could not start preview library worker: {}",e));
+        }
+    };
+    let stdout=match child.stdout.take() {
+        Some(v)=>v,
+        None=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err("Could not capture preview worker output".into()); }
+    };
+    let stderr=match child.stderr.take() {
+        Some(v)=>v,
+        None=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err("Could not capture preview worker errors".into()); }
+    };
+    let app_out=app.clone();let db_out=db_path.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            append_log(&db_out,"INFO","preview_library_stdout",json!({"line":line}),None);
+            let _=app_out.emit("preview-library-line",json!({"line":line}));
+        }
+    });
+    let app_err=app.clone();let db_err=db_path.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            append_log(&db_err,"ERROR","preview_library_stderr",json!({"line":line}),None);
+            let _=app_err.emit("preview-library-stderr",json!({"line":line}));
+        }
+    });
+    std::thread::spawn(move || {
+        let code=child.wait().ok().and_then(|s|s.code()).unwrap_or(-1);
+        PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst);
+        append_log(&db_path,if code==0{"INFO"}else{"ERROR"},"preview_library_done",json!({"code":code}),None);
+        let _=app.emit("preview-library-done",json!({"code":code}));
+    });
+    Ok(json!({"started":true,"already_running":false,"engine":engine_path.to_string_lossy()}))
+}
+
+#[tauri::command]
 fn db_stats(db_path: String) -> Result<Value, String> {
     let started=Instant::now();
     let conn = open_db(&db_path)?;
@@ -298,6 +379,79 @@ fn sort_sql(sort_by: &str, sort_dir: &str) -> String {
     format!("{} {}", col, dir)
 }
 
+fn ensure_preview_columns(conn:&Connection) -> Result<(),String> {
+    let mut stmt=conn.prepare("PRAGMA table_info(indicators)").map_err(|e|e.to_string())?;
+    let names=stmt.query_map([],|r|r.get::<_,String>(1)).map_err(|e|e.to_string())?;
+    let mut cols=std::collections::HashSet::new();
+    for name in names { cols.insert(name.map_err(|e|e.to_string())?); }
+    let additions=[
+        ("preview_attempts","INTEGER DEFAULT 0"),
+        ("preview_priority","INTEGER DEFAULT 0"),
+        ("preview_status","TEXT DEFAULT 'pending'"),
+        ("preview_path","TEXT"),
+        ("preview_hash","TEXT"),
+        ("preview_error","TEXT DEFAULT ''"),
+        ("preview_updated_at","TEXT")
+    ];
+    for (name,decl) in additions {
+        if !cols.contains(name) {
+            conn.execute(&format!("ALTER TABLE indicators ADD COLUMN {} {}",name,decl),[]).map_err(|e|e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn preview_queue_update(db_path:String, paths:Vec<String>, priority:i64, force:bool) -> Result<Value,String> {
+    let mut conn=open_db(&db_path)?;
+    ensure_preview_columns(&conn)?;
+    let tx=conn.transaction().map_err(|e|e.to_string())?;
+    let p=priority.clamp(0,10000);
+    let mut changed=0usize;
+    for path in paths.iter() {
+        let n=if force {
+            tx.execute(
+                "UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='',preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END WHERE path=?",
+                params![p,p,path]).map_err(|e|e.to_string())?
+        } else {
+            tx.execute(
+                "UPDATE indicators SET preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END WHERE path=?",
+                params![p,p,path]).map_err(|e|e.to_string())?
+        };
+        changed+=n;
+    }
+    tx.commit().map_err(|e|e.to_string())?;
+    Ok(json!({"ok":true,"changed":changed,"force":force,"priority":p}))
+}
+
+#[tauri::command]
+fn preview_worker_pause(db_path:String, paused:bool) -> Result<Value,String> {
+    let conn=open_db(&db_path)?;
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",[]).map_err(|e|e.to_string())?;
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('preview_paused',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![if paused {"1"} else {"0"}]).map_err(|e|e.to_string())?;
+    Ok(json!({"ok":true,"paused":paused}))
+}
+
+#[tauri::command]
+fn preview_queue_stats(db_path:String) -> Result<Value,String> {
+    let conn=open_db(&db_path)?;
+    ensure_preview_columns(&conn)?;
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",[]).map_err(|e|e.to_string())?;
+    let one=|sql:&str|->Result<i64,String>{conn.query_row(sql,[],|r|r.get(0)).map_err(|e|e.to_string())};
+    let paused=conn.query_row("SELECT value FROM meta WHERE key='preview_paused'",[],|r|r.get::<_,String>(0)).ok().map(|v|v=="1").unwrap_or(false);
+    Ok(json!({
+        "ok":true,
+        "total":one("SELECT COUNT(*) FROM indicators")?,
+        "ready":one("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'")?,
+        "pending":one("SELECT COUNT(*) FROM indicators WHERE preview_status='pending'")?,
+        "rendering":one("SELECT COUNT(*) FROM indicators WHERE preview_status='rendering'")?,
+        "failed":one("SELECT COUNT(*) FROM indicators WHERE preview_status='failed'")?,
+        "paused":paused
+    }))
+}
+
 #[tauri::command]
 fn write_preview_batch_sources(sources:Vec<String>) -> Result<Value,String> {
     let path=std::env::temp_dir().join(format!("mql-preview-batch-{}-{}.json",std::process::id(),now_ms()));
@@ -323,7 +477,7 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
     let mut total_stmt=conn.prepare(&total_sql).map_err(|e|e.to_string())?;
     let total:i64=total_stmt.query_row(rusqlite::params_from_iter(vals.iter()),|r|r.get(0)).map_err(|e|e.to_string())?;
     let order=sort_sql(sort_by.as_deref().unwrap_or("name"),sort_dir.as_deref().unwrap_or("asc"));
-    let sql=format!("SELECT id,path,filename,platform,source_structure,display_location,primary_category,secondary_categories,visual_category,behavior_tags,techniques,evidence,classification_status,review_reason,classifier_version,standard_indicators,custom_dependencies,confidence,warnings,duplicate_of,user_favorite,user_tags,human_verified,verified_primary,verified_secondary,family_fingerprint,analyzed_at,draw_types,line_plots,histogram_plots,arrow_plots,filling_plots,object_usage,declared_buffers,declared_plots,active_buffers,preview_status,preview_path,preview_hash FROM indicators{} ORDER BY {} LIMIT ? OFFSET ?",where_sql,order);
+    let sql=format!("SELECT id,path,filename,platform,source_structure,display_location,primary_category,secondary_categories,visual_category,behavior_tags,techniques,evidence,classification_status,review_reason,classifier_version,standard_indicators,custom_dependencies,confidence,warnings,duplicate_of,user_favorite,user_tags,human_verified,verified_primary,verified_secondary,family_fingerprint,analyzed_at,draw_types,line_plots,histogram_plots,arrow_plots,filling_plots,object_usage,declared_buffers,declared_plots,active_buffers,preview_status,preview_path,preview_hash,sha256,preview_error,preview_updated_at,preview_attempts FROM indicators{} ORDER BY {} LIMIT ? OFFSET ?",where_sql,order);
     let mut all=vals.clone(); all.push(limit.clamp(1,500).to_string()); all.push(offset.max(0).to_string());
     let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;
     let mapped=stmt.query_map(rusqlite::params_from_iter(all.iter()),|r| {
@@ -346,7 +500,9 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
           "draw_types":parse_json_text(r.get::<_,String>(27)?),"line_plots":r.get::<_,i64>(28)?,"histogram_plots":r.get::<_,i64>(29)?,
           "arrow_plots":r.get::<_,i64>(30)?,"filling_plots":r.get::<_,i64>(31)?,"object_usage":r.get::<_,i64>(32)?==1,
           "declared_buffers":r.get::<_,i64>(33)?,"declared_plots":r.get::<_,i64>(34)?,"active_buffers":r.get::<_,i64>(35)?,
-          "preview_status":r.get::<_,Option<String>>(36)?,"preview_path":r.get::<_,Option<String>>(37)?,"preview_hash":r.get::<_,Option<String>>(38)?
+          "preview_status":r.get::<_,Option<String>>(36)?,"preview_path":r.get::<_,Option<String>>(37)?,"preview_hash":r.get::<_,Option<String>>(38)?,
+          "sha256":r.get::<_,Option<String>>(39)?,"preview_error":r.get::<_,Option<String>>(40)?,"preview_updated_at":r.get::<_,Option<String>>(41)?,
+          "preview_attempts":r.get::<_,Option<i64>>(42)?.unwrap_or(0)
         }))
     }).map_err(|e|e.to_string())?;
     let mut rows_out=Vec::new();
@@ -465,7 +621,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,write_preview_batch_sources,app_log,export_diagnostics])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,start_preview_library,preview_queue_update,preview_queue_stats,preview_worker_pause,write_preview_batch_sources,app_log,export_diagnostics])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }

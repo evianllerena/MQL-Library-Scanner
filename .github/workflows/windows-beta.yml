@@ -10,6 +10,7 @@ on:
       - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
+      - 'requirements-build.txt'
       - 'preview_bridge.py'
       - 'preview_batch.py'
       - 'preview_control.py'
@@ -31,6 +32,7 @@ on:
       - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
+      - 'requirements-build.txt'
       - 'preview_bridge.py'
       - 'preview_batch.py'
       - 'preview_control.py'
@@ -75,6 +77,7 @@ jobs:
           Set-Location $env:APP_DIR
           Copy-Item "$r/engine.py" 'engine/engine.py' -Force
           Copy-Item "$r/engine_core.py" 'engine/engine_core.py' -Force
+          Copy-Item "$r/requirements-build.txt" 'engine/requirements-build.txt' -Force
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
           Copy-Item "$r/preview_batch.py" 'engine/preview_batch.py' -Force
           Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
@@ -106,8 +109,11 @@ jobs:
         run: |
           Set-Location $env:APP_DIR
           python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py
+          if($LASTEXITCODE -ne 0){throw 'Python source validation failed'}
           node --check ui/main.js
+          if($LASTEXITCODE -ne 0){throw 'main.js syntax validation failed'}
           node --check ui/preview_ui.js
+          if($LASTEXITCODE -ne 0){throw 'preview_ui.js syntax validation failed'}
           $packageVersion=(Get-Content package.json -Raw | ConvertFrom-Json).version
           $tauriVersion=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $cargoVersion=[regex]::Match((Get-Content src-tauri/Cargo.toml -Raw),'(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
@@ -223,12 +229,15 @@ jobs:
           if($bundle -notmatch 'Clear Application / Start Fresh'){throw 'Clear application control was not bundled into frontend'}
           if($bundle -match 'Create Archive Backup'){throw 'Archive UI was bundled unexpectedly'}
           if($bundle -notmatch 'mql-preview-control'){throw 'Preview control sidecar was not bundled into frontend'}
-          if($bundle -notmatch 'preview_cancel_result'){throw 'Verified preview cancellation logic was not bundled'}
+          if($bundle -notmatch 'preview_cache_hit'){throw 'Cache-first preview click path was not bundled'}
+          if($bundle -notmatch 'preview_queue_update'){throw 'SQLite preview queue controls were not bundled'}
+          if($bundle -notmatch 'start_preview_library'){throw 'Background preview library worker launcher was not bundled'}
           if($bundle -notmatch 'ui_event_loop_stall'){throw 'UI stall watchdog was not bundled'}
-          if($bundle -notmatch 'preview_engine_stage'){throw 'Preview engine stage diagnostics were not bundled'}
-          if($bundle -notmatch 'preview_preflight_start' -or $bundle -notmatch 'preview_preflight_failed' -or $bundle -notmatch 'preview_discovery_stage'){throw 'Preview runtime preflight/discovery diagnostics were not bundled'}
-          if($bundle -notmatch 'mt5_full_recompile'){throw 'MT5 first-use initialization status was not bundled'}
-          if($bundle -notmatch 'terminal_selected'){throw 'Bound terminal data-folder status was not bundled'}
+          if($bundle -notmatch 'preview_library_done_ui'){throw 'Background preview completion handling was not bundled'}
+          if($bundle -notmatch 'preview_refresh_queued'){throw 'Explicit preview refresh queueing was not bundled'}
+          if($bundle -notmatch 'preview_queue_stats'){throw 'Preview queue progress/statistics were not bundled'}
+          if($bundle -notmatch 'preview_worker_pause'){throw 'Preview worker pause/resume control was not bundled'}
+          if($bundle -match 'preview_scheduled'){throw 'Old synchronous click-preview scheduler was bundled unexpectedly'}
 
       - name: Frontend readiness smoke test
         shell: pwsh

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterable
 from engine_core import Analysis, analyze
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 JSON_FIELDS = ['draw_types','standard_indicators','custom_dependencies','secondary_categories','behavior_tags','techniques','evidence','warnings','user_tags']
 
 # Windows/PyInstaller can otherwise inherit a legacy ANSI console encoding even
@@ -79,12 +79,16 @@ def migrate(conn):
       'review_reason':"TEXT DEFAULT ''",'classifier_version':"TEXT DEFAULT ''",'family_fingerprint':"TEXT DEFAULT ''",
       'family_id':'TEXT','human_verified':'INTEGER DEFAULT 0','verified_primary':'TEXT','verified_secondary':"TEXT DEFAULT '[]'",
       'verified_at':'TEXT','mtime_ns':'INTEGER DEFAULT 0','scan_status':"TEXT DEFAULT 'complete'",'user_favorite':'INTEGER DEFAULT 0','user_tags':"TEXT DEFAULT '[]'",
-      'preview_status':"TEXT DEFAULT 'pending'",'preview_path':'TEXT','preview_hash':'TEXT','preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT'
+      'preview_status':"TEXT DEFAULT 'pending'",'preview_path':'TEXT','preview_hash':'TEXT','preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT',
+      'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0'
     }
     existing=cols(conn,'indicators')
     for name,decl in additions.items():
         if name not in existing: conn.execute(f'ALTER TABLE indicators ADD COLUMN {name} {decl}')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_preview_status ON indicators(preview_status)')
+    conn.execute("UPDATE indicators SET preview_status='pending' WHERE preview_status='rendering'")
+    conn.execute("UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='' "
+                 "WHERE preview_status='ready' AND COALESCE(preview_hash,'')!=COALESCE(sha256,'')")
     conn.execute("INSERT INTO meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(SCHEMA_VERSION),))
     conn.commit()
 
@@ -133,12 +137,20 @@ def discover(sources: Iterable[Path]):
 
 def save_analysis(conn,a:Analysis,mtime_ns:int):
     d=asdict(a)
+    path=d['path']
+    prior=conn.execute('SELECT sha256 FROM indicators WHERE path=?',(path,)).fetchone()
+    prior_sha=prior['sha256'] if prior else None
     for k in JSON_FIELDS:
         if k in d: d[k]=json.dumps(d[k],ensure_ascii=False)
     d['object_usage']=1 if d['object_usage'] else 0; d['mtime_ns']=mtime_ns; d['scan_status']='complete'
     cols_=list(d.keys())
     sql=f"INSERT INTO indicators({','.join(cols_)}) VALUES({','.join('?' for _ in cols_)}) ON CONFLICT(path) DO UPDATE SET "+','.join(f"{c}=excluded.{c}" for c in cols_ if c!='path')+", analyzed_at=CURRENT_TIMESTAMP"
     conn.execute(sql,[d[c] for c in cols_])
+    if prior_sha != a.sha256:
+        conn.execute(
+            "UPDATE indicators SET preview_status='pending',preview_path=NULL,preview_hash=NULL,"
+            "preview_error='',preview_updated_at=NULL,preview_attempts=0 WHERE path=?",
+            (path,))
 
 def unchanged(conn,p):
     st=p.stat(); row=conn.execute('SELECT size,mtime_ns,scan_status,classifier_version FROM indicators WHERE path=?',(display_path(p),)).fetchone()

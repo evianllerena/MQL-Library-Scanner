@@ -427,20 +427,35 @@ def clone_runtime(t,out,kind):
     if missing:raise RuntimeError(f'Preview sandbox initialization failed for {kind}: {", ".join(missing)}')
     return rt
 
-def stage(src,mql,kind,editor,data_dir=None):
+def stage(src,mql,kind,editor,data_dir=None,compiled_cache=None):
     ext='.ex5' if kind=='MT5' else '.ex4'; job=hashlib.sha1(str(src.resolve()).lower().encode()).hexdigest()[:14]; d=mql/'Indicators'/'MQLLibraryPreview'/job;d.mkdir(parents=True,exist_ok=True)
     staged=d/safe_name(src); shutil.copy2(src,staged)
     for dep in src.parent.glob('*.mqh'):
         try:shutil.copy2(dep,d/dep.name)
         except Exception:pass
-    binary=d/(staged.stem+ext); old=existing_binary(src,ext) or find_live_binary(src,ext,data_dir)
-    if old:shutil.copy2(old,binary);return job,staged,binary,{'used_existing_binary':True,'existing_binary':str(old)}
+    binary=d/(staged.stem+ext)
+    cache=Path(compiled_cache) if compiled_cache else None
+    if cache and cache.is_file() and cache.stat().st_size:
+        shutil.copy2(cache,binary)
+        return job,staged,binary,{'used_compiled_cache':True,'compiled_cache':str(cache)}
+    old=existing_binary(src,ext) or find_live_binary(src,ext,data_dir)
+    if old:
+        shutil.copy2(old,binary)
+        if cache:
+            cache.parent.mkdir(parents=True,exist_ok=True)
+            try:shutil.copy2(old,cache)
+            except Exception:pass
+        return job,staged,binary,{'used_existing_binary':True,'existing_binary':str(old)}
     if src.suffix.lower() not in ('.mq4','.mq5'):raise RuntimeError(f'Indicator compile failed — {kind} executable could not be staged.')
     built,cmds,log=compile_file(editor,staged,mql)
     if not built:
         if log:raise RuntimeError(f'Indicator compile failed — {kind} source produced no {ext.upper()[1:]}.\n{log[-2200:]}')
         raise RuntimeError(f'Indicator compile failed — {kind} MetaEditor produced no executable. Staged={staged}; commands={cmds}')
-    return job,staged,built,{'used_existing_binary':False}
+    if cache:
+        cache.parent.mkdir(parents=True,exist_ok=True)
+        try:shutil.copy2(built,cache)
+        except Exception:pass
+    return job,staged,built,{'used_existing_binary':False,'compiled_cache':str(cache) if cache else None}
 
 def copy_mt4_history(live,rt):
     files=[]; h=live/'history'
@@ -793,12 +808,378 @@ def render_mt5_batch(sources, out, t, job_id):
           'results': results})
     return results
 
-def render_mt4(src,out,t,job_id):
+
+def mt5_batch_capture_source_v2(manifest_rel, cur_prefix, done_marker):
+    m=_mql_str(manifest_rel); cur=_mql_str(cur_prefix); done=_mql_str(done_marker)
+    return (
+        'void _clear(){for(int w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL)-1;w>=0;w--){'
+        'int tt=ChartIndicatorsTotal(0,w);for(int i=tt-1;i>=0;i--)ChartIndicatorDelete(0,w,ChartIndicatorName(0,w,i));}ChartRedraw();}\n'
+        'void _mark(string suf){int f=FileOpen(suf,FILE_WRITE|FILE_TXT|FILE_ANSI);if(f!=INVALID_HANDLE){FileWrite(f,"x");FileClose(f);}}\n'
+        'void OnStart(){\n'
+        f' int fh=FileOpen("{m}",FILE_READ|FILE_TXT|FILE_ANSI);\n'
+        ' if(fh==INVALID_HANDLE){TerminalClose(31);return;}\n'
+        ' int idx=0;\n'
+        ' while(!FileIsEnding(fh)){\n'
+        '   string line=FileReadString(fh); if(StringLen(line)==0) continue;\n'
+        '   string p[]; int n=StringSplit(line,(ushort)9,p); if(n<2) continue;\n'
+        '   string rel=p[0]; string shot=p[1]; int win=(n>=3)?(int)StringToInteger(p[2]):0;\n'
+        f'  _mark("{cur}"+IntegerToString(idx)+".cur");\n'
+        '   _clear(); ResetLastError();\n'
+        '   int h=iCustom(_Symbol,_Period,rel);\n'
+        '   if(h!=INVALID_HANDLE){int w=win; if(w==1)w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);\n'
+        '     if(ChartIndicatorAdd(0,w,h)){ChartRedraw();\n'
+        '       for(int i=0;i<20;i++){if(BarsCalculated(h)>=0)break;Sleep(200);} Sleep(800);\n'
+        '       ChartScreenShot(0,shot,1200,720,ALIGN_RIGHT);} IndicatorRelease(h);}\n'
+        f'  _mark(shot+".ok");\n'
+        '   idx++; Sleep(120);\n'
+        ' }\n'
+        f' FileClose(fh); _mark("{done}");\n'
+        ' Sleep(200); TerminalClose(0);\n'
+        '}\n'
+    )
+
+
+def _cache_image_path(dest, source_hash):
+    digest=str(source_hash or '').lower().strip()
+    if not re.fullmatch(r'[0-9a-f]{64}',digest):
+        digest=hashlib.sha256(digest.encode('utf-8','ignore')).hexdigest()
+    shard=Path(dest)/digest[:2]
+    shard.mkdir(parents=True,exist_ok=True)
+    return shard/(digest+'.png')
+
+
+def _compiled_cache_path(dest, kind, source_hash):
+    digest=str(source_hash or '').lower().strip()
+    if not re.fullmatch(r'[0-9a-f]{64}',digest):
+        digest=hashlib.sha256(digest.encode('utf-8','ignore')).hexdigest()
+    ext='.ex5' if kind=='MT5' else '.ex4'
+    root=Path(dest).parent/'preview-runtime'/'compiled-cache'/kind.lower()/digest[:2]
+    root.mkdir(parents=True,exist_ok=True)
+    return root/(digest+ext)
+
+
+def _store_preview_image(source_image, dest, source_hash):
+    source_image=Path(source_image); final=_cache_image_path(dest,source_hash)
+    try:
+        from PIL import Image
+        with Image.open(source_image) as im:
+            im.convert('RGB').save(final,format='PNG',optimize=True)
+    except Exception:
+        if source_image.suffix.lower()=='.png':shutil.copy2(source_image,final)
+        else:raise
+    return final
+
+
+def _thumb_path(image):
+    image=Path(image)
+    return image.with_name(image.stem+'.thumb.png')
+
+
+def _make_thumb(image):
+    image=Path(image)
+    thumb=_thumb_path(image)
+    if thumb.exists() and thumb.stat().st_size:return thumb
+    try:
+        from PIL import Image
+        with Image.open(image) as im:
+            im=im.convert('RGB')
+            width=300
+            height=max(1,round(im.height*(width/im.width)))
+            im.thumbnail((width,height))
+            thumb.parent.mkdir(parents=True,exist_ok=True)
+            im.save(thumb,format='PNG',optimize=True)
+        return thumb
+    except Exception:
+        return None
+
+
+def _migrate_ready_cache(con,dest):
+    try:rows=con.execute("SELECT id,sha256,preview_path FROM indicators WHERE preview_status='ready' AND preview_path IS NOT NULL").fetchall()
+    except Exception:return
+    root=Path(dest).resolve()
+    for row in rows:
+        try:
+            old=Path(row['preview_path'] if isinstance(row,sqlite3.Row) else row[2])
+            sha=row['sha256'] if isinstance(row,sqlite3.Row) else row[1]
+            if not old.is_file() or not sha:continue
+            target=_cache_image_path(dest,sha)
+            if old.resolve()!=target.resolve():
+                final=_store_preview_image(old,dest,sha)
+                con.execute("UPDATE indicators SET preview_path=? WHERE id=?",(str(final),row['id'] if isinstance(row,sqlite3.Row) else row[0]))
+                try:
+                    old_res=old.resolve()
+                    if root in old_res.parents:
+                        old.unlink(missing_ok=True)
+                        _thumb_path(old).unlink(missing_ok=True)
+                except Exception:pass
+        except Exception:pass
+    con.commit()
+
+
+def _worker_pause_reason(con,dest):
+    try:
+        row=con.execute("SELECT value FROM meta WHERE key='preview_paused'").fetchone()
+        if row and str(row[0])=='1':return 'paused_by_user'
+    except Exception:pass
+    try:
+        free=shutil.disk_usage(Path(dest).parent).free
+        if free<2*1024*1024*1024:return 'low_disk'
+    except Exception:pass
+    if os.name=='nt':
+        try:
+            class SYSTEM_POWER_STATUS(ctypes.Structure):
+                _fields_=[('ACLineStatus',ctypes.c_ubyte),('BatteryFlag',ctypes.c_ubyte),('BatteryLifePercent',ctypes.c_ubyte),('SystemStatusFlag',ctypes.c_ubyte),('BatteryLifeTime',ctypes.c_ulong),('BatteryFullLifeTime',ctypes.c_ulong)]
+            s=SYSTEM_POWER_STATUS()
+            if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s)) and s.ACLineStatus==0 and s.BatteryLifePercent!=255 and s.BatteryLifePercent<=20:
+                return 'low_battery'
+        except Exception:pass
+    return None
+
+
+def _cleanup_cache_files(con,dest):
+    try:valid={str(r[0]).lower() for r in con.execute("SELECT sha256 FROM indicators WHERE sha256 IS NOT NULL") if r[0]}
+    except Exception:return
+    root=Path(dest)
+    if root.exists():
+        for p in root.rglob('*'):
+            if not p.is_file():continue
+            name=p.name.lower()
+            stem=name[:-10] if name.endswith('.thumb.png') else p.stem.lower()
+            if stem not in valid:
+                try:p.unlink()
+                except Exception:pass
+    comp=root.parent/'preview-runtime'/'compiled-cache'
+    if comp.exists():
+        for p in comp.rglob('*'):
+            if p.is_file() and p.suffix.lower() in ('.ex4','.ex5') and p.stem.lower() not in valid:
+                try:p.unlink()
+                except Exception:pass
+
+
+def _backfill_thumbnails(con):
+    try:rows=con.execute("SELECT preview_path FROM indicators WHERE preview_status='ready' AND preview_path IS NOT NULL").fetchall()
+    except Exception:return
+    for row in rows:
+        try:
+            p=Path(row[0])
+            if p.is_file() and not _thumb_path(p).exists():_make_thumb(p)
+        except Exception:pass
+
+
+def _render_chunk(rows, dest, sel, rt, sym, job_id, item_timeout):
+    dest=Path(dest);mql=rt/'MQL5';scripts=mql/'Scripts';files=mql/'Files'
+    scripts.mkdir(parents=True,exist_ok=True);files.mkdir(parents=True,exist_ok=True)
+    editor=rt/Path(sel['editor']).name;terminal=rt/Path(sel['terminal']).name
+    results={};plan=[]
+    for i,row in enumerate(rows):
+        src=Path(row['path'])
+        try:
+            emit_stage(job_id,'indicator_compile',f'[{i+1}/{len(rows)}] Compiling {src.name}',source=str(src))
+            cache=_compiled_cache_path(dest,'MT5',row['sha256'])
+            job,staged,binary,_meta=stage(src,mql,'MT5',editor,sel.get('data_dir'),cache)
+            rel=f'MQLLibraryPreview/{job}/{binary.stem}'
+            shot=f'MQLLibraryPreview_{job}.png'
+            sep='indicator_separate_window' in read_text(src).lower()
+            item={'source':str(src),'sha256':row['sha256'],'rel':rel,'shot':shot,'shot_path':files/shot,'win':'1' if sep else '0'}
+            for stale in (item['shot_path'],files/(shot+'.ok')):
+                try:stale.unlink(missing_ok=True)
+                except Exception:pass
+            plan.append(item)
+        except Exception as e:
+            results[str(src)]={'ok':False,'error':f'{type(e).__name__}: {e}'}
+
+    if not plan:return results
+    manifest_name=f'mqllib_chunk_{job_id}.txt'
+    cur_prefix=f'mqllib_chunk_{job_id}_'
+    done_marker=f'mqllib_chunk_{job_id}.done'
+    cap=scripts/f'MQLLibraryChunkCapture_{job_id}.mq5'
+    cap.write_text(mt5_batch_capture_source_v2(manifest_name,cur_prefix,done_marker),encoding='utf-8')
+    emit_stage(job_id,'capture_compile','Compiling watchdog-enabled MT5 batch capture script.')
+    built,_,log=compile_file(editor,cap,mql)
+    if not built:
+        err='Batch capture script failed to compile. '+(log or '')[-1600:]
+        for item in plan:results.setdefault(item['source'],{'ok':False,'error':err})
+        return results
+
+    remaining=list(plan);restart=0
+    while remaining:
+        restart+=1
+        (files/manifest_name).write_text('\n'.join(f"{x['rel']}\t{x['shot']}\t{x['win']}" for x in remaining),encoding='utf-8')
+        for p in files.glob(cur_prefix+'*.cur'):
+            try:p.unlink()
+            except Exception:pass
+        for item in remaining:
+            for p in (files/(item['shot']+'.ok'),item['shot_path']):
+                try:p.unlink(missing_ok=True)
+                except Exception:pass
+        done_path=files/done_marker
+        try:done_path.unlink(missing_ok=True)
+        except Exception:pass
+        cfg=rt/f'mql-chunk-{job_id}-{restart}.ini'
+        cfg.write_text(
+            '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
+            f'[StartUp]\nSymbol={sym}\nPeriod=H1\nScript={cap.stem}\nShutdownTerminal=1\n',
+            encoding='utf-8')
+        emit_stage(job_id,'terminal_launch',f'Launching MT5 for preview chunk ({len(remaining)} items).',chunk_size=len(remaining),restart=restart)
+        proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
+        active_idx=None;active_since=time.monotonic();done_count=0;timed_out=False
+        while True:
+            completed=[i for i,x in enumerate(remaining) if (files/(x['shot']+'.ok')).exists()]
+            if len(completed)!=done_count:
+                done_count=len(completed);active_since=time.monotonic()
+                emit_stage(job_id,'item_progress',f'{done_count}/{len(remaining)} items completed in current chunk.',done=done_count,total=len(remaining))
+            started=[]
+            for i in range(len(remaining)):
+                if (files/f'{cur_prefix}{i}.cur').exists():started.append(i)
+            newest=max(started) if started else None
+            if newest!=active_idx:
+                active_idx=newest;active_since=time.monotonic()
+            if done_path.exists() or proc.poll() is not None:break
+            if active_idx is not None and active_idx not in completed and time.monotonic()-active_since>=max(5,int(item_timeout)):
+                timed_out=True;break
+            time.sleep(.35)
+        terminate_tree(proc)
+
+        completed_idx={i for i,x in enumerate(remaining) if (files/(x['shot']+'.ok')).exists()}
+        for i in sorted(completed_idx):
+            item=remaining[i]
+            if item['source'] in results:continue
+            if item['shot_path'].exists() and item['shot_path'].stat().st_size:
+                final=_store_preview_image(item['shot_path'],dest,item['sha256'])
+                results[item['source']]={'ok':True,'image':str(final),'kind':'MT5'}
+            else:
+                results[item['source']]={'ok':False,'error':'No screenshot produced (indicator could not load on the chart).'}
+
+        if done_path.exists():
+            for i,item in enumerate(remaining):
+                results.setdefault(item['source'],{'ok':False,'error':'No completion marker was produced.'})
+            break
+
+        if timed_out:
+            bad=active_idx if active_idx is not None else 0
+            bad=max(0,min(bad,len(remaining)-1))
+            hung=remaining[bad]
+            results[hung['source']]={'ok':False,'error':f'Preview watchdog timeout after {item_timeout}s.'}
+            emit_stage(job_id,'item_timeout',f'Watchdog stopped a hung preview: {Path(hung["source"]).name}',source=hung['source'],timeout=item_timeout)
+            remaining=remaining[bad+1:]
+            continue
+
+        pending=[i for i in range(len(remaining)) if i not in completed_idx]
+        if not pending:break
+        bad=pending[0]
+        item=remaining[bad]
+        results[item['source']]={'ok':False,'error':'MetaTrader exited before the preview completed.'}
+        remaining=remaining[bad+1:]
+
+    try:
+        preview_tree=mql/'Indicators'/'MQLLibraryPreview'
+        shutil.rmtree(preview_tree,ignore_errors=True)
+        preview_tree.mkdir(parents=True,exist_ok=True)
+    except Exception:pass
+    return results
+
+
+def _ensure_preview_queue_schema(con):
+    cols={r[1] for r in con.execute('PRAGMA table_info(indicators)')}
+    additions={
+        'preview_status':"TEXT DEFAULT 'pending'",
+        'preview_path':'TEXT','preview_hash':'TEXT',
+        'preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT',
+        'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0'
+    }
+    for name,decl in additions.items():
+        if name not in cols:con.execute(f'ALTER TABLE indicators ADD COLUMN {name} {decl}')
+    con.execute("UPDATE indicators SET preview_status='pending' WHERE preview_status='rendering'")
+    con.execute("UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='' "
+                "WHERE preview_status='ready' AND COALESCE(preview_hash,'')!=COALESCE(sha256,'')")
+    con.commit()
+
+
+def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_attempts=2, job_id=None):
+    job_id=safe_job_id(job_id);dest=Path(out)
+    con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
+    con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=30000')
+    _ensure_preview_queue_schema(con)
+    _migrate_ready_cache(con,dest)
+    _backfill_thumbnails(con)
+    mt5_sel=mt5_rt=mt5_sym=None
+    mt4_sel=None
+    lock=dest.parent/'preview-runtime'/'.render.lock'
+    with RenderLock(lock,timeout=5.0):
+        while True:
+            pause_reason=_worker_pause_reason(con,dest)
+            if pause_reason:
+                emit({'ok':True,'job_id':job_id,'paused':True,'reason':pause_reason})
+                break
+            attempts=max(1,min(int(max_attempts),10))
+            con.execute("UPDATE indicators SET preview_status='failed' WHERE preview_status='pending' AND COALESCE(preview_attempts,0)>=?",(attempts,))
+            con.commit()
+            rows=con.execute(
+                "SELECT id,path,platform,sha256 FROM indicators "
+                "WHERE preview_status='pending' AND COALESCE(preview_attempts,0)<? "
+                "ORDER BY COALESCE(preview_priority,0) DESC,user_favorite DESC,id LIMIT ?",
+                (attempts,max(1,min(int(chunk_size),200)))).fetchall()
+            if not rows:break
+            ids=[r['id'] for r in rows]
+            con.executemany(
+                "UPDATE indicators SET preview_status='rendering',"
+                "preview_attempts=COALESCE(preview_attempts,0)+1 WHERE id=?",
+                [(i,) for i in ids]);con.commit()
+            results={}
+            mt5_rows=[r for r in rows if str(r['platform']).upper() in ('MQL5','MT5') or Path(r['path']).suffix.lower() in ('.mq5','.ex5')]
+            mt4_rows=[r for r in rows if r not in mt5_rows]
+            if mt5_rows:
+                try:
+                    if mt5_sel is None:
+                        mt5_sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
+                        mt5_rt=clone_runtime(mt5_sel,dest,'MT5')
+                        mt5_sym=copy_mt5_history(Path(mt5_sel['data_dir']),mt5_rt)
+                        prime_mt5_runtime(mt5_rt,mt5_rt/Path(mt5_sel['terminal']).name,mt5_sym,job_id)
+                    results.update(_render_chunk(mt5_rows,dest,mt5_sel,mt5_rt,mt5_sym,job_id,item_timeout))
+                except Exception as e:
+                    for r in mt5_rows:results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
+            if mt4_rows:
+                try:
+                    if mt4_sel is None:mt4_sel=load_runtime_cache(dest,'MT4') or choose_runtime('MT4',terminal)
+                    for r in mt4_rows:
+                        try:
+                            compiled=_compiled_cache_path(dest,'MT4',r['sha256'])
+                            image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id,compiled)
+                            final=_store_preview_image(image,dest,r['sha256'])
+                            results[str(r['path'])]={'ok':True,'image':str(final),'kind':'MT4'}
+                        except Exception as e:
+                            results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
+                except Exception as e:
+                    for r in mt4_rows:results[str(r['path'])]={'ok':False,'error':f'{type(e).__name__}: {e}'}
+
+            for r in rows:
+                res=results.get(str(r['path']))
+                if res and res.get('ok'):
+                    _make_thumb(res['image'])
+                    con.execute(
+                        "UPDATE indicators SET preview_status='ready',preview_path=?,preview_hash=?,"
+                        "preview_error='',preview_updated_at=datetime('now'),preview_priority=0 WHERE id=?",
+                        (res['image'],r['sha256'],r['id']))
+                else:
+                    err=(res or {}).get('error','render timeout/hang')
+                    con.execute(
+                        "UPDATE indicators SET preview_status=CASE WHEN COALESCE(preview_attempts,0)>=? "
+                        "THEN 'failed' ELSE 'pending' END,preview_error=? WHERE id=?",
+                        (attempts,str(err)[:800],r['id']))
+            con.commit()
+            ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
+            total=con.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
+            emit({'type':'progress','job_id':job_id,'done':ready,'total':total})
+    _cleanup_cache_files(con,dest)
+    con.close()
+    emit({'ok':True,'job_id':job_id,'finished':True})
+
+def render_mt4(src,out,t,job_id,compiled_cache=None):
     emit_stage(job_id,'runtime_clone','Preparing isolated MT4 runtime.')
     rt=clone_runtime(t,out,'MT4');mql=rt/'MQL4';scripts=mql/'Scripts';templates=rt/'templates';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,templates,files)]
     editor=rt/Path(t['editor']).name;terminal=rt/Path(t['terminal']).name;sym=copy_mt4_history(Path(t['data_dir']),rt)
     emit_stage(job_id,'indicator_compile','Compiling/staging the selected MT4 indicator.')
-    job,staged,binary,meta=stage(src,mql,'MT4',editor,t.get('data_dir'));emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT4 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT4 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
+    job,staged,binary,meta=stage(src,mql,'MT4',editor,t.get('data_dir'),compiled_cache);emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT4 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT4 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
     tplname=f'MQLLibraryPreview_{job}.tpl';tpl=templates/tplname;sep='indicator_separate_window' in read_text(src).lower();win='1' if sep else '0';tpl.write_text(f'<chart>\nsymbol={sym}\nperiod=60\ngraph=1\ngrid=1\n<window>\nheight=420\n<indicator>\nname=main\n</indicator>\n<indicator>\nname=Custom Indicator\n<expert>\nname={rel}\nflags=339\nwindow_num={win}\n</expert>\nshow_data=1\n</indicator>\n</window>\n</chart>\n')
     shot=f'MQLLibraryPreview_{job}.gif';cap=scripts/f'MQLLibraryPreviewCapture_{job}.mq4';cap.write_text(f'#property strict\nvoid OnStart(){{Print("MQLLIB_PREVIEW stage=onstart");Sleep(3000);WindowRedraw();ResetLastError();bool ok=WindowScreenShot("{shot}",1200,720);Print("MQLLIB_PREVIEW stage=screenshot ok=",ok," err=",GetLastError());Sleep(300);TerminalClose(ok?0:23);return;}}\n')
     emit_stage(job_id,'capture_compile','Compiling MT4 capture script.')
@@ -1055,6 +1436,7 @@ def main():
     p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal')
     p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
+    p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=40);p.add_argument('--timeout',type=int,default=45);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
     p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
@@ -1072,6 +1454,7 @@ def main():
         with RenderLock(lock_path,timeout=5.0):
             sel=load_runtime_cache(Path(x.out),'MT5') or choose_runtime('MT5',x.terminal)
             render_mt5_batch(mt5,x.out,sel,job)
+    elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)

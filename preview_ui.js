@@ -226,10 +226,10 @@ async function spawnRender(source,outDir,myToken,jobId){
   return payload;
 }
 
-function schedulePreview(source,delay=900){
+function schedulePreview(source,delay=900,force=false){
   if(!source)return;
   if(desiredSource===source&&(previewTimer||activeJob?.source===source))return;
-  if(previewState.source===source&&previewState.phase==='success')return;
+  if(!force&&previewState.source===source&&previewState.phase==='success')return;
 
   desiredSource=source;
   previewToken++;
@@ -332,12 +332,19 @@ async function openSource(source,status,button){
   }finally{button.disabled=false;}
 }
 
+function detailCachedPreview(detail){
+  const status=detail?.dataset?.previewStatus||'';
+  const path=detail?.dataset?.previewPath||'';
+  return status==='ready'&&path?{status,path}:null;
+}
+
 function injectPreview(){
   const detail=document.getElementById('detail');
   const body=document.getElementById('detailBody');
   if(!detail?.classList.contains('open')||!body)return;
   const source=detailSource();
   if(!source)return;
+  const cached=detailCachedPreview(detail);
 
   const existing=document.getElementById('realMetaPreview');
   if(existing?.dataset.source===source){
@@ -353,26 +360,68 @@ function injectPreview(){
   section.className='section';
   section.id='realMetaPreview';
   section.dataset.source=source;
-  section.innerHTML=`<div class="label">Real MetaTrader Preview</div><div style="border:1px solid rgba(127,127,127,.22);border-radius:10px;padding:10px;margin-top:8px"><div class="muted" style="margin-bottom:9px">Only one real preview can run at a time. A new selection waits until the prior MetaTrader process tree is confirmed stopped.</div><div class="status" id="previewStatus">Preparing automatic preview…</div><img id="previewImage" alt="MetaTrader indicator preview" style="display:none;width:100%;margin-top:10px;border-radius:8px;border:1px solid rgba(127,127,127,.25)"/><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn" id="retryPreview" style="display:none">Retry Preview</button><button class="btn" id="openPreviewSource">Open in MetaTrader / MetaEditor</button></div></div>`;
+  section.innerHTML=`<div class="label">Real MetaTrader Preview</div><div style="border:1px solid rgba(127,127,127,.22);border-radius:10px;padding:10px;margin-top:8px"><div class="muted" style="margin-bottom:9px">Cached previews load instantly. MetaTrader only starts here when no ready cache exists or you explicitly refresh.</div><div class="status" id="previewStatus">Checking preview cache…</div><img id="previewImage" alt="MetaTrader indicator preview" style="display:none;width:100%;margin-top:10px;border-radius:8px;border:1px solid rgba(127,127,127,.25)"/><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn" id="retryPreview" style="display:none">Retry Preview</button><button class="btn" id="refreshPreview">Refresh Preview</button><button class="btn" id="openPreviewSource">Open in MetaTrader / MetaEditor</button></div></div>`;
   body.prepend(section);
 
   const status=section.querySelector('#previewStatus');
   const retry=section.querySelector('#retryPreview');
+  const refresh=section.querySelector('#refreshPreview');
   const open=section.querySelector('#openPreviewSource');
-  retry.onclick=()=>{
-    previewState={source:null,phase:'idle',message:'',image:null,kind:null};
-    desiredSource=null;
-    schedulePreview(source,0);
+  const queueRefresh=async(button)=>{
+    button.disabled=true;
+    try{
+      if(typeof window.__mqlQueuePreview==='function')await window.__mqlQueuePreview([source],1000,true);
+      if(typeof window.__mqlStartPreviewLibraryWorker==='function')void window.__mqlStartPreviewLibraryWorker();
+      const cachedPath=detail.dataset.previewPath||'';
+      detail.dataset.previewStatus='pending';
+      detail.dataset.previewError='';
+      desiredSource=null;
+      previewToken++;
+      if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
+      previewState={
+        source,
+        phase:cachedPath?'success':'pending',
+        kind,
+        image:cachedPath?convertFileSrc(cachedPath)+`?cache=${Date.now()}`:null,
+        message:cachedPath?'Refresh queued • showing cached preview until replacement is ready':'Preview queued in background…'
+      };
+      applyPreviewState();
+      void appLog('INFO','preview_refresh_queued',{source});
+    }finally{button.disabled=false;}
   };
+  retry.onclick=()=>void queueRefresh(retry);
+  refresh.onclick=()=>void queueRefresh(refresh);
   open.onclick=()=>openSource(source,status,open);
 
-  if(previewState.source===source){
+  if(cached){
+    desiredSource=null;
+    previewState={
+      source,phase:'success',kind,
+      image:convertFileSrc(cached.path)+`?cache=1`,
+      message:'Cached preview • ready'
+    };
     applyPreviewState();
-    if(!desiredSource&&!activeJob&&previewState.phase!=='success')schedulePreview(source);
-  }else{
-    previewState={source,phase:'idle',message:'',image:null,kind};
-    schedulePreview(source);
+    void appLog('INFO','preview_cache_hit',{source,path:cached.path});
+    return;
   }
+
+  desiredSource=null;
+  previewToken++;
+  if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
+  const queueStatus=detail.dataset.previewStatus||'pending';
+  const queueError=detail.dataset.previewError||'';
+  previewState={
+    source,
+    phase:queueStatus==='failed'?'failed':'pending',
+    kind,
+    image:null,
+    message:queueStatus==='rendering'
+      ?'Background preview is rendering…'
+      :queueStatus==='failed'
+        ?`Can't preview: ${queueError||'render failed after retry limit'}`
+        :'Preview queued in background…'
+  };
+  applyPreviewState();
 }
 
 function armButton(button,label,confirmLabel,ms=6000){
