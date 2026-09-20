@@ -435,13 +435,14 @@ def seed_mql_runtime(t,rt,kind):
     if preview_dir.exists():shutil.rmtree(preview_dir,ignore_errors=True)
     return not marker_valid
 
-def clone_runtime(t,out,kind):
+def clone_runtime(t,out,kind,worker_id=None):
     install=Path(t['install_dir'])
     live=Path(t['data_dir'])
     terminal_src=Path(t['terminal'])
     editor_src=Path(t['editor'])
     token=hashlib.sha1((str(terminal_src)+'|'+str(live)).lower().encode()).hexdigest()[:10]
-    rt=out.parent/'preview-runtime'/'v5'/f'{kind.lower()}-{token}'
+    worker_suffix=('-'+safe_job_id(worker_id)) if worker_id else ''
+    rt=out.parent/'preview-runtime'/'v5'/f'{kind.lower()}-{token}{worker_suffix}'
     stamp=f'v5:{terminal_src.stat().st_size}:{terminal_src.stat().st_mtime_ns}:{editor_src.stat().st_size}:{editor_src.stat().st_mtime_ns}:{str(live).lower()}'
     marker=rt/'.stamp'
     if not rt.exists() or not marker.exists() or marker.read_text(errors='ignore')!=stamp:
@@ -873,7 +874,7 @@ def mt5_batch_capture_source_v2(manifest_rel, cur_prefix, done_marker):
         '   int h=iCustom(_Symbol,_Period,rel);\n'
         '   if(h!=INVALID_HANDLE){int w=win; if(w==1)w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);\n'
         '     if(ChartIndicatorAdd(0,w,h)){ChartRedraw();\n'
-        '       for(int i=0;i<20;i++){if(BarsCalculated(h)>=0)break;Sleep(200);} Sleep(800);\n'
+        '       for(int i=0;i<10;i++){if(BarsCalculated(h)>=0)break;Sleep(150);} Sleep(400);\n'
         '       ChartScreenShot(0,shot,1200,720,ALIGN_RIGHT);} IndicatorRelease(h);}\n'
         f'  _mark(shot+".ok");\n'
         '   idx++; Sleep(120);\n'
@@ -1149,20 +1150,38 @@ def _render_chunk(rows, dest, sel, rt, sym, job_id, item_timeout):
     except Exception:pass
     return results,meta
 
-def _ensure_preview_queue_schema(con):
+def _ensure_preview_queue_schema(con,worker_id=None):
     cols={r[1] for r in con.execute('PRAGMA table_info(indicators)')}
     additions={
         'preview_status':"TEXT DEFAULT 'pending'",
         'preview_path':'TEXT','preview_hash':'TEXT',
         'preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT',
-        'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0'
+        'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0','worker_id':'TEXT'
     }
     for name,decl in additions.items():
         if name not in cols:con.execute(f'ALTER TABLE indicators ADD COLUMN {name} {decl}')
-    con.execute("UPDATE indicators SET preview_status='pending' WHERE preview_status='rendering'")
-    con.execute("UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='' "
+    if worker_id:
+        con.execute("UPDATE indicators SET preview_status='pending',worker_id=NULL WHERE preview_status='rendering' AND (worker_id=? OR worker_id IS NULL)",(worker_id,))
+    else:
+        con.execute("UPDATE indicators SET preview_status='pending',worker_id=NULL WHERE preview_status='rendering' AND worker_id IS NULL")
+    con.execute("UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='',worker_id=NULL "
                 "WHERE preview_status='ready' AND COALESCE(preview_hash,'')!=COALESCE(sha256,'')")
     con.commit()
+
+
+def _mt5_static_fast_fail(path):
+    src=Path(path)
+    if src.suffix.lower()!='.mq5':return None
+    text=read_text(src)
+    market=bool(re.search(r'\bMarketInfo\s*\(',text))
+    mode=bool(re.search(r'\bMODE_(?:BID|ASK|POINT|DIGITS|SPREAD|STOPLEVEL|TICKVALUE|TICKSIZE|LOTSIZE|MINLOT|MAXLOT|LOTSTEP)\b',text))
+    bare=bool(re.search(r'\b(?:Open|High|Low|Close|Volume)\s*\[',text))
+    extmap=bool(re.search(r'\bExtMapBuffer\w*\b',text))
+    if market and (mode or bare):
+        return 'MT4 source in .mq5: MarketInfo/MODE or bare-series pattern'
+    if extmap and market:
+        return 'MT4 source in .mq5: decompiled MT4 buffer/MarketInfo pattern'
+    return None
 
 
 def render_library(db, out, terminal=None, chunk_size=40, item_timeout=45, max_attempts=2, job_id=None):
