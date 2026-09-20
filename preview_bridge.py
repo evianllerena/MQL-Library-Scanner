@@ -74,6 +74,46 @@ def terminate_tree(proc):
             try:proc.kill()
             except Exception:pass
 
+def hard_kill(proc,runtime_dir):
+    """Force-reap the isolated MetaTrader tree without touching the user's live terminal."""
+    pid=getattr(proc,'pid',None)
+    try:terminate_tree(proc)
+    except Exception:pass
+    if os.name=='nt' and pid:
+        try:
+            subprocess.run(['taskkill','/F','/T','/PID',str(pid)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=CREATE_NO_WINDOW,timeout=8)
+        except Exception:pass
+    try:
+        import psutil
+        rd=str(Path(runtime_dir).resolve()).lower().rstrip('\\/')+os.sep
+        names={'terminal64.exe','terminal.exe','metaeditor64.exe','metaeditor.exe'}
+        for p in psutil.process_iter(['pid','name','exe']):
+            try:
+                exe=str(p.info.get('exe') or '').lower()
+                name=str(p.info.get('name') or '').lower()
+                if exe and exe.startswith(rd) and name in names:
+                    p.kill()
+            except Exception:pass
+    except Exception:pass
+
+
+def emit_heartbeat(job_id,done=0,inflight=None,**details):
+    payload={'type':'heartbeat','job_id':job_id,'ts':time.time(),'done':int(done or 0),'inflight':str(inflight) if inflight else None}
+    payload.update(details);emit(payload)
+
+
+def _prepare_offline_runtime(rt):
+    """Suppress cloned-runtime UI/network distractions that can block unattended batches."""
+    rt=Path(rt)
+    for p in (rt/'profiles'/'lastprofile.ini',rt/'config'/'lastprofile.ini'):
+        try:p.unlink(missing_ok=True)
+        except Exception:pass
+    for base in (rt/'bases',):
+        if not base.exists():continue
+        for child in list(base.glob('*/news'))+list(base.glob('*/mail')):
+            try:shutil.rmtree(child,ignore_errors=True)
+            except Exception:pass
+
 def compile_has_errors(text):
     for m in re.finditer(r'(?i)(?:result\s*:\s*)?(\d+)\s+errors?\b',text or ''):
         try:
@@ -518,8 +558,9 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
     if marker.exists():
         emit_stage(job_id,'mt5_prime_cached','MT5 preview runtime is already initialized.')
         return
+    _prepare_offline_runtime(rt)
     cfg=rt/f'mql-prime-{safe_job_id(job_id)}.ini'
-    cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={symbol}\nPeriod=H1\n',encoding='utf-8')
+    cfg.write_text(f'[Common]\nNewsEnable=0\n\n[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol={symbol}\nPeriod=H1\n',encoding='utf-8')
     emit_stage(job_id,'mt5_prime_start','Initializing isolated MT5 runtime. First use can take longer while MetaTrader prepares its MQL5 files.')
     proc=subprocess.Popen([str(terminal),'/portable',f'/config:{cfg}'],cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
     start=time.monotonic()
@@ -531,9 +572,13 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
     saw_meta_activity_after_recompile=False
     settled=False
     announced_recompile=False
+    last_heartbeat=start-10
     try:
         while time.monotonic()-start<120:
             now=time.monotonic()
+            if now-last_heartbeat>=5:
+                emit_heartbeat(job_id,0,None,stage='mt5_prime')
+                last_heartbeat=now
             hide_pid(proc.pid)
             if proc.poll() is not None and now-start<5:
                 break
@@ -575,7 +620,7 @@ def prime_mt5_runtime(rt,terminal,symbol='EURUSD',job_id=None):
             else:
                 time.sleep(.5)
     finally:
-        terminate_tree(proc)
+        hard_kill(proc,rt)
     if not settled:
         emit_stage(job_id,'mt5_prime_timeout','MT5 runtime initialization did not reach a verified idle state.',elapsed_ms=round((time.monotonic()-start)*1000))
         raise RuntimeError('MT5 preview runtime initialization timed out before MetaTrader became idle.')
