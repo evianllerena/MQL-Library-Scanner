@@ -156,11 +156,21 @@ jobs:
           if($bridge -notmatch 'BEGIN IMMEDIATE' -or $bridge -notmatch 'GROUP BY sha256'){throw 'Atomic SHA256 dedup claim missing'}
           if($bridge -notmatch 'worker_id' -or $bridge -notmatch 'clone_runtime\(mt5_sel,dest,''MT5'',worker_id\)'){throw 'Worker-owned isolated runtime missing'}
           if($bridge -notmatch '_mt5_static_fast_fail'){throw 'Known-bad MT5 static prefilter missing'}
+          if($bridge -notmatch 'static_fast_fail=False'){throw 'Static MT5 fast-fail must default OFF'}
+          if($bridge -notmatch "reason=_mt5_static_fast_fail\(r\['path'\]\) if static_fast_fail else None"){throw 'Static MT5 fast-fail is not guarded by opt-in setting'}
+          if($bridge -notmatch "preview_error LIKE 'MT4 source in .mq5:%'"){throw 'Legacy static-fast-fail rows are not recovered'}
+          if($bridge -notmatch "add_argument\('--static-fast-fail',action='store_true',default=False\)"){throw 'Static MT5 fast-fail opt-in CLI setting missing'}
+          if($bridge -notmatch 'RESIDENT_EA_SOURCE' -or $bridge -notmatch 'current.job' -or $bridge -notmatch 'current.done' -or $bridge -notmatch 'heartbeat.txt'){throw 'Resident EA file protocol missing'}
+          if($bridge -notmatch 'def render_server' -or $bridge -notmatch "add_parser\('render-server'\)"){throw 'Resident render-server command missing'}
+          if($bridge -notmatch 'def compile_pool' -or $bridge -notmatch "add_parser\('compile-pool'\)"){throw 'Parallel compile-pool command missing'}
+          if($bridge -notmatch '_resident_indicator_rel' -or $bridge -notmatch "MQLLibraryPreview/"){throw 'Forward-slash resident iCustom path missing'}
           $lib=Get-Content src-tauri/src/lib.rs -Raw
           if($lib -notmatch 'preview_library_heartbeat_timeout' -or $lib -notmatch 'preview_library_restart'){throw 'Supervisor heartbeat restart missing'}
-          if($lib -notmatch 'AtomicUsize' -or $lib -notmatch 'worker_count'){throw 'Parallel worker supervisor missing'}
+          if($lib -notmatch 'run_preview_worker_supervisor' -or $lib -notmatch 'run_compile_pool_process'){throw 'Resident render-server + compile-pool supervisor missing'}
+          if($lib -notmatch '"render_server":1' -or $lib -notmatch '"compile_workers"'){throw 'One warm render server / compile worker split missing'}
           $main=Get-Content ui/main.js -Raw
-          if($main -notmatch 'preview.workers' -or $main -notmatch 'defaultPreviewWorkers'){throw 'Adaptive worker settings missing'}
+          if($main -notmatch 'preview.workers' -or $main -notmatch 'defaultPreviewWorkers'){throw 'Compile worker settings missing'}
+          if($main -notmatch "'render-server'" -or $main -match "'render-library','--db'"){throw 'UI is not switched to resident render-server path'}
           $req=Get-Content engine/requirements-build.txt -Raw
           if($req -notmatch '(?m)^psutil'){throw 'psutil build dependency missing'}
           python engine/preview_control.py self-test
