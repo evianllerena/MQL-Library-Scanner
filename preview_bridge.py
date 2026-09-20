@@ -119,6 +119,23 @@ def _prepare_offline_runtime(rt):
             try:shutil.rmtree(child,ignore_errors=True)
             except Exception:pass
 
+
+def _prepare_render_runtime(rt):
+    """Remove transient UI state but preserve logged-in account and Algo-Trading config."""
+    rt=Path(rt)
+    for path in (
+        rt/'profiles'/'lastprofile.ini',
+        rt/'config'/'lastprofile.ini',
+        rt/'config'/'community.ini'
+    ):
+        try:path.unlink(missing_ok=True)
+        except Exception:pass
+    for base in (rt/'bases',):
+        if not base.exists():continue
+        for child in list(base.glob('*/news'))+list(base.glob('*/mail')):
+            try:shutil.rmtree(child,ignore_errors=True)
+            except Exception:pass
+
 def compile_has_errors(text):
     for m in re.finditer(r'(?i)(?:result\s*:\s*)?(\d+)\s+errors?\b',text or ''):
         try:
@@ -177,6 +194,59 @@ def same_path(a,b):
 
 def metatrader_data_root():
     return Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'
+
+
+def _tree_has_file(root):
+    root=Path(root)
+    if not root.exists():return False
+    try:
+        for item in root.rglob('*'):
+            if item.is_file():return True
+    except Exception:pass
+    return False
+
+def _render_data_activity(root):
+    root=Path(root); newest=0
+    for candidate in (
+        root/'config'/'accounts.dat',
+        root/'config'/'terminal.ini',
+        root/'config'/'common.ini',
+        root/'bases',
+        root/'history'
+    ):
+        try:newest=max(newest,candidate.stat().st_mtime_ns)
+        except Exception:pass
+    return newest
+
+def _valid_mt5_render_data_dir(root):
+    root=Path(root)
+    accounts=root/'config'/'accounts.dat'
+    history_ok=_tree_has_file(root/'bases') or _tree_has_file(root/'history')
+    return root.is_dir() and accounts.is_file() and accounts.stat().st_size>0 and history_ok
+
+def resolve_mt5_render_data_dir(configured=None):
+    if configured:
+        root=Path(os.path.expandvars(os.path.expanduser(str(configured).strip().strip('"'))))
+        if not _valid_mt5_render_data_dir(root):
+            raise RuntimeError(
+                f'MT5 data folder is not usable for rendering: {root}. '
+                'Expected config/accounts.dat plus non-empty bases/ or history/.')
+        return root
+    base=metatrader_data_root()
+    candidates=[]
+    if base.exists():
+        for root in base.iterdir():
+            if not root.is_dir():continue
+            try:
+                if _valid_mt5_render_data_dir(root):
+                    candidates.append((_render_data_activity(root),root))
+            except Exception:pass
+    if not candidates:
+        raise RuntimeError(
+            'No logged-in MT5 data folder was found. Set the MT5 data folder in Settings '
+            '(the MetaQuotes\\Terminal\\<hash> folder containing config\\accounts.dat and history).')
+    candidates.sort(key=lambda x:x[0],reverse=True)
+    return candidates[0][1]
 
 def observed_data_folders(base=None):
     base=Path(base) if base is not None else metatrader_data_root()
@@ -529,6 +599,31 @@ def copy_mt5_history(live,rt):
     except Exception:pass
     return src.name
 
+
+def seed_render_runtime_from_data_dir(real_data,rt):
+    real_data=resolve_mt5_render_data_dir(real_data)
+    rt=Path(rt)
+    cfg_src=real_data/'config'; cfg_dst=rt/'config'; cfg_dst.mkdir(parents=True,exist_ok=True)
+    copied=[]
+    for name in ('accounts.dat','servers.dat','common.ini','terminal.ini'):
+        src=cfg_src/name
+        if src.is_file():
+            shutil.copy2(src,cfg_dst/name);copied.append(name)
+    if not (cfg_dst/'accounts.dat').is_file():
+        raise RuntimeError(f'Render seed is missing config/accounts.dat in {real_data}')
+    origin=real_data/'origin.txt'
+    if origin.is_file():
+        try:shutil.copy2(origin,rt/'origin.txt')
+        except Exception:pass
+    symbol=copy_mt5_history(real_data,rt)
+    if symbol=='EURUSD':
+        # Keep the existing MT5 history copier as the primary source; legacy history is a fallback.
+        legacy=real_data/'history'
+        if legacy.exists() and not (rt/'history').exists():
+            try:shutil.copytree(legacy,rt/'history',dirs_exist_ok=True)
+            except Exception:pass
+    return symbol,copied
+
 def startupinfo():
     if os.name!='nt':return None
     si=subprocess.STARTUPINFO();si.dwFlags|=getattr(subprocess,'STARTF_USESHOWWINDOW',1);si.wShowWindow=SW_HIDE;return si
@@ -811,11 +906,11 @@ def _install_resident_ea(mql,editor,job_id):
 
 
 def _launch_resident_terminal(rt,terminalexe,sym,job_id):
-    _prepare_offline_runtime(rt)
+    _prepare_render_runtime(rt)
     cfg=Path(rt)/f'render-server-{safe_job_id(job_id)}.ini'
     cfg.write_text(
         '[Common]\nNewsEnable=0\n\n'
-        '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
+        '[Experts]\nEnabled=1\nAllowLiveTrading=1\nAllowDllImport=0\n\n'
         f'[StartUp]\nSymbol={sym}\nPeriod=H1\nExpert=MQLLibRenderServer\nShutdownTerminal=0\n',
         encoding='utf-8')
     return subprocess.Popen(
@@ -963,7 +1058,7 @@ def compile_pool(db,out,terminal=None,workers=4,job_id=None):
     emit({'ok':True,'job_id':job_id,'component':'compile_pool','finished':True,'compiled_done':completed})
 
 
-def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2):
+def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2,mt5_data_dir=None):
     job_id=safe_job_id(job_id);dest=Path(out)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
@@ -976,11 +1071,14 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
     _propagate_existing_ready(con)
 
     sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
+    render_data=resolve_mt5_render_data_dir(mt5_data_dir)
     rt=clone_runtime(sel,dest,'MT5','render-server')
     hard_kill(None,rt)
+    sym,copied_cfg=seed_render_runtime_from_data_dir(render_data,rt)
+    emit_stage(job_id,'render_runtime_seeded','Seeded render runtime from logged-in MT5 data folder.',
+               data_dir=str(render_data),symbol=sym,config_files=copied_cfg)
     mql=rt/'MQL5'
     files,cur,done,hb=_resident_job_paths(mql)
-    sym=copy_mt5_history(Path(sel['data_dir']),rt)
     editor=rt/Path(sel['editor']).name
     terminalexe=rt/Path(sel['terminal']).name
     _install_resident_ea(mql,editor,job_id)
@@ -2040,7 +2138,7 @@ def main():
     p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=70);p.add_argument('--timeout',type=int,default=30);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id');p.add_argument('--worker-id');p.add_argument('--static-fast-fail',action='store_true',default=False)
-    p=s.add_parser('render-server');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--attempts',type=int,default=2)
+    p=s.add_parser('render-server');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--attempts',type=int,default=2);p.add_argument('--mt5-data-dir')
     p=s.add_parser('compile-pool');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--workers',type=int,default=4);p.add_argument('--job-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
@@ -2060,7 +2158,7 @@ def main():
             sel=load_runtime_cache(Path(x.out),'MT5') or choose_runtime('MT5',x.terminal)
             render_mt5_batch(mt5,x.out,sel,job)
     elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id,x.worker_id,x.static_fast_fail)
-    elif x.cmd=='render-server':render_server(x.db,x.out,x.terminal,x.job_id,x.hang_timeout,x.attempts)
+    elif x.cmd=='render-server':render_server(x.db,x.out,x.terminal,x.job_id,x.hang_timeout,x.attempts,x.mt5_data_dir)
     elif x.cmd=='compile-pool':compile_pool(x.db,x.out,x.terminal,x.workers,x.job_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
