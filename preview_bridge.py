@@ -515,14 +515,19 @@ def seed_mql_runtime(t,rt,kind):
     if preview_dir.exists():shutil.rmtree(preview_dir,ignore_errors=True)
     return not marker_valid
 
+def runtime_path(t,out,kind,worker_id=None):
+    live=Path(t['data_dir'])
+    terminal_src=Path(t['terminal'])
+    token=hashlib.sha1((str(terminal_src)+'|'+str(live)).lower().encode()).hexdigest()[:10]
+    worker_suffix=('-'+safe_job_id(worker_id)) if worker_id else ''
+    return Path(out).parent/'preview-runtime'/'v5'/f'{kind.lower()}-{token}{worker_suffix}'
+
 def clone_runtime(t,out,kind,worker_id=None):
     install=Path(t['install_dir'])
     live=Path(t['data_dir'])
     terminal_src=Path(t['terminal'])
     editor_src=Path(t['editor'])
-    token=hashlib.sha1((str(terminal_src)+'|'+str(live)).lower().encode()).hexdigest()[:10]
-    worker_suffix=('-'+safe_job_id(worker_id)) if worker_id else ''
-    rt=out.parent/'preview-runtime'/'v5'/f'{kind.lower()}-{token}{worker_suffix}'
+    rt=runtime_path(t,out,kind,worker_id)
     stamp=f'v5:{terminal_src.stat().st_size}:{terminal_src.stat().st_mtime_ns}:{editor_src.stat().st_size}:{editor_src.stat().st_mtime_ns}:{str(live).lower()}'
     marker=rt/'.stamp'
     if not rt.exists() or not marker.exists() or marker.read_text(errors='ignore')!=stamp:
@@ -871,6 +876,18 @@ def _resident_indicator_rel(job,binary):
     return f'MQLLibraryPreview/{safe_job_id(job)}/{Path(binary).stem}'
 
 
+def _render_runtime_ready_marker(rt,runtime_id):
+    return Path(rt)/f'.render-runtime-ready-{safe_job_id(runtime_id)}'
+
+def _wait_for_render_runtime(rt,runtime_id,timeout=120):
+    marker=_render_runtime_ready_marker(rt,runtime_id)
+    deadline=time.time()+max(5,int(timeout))
+    while time.time()<deadline:
+        if marker.is_file() and (Path(rt)/'MQL5'/'Indicators').is_dir():
+            return marker
+        time.sleep(.25)
+    raise RuntimeError(f'Render runtime was not initialized for compile output: {rt}')
+
 def _resident_job_paths(mql):
     root=Path(mql)/'Files'/'MQLLibRender'
     root.mkdir(parents=True,exist_ok=True)
@@ -1013,7 +1030,7 @@ def _compile_pool_claim(con,limit):
         con.rollback();raise
 
 
-def compile_pool(db,out,terminal=None,workers=4,job_id=None):
+def compile_pool(db,out,terminal=None,workers=4,job_id=None,runtime_id=None):
     job_id=safe_job_id(job_id);dest=Path(out);workers=max(1,min(int(workers),8))
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
@@ -1027,10 +1044,13 @@ def compile_pool(db,out,terminal=None,workers=4,job_id=None):
     con.commit()
 
     sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
-    rt=clone_runtime(sel,dest,'MT5','compile-pool')
+    shared_runtime_id=safe_job_id(runtime_id or job_id)
+    rt=runtime_path(sel,dest,'MT5','render-server')
+    _wait_for_render_runtime(rt,shared_runtime_id,120)
     mql=rt/'MQL5'
     editor=rt/Path(sel['editor']).name
-    emit_stage(job_id,'compile_pool_start',f'Starting MT5 compile pool with {workers} workers.',workers=workers)
+    emit_stage(job_id,'compile_pool_start',f'Starting MT5 compile pool with {workers} workers in shared render runtime.',
+               workers=workers,runtime=str(rt),runtime_id=shared_runtime_id)
 
     def compile_one(row):
         src=Path(row['path']);sha=row['sha256']
@@ -1082,7 +1102,7 @@ def compile_pool(db,out,terminal=None,workers=4,job_id=None):
     emit({'ok':True,'job_id':job_id,'component':'compile_pool','finished':True,'compiled_done':completed})
 
 
-def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2,mt5_data_dir=None):
+def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2,mt5_data_dir=None,runtime_id=None):
     job_id=safe_job_id(job_id);dest=Path(out)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
@@ -1109,6 +1129,15 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
         resident_ex5=_install_resident_ea(mql,editor,job_id)
         if not resident_ex5 or not Path(resident_ex5).is_file() or not Path(resident_ex5).stat().st_size:
             raise RenderStartupError('Resident capture EA did not compile to MQLLibRenderServer.ex5.')
+        shared_runtime_id=safe_job_id(runtime_id or job_id)
+        ready_marker=_render_runtime_ready_marker(rt,shared_runtime_id)
+        for stale in rt.glob('.render-runtime-ready-*'):
+            if stale!=ready_marker:
+                try:stale.unlink(missing_ok=True)
+                except Exception:pass
+        ready_marker.write_text(str(time.time()),encoding='utf-8')
+        emit_stage(job_id,'render_runtime_ready','Shared render runtime is ready for compile output.',
+                   runtime=str(rt),runtime_id=shared_runtime_id)
     except Exception as e:
         msg=str(e)
         emit({'type':'fatal','job_id':job_id,'component':'render-server',
@@ -1179,6 +1208,16 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
                 continue
 
             rel=_resident_indicator_rel(job,binary)
+            expected_ex5=mql/'Indicators'/'MQLLibraryPreview'/job/(Path(binary).stem+'.ex5')
+            if not expected_ex5.is_file() or not expected_ex5.stat().st_size:
+                err=f'ex5 missing in render runtime: {expected_ex5}'
+                con.execute(
+                    "UPDATE indicators SET preview_status='failed',preview_error=?,worker_id=NULL,"
+                    "preview_updated_at=datetime('now') WHERE sha256=?",
+                    (err[:800],sha));con.commit()
+                emit_stage(job_id,'render_artifact_missing','Compiled indicator is not staged in the render runtime.',
+                           source=str(src),expected_ex5=str(expected_ex5),sha256=sha)
+                continue
             shot=f'MQLLibRender/out_{job}.png'
             shotfile=mql/'Files'/shot
             shotfile.parent.mkdir(parents=True,exist_ok=True)
@@ -2198,8 +2237,8 @@ def main():
     p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=70);p.add_argument('--timeout',type=int,default=30);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id');p.add_argument('--worker-id');p.add_argument('--static-fast-fail',action='store_true',default=False)
-    p=s.add_parser('render-server');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--attempts',type=int,default=2);p.add_argument('--mt5-data-dir')
-    p=s.add_parser('compile-pool');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--workers',type=int,default=4);p.add_argument('--job-id')
+    p=s.add_parser('render-server');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--attempts',type=int,default=2);p.add_argument('--mt5-data-dir');p.add_argument('--runtime-id')
+    p=s.add_parser('compile-pool');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--workers',type=int,default=4);p.add_argument('--job-id');p.add_argument('--runtime-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
     p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
@@ -2218,8 +2257,8 @@ def main():
             sel=load_runtime_cache(Path(x.out),'MT5') or choose_runtime('MT5',x.terminal)
             render_mt5_batch(mt5,x.out,sel,job)
     elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id,x.worker_id,x.static_fast_fail)
-    elif x.cmd=='render-server':render_server(x.db,x.out,x.terminal,x.job_id,x.hang_timeout,x.attempts,x.mt5_data_dir)
-    elif x.cmd=='compile-pool':compile_pool(x.db,x.out,x.terminal,x.workers,x.job_id)
+    elif x.cmd=='render-server':render_server(x.db,x.out,x.terminal,x.job_id,x.hang_timeout,x.attempts,x.mt5_data_dir,x.runtime_id)
+    elif x.cmd=='compile-pool':compile_pool(x.db,x.out,x.terminal,x.workers,x.job_id,x.runtime_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)
