@@ -767,6 +767,10 @@ void OnTimer(){
 '''
 
 
+def _resident_indicator_rel(job,binary):
+    return f'MQLLibraryPreview/{safe_job_id(job)}/{Path(binary).stem}'
+
+
 def _resident_job_paths(mql):
     root=Path(mql)/'Files'/'MQLLibRender'
     root.mkdir(parents=True,exist_ok=True)
@@ -1034,7 +1038,7 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
                     (('stage compiled cache: '+str(e))[:800],sha));con.commit()
                 continue
 
-            rel=f'MQLLibraryPreview/{job}/{binary.stem}'
+            rel=_resident_indicator_rel(job,binary)
             shot=f'MQLLibRender/out_{job}.png'
             shotfile=mql/'Files'/shot
             shotfile.parent.mkdir(parents=True,exist_ok=True)
@@ -2023,7 +2027,7 @@ def self_test():
         'resident_ea_timer':'EventSetMillisecondTimer(150)' in RESIDENT_EA_SOURCE,
         'resident_ea_job_protocol':all(x in RESIDENT_EA_SOURCE for x in ('current.job','current.done','heartbeat.txt')),
         'resident_ea_warm_terminal':'TerminalClose' not in RESIDENT_EA_SOURCE,
-        'resident_ea_forward_path_host':"rel=f'MQLLibraryPreview/{job}/{binary.stem}'" in read_text(Path(__file__)),
+        'resident_ea_forward_path_host':_resident_indicator_rel('abc',Path('demo.ex5'))=='MQLLibraryPreview/abc/demo',
     }
     checks.update(self_test_discovery())
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
