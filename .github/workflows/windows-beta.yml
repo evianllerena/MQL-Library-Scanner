@@ -178,6 +178,10 @@ jobs:
           if($main -notmatch "'render-server'" -or $main -match "'render-library','--db'"){throw 'UI is not switched to resident render-server path'}
           if($main -notmatch 'mt5DataDir' -or $main -notmatch 'preview.mt5DataDir'){throw 'FIX 1 mt5_data_dir Settings control missing'}
           if($main -notmatch 'preview-library-config-error' -or $main -notmatch 'render_startup_config'){throw 'FIX 2 startup configuration error UI missing'}
+          if($bridge -notmatch "runtime_path\(sel,dest,'MT5','render-server'\)" -or $bridge -notmatch '_wait_for_render_runtime'){throw '4802 fix: compile pool is not targeting shared render runtime'}
+          if($bridge -notmatch 'render_artifact_missing' -or $bridge -notmatch 'ex5 missing in render runtime'){throw '4802 fix: pre-queue EX5 assertion missing'}
+          if($bridge -notmatch "add_argument\('--runtime-id'"){throw '4802 fix: runtime generation guard missing'}
+          if($lib -notmatch '"--runtime-id"' -or $lib -notmatch 'render_args.push'){throw '4802 fix: Rust runtime generation wiring missing'}
           $req=Get-Content engine/requirements-build.txt -Raw
           if($req -notmatch '(?m)^psutil'){throw 'psutil build dependency missing'}
           python engine/preview_control.py self-test
