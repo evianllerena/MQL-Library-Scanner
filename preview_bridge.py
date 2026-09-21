@@ -999,6 +999,13 @@ def _launch_resident_terminal(rt,terminalexe,sym,job_id):
         cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
 
 
+def _render_failure_message(err_code):
+    code=str(err_code or '')
+    if code=='4802':
+        return 'indicator OnInit failed (err 4802) — needs dependencies/inputs'
+    return f'render failed err={code}'
+
+
 def _render_server_fail(con,row,err,max_attempts=2):
     sha=row['sha256']
     current=con.execute(
@@ -1306,10 +1313,7 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
             else:
                 if done_payload and not done_payload.get('ok'):
                     err_code=str(done_payload.get('err') or '')
-                    if err_code=='4802':
-                        err='indicator OnInit failed (err 4802) — needs dependencies/inputs'
-                    else:
-                        err=f'render failed err={err_code}'
+                    err=_render_failure_message(err_code)
                     _render_server_fail(con,row,err,max_attempts)
                     emit_stage(job_id,'resident_job_failed',f'Resident EA completed with failure: {src.name}',
                                source=str(src),error=err,error_code=err_code)
@@ -2250,6 +2254,48 @@ def self_test_discovery():
         checks['runtime_selection_cache_written']=cache.is_file()
     return checks
 
+def self_test_render_dependencies():
+    checks={}
+    with tempfile.TemporaryDirectory() as td:
+        root=Path(td)
+        real=root/'Terminal'/'ABC123'; rt=root/'render'
+        (real/'config').mkdir(parents=True)
+        (real/'config'/'accounts.dat').write_bytes(b'account')
+        hist=real/'bases'/'broker'/'history'/'EURUSD';hist.mkdir(parents=True)
+        (hist/'2026.hcc').write_bytes(b'bars')
+
+        for path,data in (
+            (real/'MQL5'/'Indicators'/'Helpers'/'Helper.ex5',b'helper'),
+            (real/'MQL5'/'Include'/'Custom'/'Helper.mqh',b'header'),
+            (real/'MQL5'/'Libraries'/'CustomLib.ex5',b'library'),
+            (real/'MQL5'/'Files'/'settings.dat',b'data'),
+            (real.parent/'Common'/'Files'/'shared.dat',b'common'),
+            (real/'MQL5'/'Indicators'/'MQLLibraryPreview'/'stale.ex5',b'stale-preview'),
+            (real/'MQL5'/'Files'/'MQLLibRender'/'stale.txt',b'stale-protocol'),
+        ):
+            path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+
+        preview_keep=rt/'MQL5'/'Indicators'/'MQLLibraryPreview'/'live.ex5'
+        protocol_keep=rt/'MQL5'/'Files'/'MQLLibRender'/'current.job'
+        preview_keep.parent.mkdir(parents=True,exist_ok=True);preview_keep.write_bytes(b'live-preview')
+        protocol_keep.parent.mkdir(parents=True,exist_ok=True);protocol_keep.write_text('live-job',encoding='utf-8')
+        (rt/'.stamp').write_text('runtime-v1',encoding='utf-8')
+
+        seeded=seed_render_dependencies_from_data_dir(real,rt)
+        checks['dependency_seed_not_cached_first']=not seeded.get('cached',True)
+        checks['helper_indicator_seeded']=(rt/'MQL5'/'Indicators'/'Helpers'/'Helper.ex5').read_bytes()==b'helper'
+        checks['include_seeded']=(rt/'MQL5'/'Include'/'Custom'/'Helper.mqh').read_bytes()==b'header'
+        checks['library_seeded']=(rt/'MQL5'/'Libraries'/'CustomLib.ex5').read_bytes()==b'library'
+        checks['files_seeded']=(rt/'MQL5'/'Files'/'settings.dat').read_bytes()==b'data'
+        checks['common_seeded']=(rt/'Common'/'Files'/'shared.dat').read_bytes()==b'common'
+        checks['preview_workdir_preserved']=preview_keep.read_bytes()==b'live-preview' and not (rt/'MQL5'/'Indicators'/'MQLLibraryPreview'/'stale.ex5').exists()
+        checks['protocol_workdir_preserved']=protocol_keep.read_text(encoding='utf-8')=='live-job' and not (rt/'MQL5'/'Files'/'MQLLibRender'/'stale.txt').exists()
+        cached=seed_render_dependencies_from_data_dir(real,rt)
+        checks['dependency_seed_cached_second']=bool(cached.get('cached'))
+    checks['residual_4802_classified']=_render_failure_message('4802')=='indicator OnInit failed (err 4802) — needs dependencies/inputs'
+    return checks
+
+
 def self_test():
     src=mt5_capture_source('MQLLibraryPreview\\abc\\demo','shot.png','0')
     checks={
@@ -2275,6 +2321,7 @@ def self_test():
         'resident_ea_forward_path_host':_resident_indicator_rel('abc',Path('demo.ex5'))=='MQLLibraryPreview/abc/demo',
     }
     checks.update(self_test_discovery())
+    checks.update(self_test_render_dependencies())
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
     emit({'ok':True,'checks':checks})
 
