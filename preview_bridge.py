@@ -2463,7 +2463,7 @@ def _selftest_copy_png(source,target):
 def _selftest_label_from_error(error):
     msg=str(error or '')
     low=msg.lower()
-    if low.startswith('compile:') or 'compile failed' in low or 'produced no ex' in low:
+    if low.startswith('compile:') or 'compile failed' in low or 'compile-pool' in low or 'produced no ex' in low:
         return 'COMPILE_FAIL'
     if 'timeout' in low or 'hang' in low:
         return 'TIMEOUT'
@@ -2541,7 +2541,7 @@ def preview_selftest(out,sample=30,source=None,db=None,terminal=None,workers=4,h
             render_error.append(e)
 
     import threading
-    thread=threading.Thread(target=render_thread,name='mql-preview-selftest-render',daemon=False)
+    thread=threading.Thread(target=render_thread,name='mql-preview-selftest-render',daemon=True)
     thread.start()
     compile_error=None
     try:
