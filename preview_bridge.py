@@ -634,6 +634,46 @@ def seed_render_runtime_from_data_dir(real_data,rt):
             except Exception:pass
     return symbol,copied
 
+def seed_render_dependencies_from_data_dir(real_data,rt):
+    """Seed helper indicators/includes once per render-runtime build without touching preview work dirs."""
+    real_data=resolve_mt5_render_data_dir(real_data)
+    rt=Path(rt)
+    src_mql=real_data/'MQL5'; dst_mql=rt/'MQL5'
+    dst_mql.mkdir(parents=True,exist_ok=True)
+    marker=rt/'.render-dependencies-seed-v1'
+    stamp=rt/'.stamp'
+    try:runtime_stamp=stamp.read_text(encoding='utf-8',errors='ignore').strip()
+    except Exception:runtime_stamp=''
+    key=f'v1\n{str(real_data.resolve()).lower()}\n{runtime_stamp}'
+    if marker.is_file():
+        try:
+            if marker.read_text(encoding='utf-8',errors='ignore')==key:
+                return {'cached':True,'source':str(real_data),'trees':[]}
+        except Exception:pass
+
+    copied=[]
+    for name in ('Indicators','Include','Libraries','Files'):
+        src=src_mql/name
+        if not src.is_dir():continue
+        dst=dst_mql/name
+        def ignore_workdirs(path,names,root=src,name=name):
+            if Path(path)==root:
+                blocked=set()
+                if name=='Indicators' and 'MQLLibraryPreview' in names:blocked.add('MQLLibraryPreview')
+                if name=='Files' and 'MQLLibRender' in names:blocked.add('MQLLibRender')
+                return blocked
+            return set()
+        shutil.copytree(src,dst,dirs_exist_ok=True,ignore=ignore_workdirs)
+        copied.append(f'MQL5/{name}')
+
+    common_src=real_data.parent/'Common'
+    if common_src.is_dir():
+        shutil.copytree(common_src,rt/'Common',dirs_exist_ok=True)
+        copied.append('Common')
+
+    marker.write_text(key,encoding='utf-8')
+    return {'cached':False,'source':str(real_data),'trees':copied}
+
 def startupinfo():
     if os.name!='nt':return None
     si=subprocess.STARTUPINFO();si.dwFlags|=getattr(subprocess,'STARTF_USESHOWWINDOW',1);si.wShowWindow=SW_HIDE;return si
@@ -1122,6 +1162,10 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
         sym,copied_cfg=seed_render_runtime_from_data_dir(render_data,rt)
         emit_stage(job_id,'render_runtime_seeded','Seeded render runtime from logged-in MT5 data folder.',
                    data_dir=str(render_data),symbol=sym,config_files=copied_cfg)
+        dependency_seed=seed_render_dependencies_from_data_dir(render_data,rt)
+        emit_stage(job_id,'render_dependencies_seeded','Seeded real MT5 indicator/include dependencies into render runtime.',
+                   data_dir=str(render_data),cached=dependency_seed.get('cached',False),
+                   trees=dependency_seed.get('trees',[]))
         mql=rt/'MQL5'
         files,cur,done,hb=_resident_job_paths(mql)
         editor=rt/Path(sel['editor']).name
@@ -1261,10 +1305,14 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
                     (str(final),sha,sha));con.commit()
             else:
                 if done_payload and not done_payload.get('ok'):
-                    err=f"render failed err={done_payload.get('err')}"
+                    err_code=str(done_payload.get('err') or '')
+                    if err_code=='4802':
+                        err='indicator OnInit failed (err 4802) — needs dependencies/inputs'
+                    else:
+                        err=f'render failed err={err_code}'
                     _render_server_fail(con,row,err,max_attempts)
                     emit_stage(job_id,'resident_job_failed',f'Resident EA completed with failure: {src.name}',
-                               source=str(src),error=err)
+                               source=str(src),error=err,error_code=err_code)
                 else:
                     err='render hang/timeout'
                     _render_server_fail(con,row,err,max_attempts)
