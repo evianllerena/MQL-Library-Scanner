@@ -182,6 +182,12 @@ jobs:
           if($bridge -notmatch 'render_artifact_missing' -or $bridge -notmatch 'ex5 missing in render runtime'){throw '4802 fix: pre-queue EX5 assertion missing'}
           if($bridge -notmatch "add_argument\('--runtime-id'"){throw '4802 fix: runtime generation guard missing'}
           if($lib -notmatch '"--runtime-id"' -or $lib -notmatch 'render_args.push'){throw '4802 fix: Rust runtime generation wiring missing'}
+          if($bridge -notmatch 'seed_render_dependencies_from_data_dir' -or $bridge -notmatch "for name in \('Indicators','Include','Libraries','Files'\)"){throw 'Residual 4802 fix: render dependency seeding missing'}
+          if($bridge -notmatch "common_src=real_data.parent/'Common'"){throw 'Residual 4802 fix: Terminal Common seed missing'}
+          if($bridge -notmatch "f'/inc:{mqlroot}'"){throw 'Residual 4802 fix: MetaEditor /inc render-root compile flag missing'}
+          if($bridge -notmatch 'indicator OnInit failed \(err 4802\)' ){throw 'Residual 4802 fix: terminal OnInit failure classification missing'}
+          $previewUi=Get-Content ui/preview_ui.js -Raw
+          if($main -notmatch "Can't preview \(indicator won't initialize\)" -or $previewUi -notmatch "Can't preview \(indicator won't initialize\)"){throw 'Residual 4802 fix: cannot-preview UI label missing'}
           $req=Get-Content engine/requirements-build.txt -Raw
           if($req -notmatch '(?m)^psutil'){throw 'psutil build dependency missing'}
           python engine/preview_control.py self-test
