@@ -26,7 +26,7 @@ on:
       - 'tauri.conf.json'
       - 'windows/**'
   push:
-    branches: [main]
+    branches: [main, fix/overlay-selftest-real-pipeline]
     paths:
       - '.github/workflows/windows-beta.yml'
       - 'MQL-Indicator-Library-Repo-Ready.zip'
