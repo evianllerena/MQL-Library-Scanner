@@ -5,6 +5,11 @@ from pathlib import Path
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
 SW_HIDE=0
 
+RENDER_STARTUP_EXIT=42
+
+class RenderStartupError(RuntimeError):
+    pass
+
 def mql_dir_name(kind):
     """MetaTrader source directory name for a platform kind.
 
@@ -119,6 +124,23 @@ def _prepare_offline_runtime(rt):
             try:shutil.rmtree(child,ignore_errors=True)
             except Exception:pass
 
+
+def _prepare_render_runtime(rt):
+    """Remove transient UI state but preserve logged-in account and Algo-Trading config."""
+    rt=Path(rt)
+    for path in (
+        rt/'profiles'/'lastprofile.ini',
+        rt/'config'/'lastprofile.ini',
+        rt/'config'/'community.ini'
+    ):
+        try:path.unlink(missing_ok=True)
+        except Exception:pass
+    for base in (rt/'bases',):
+        if not base.exists():continue
+        for child in list(base.glob('*/news'))+list(base.glob('*/mail')):
+            try:shutil.rmtree(child,ignore_errors=True)
+            except Exception:pass
+
 def compile_has_errors(text):
     for m in re.finditer(r'(?i)(?:result\s*:\s*)?(\d+)\s+errors?\b',text or ''):
         try:
@@ -177,6 +199,59 @@ def same_path(a,b):
 
 def metatrader_data_root():
     return Path(os.environ.get('APPDATA',''))/'MetaQuotes'/'Terminal'
+
+
+def _tree_has_file(root):
+    root=Path(root)
+    if not root.exists():return False
+    try:
+        for item in root.rglob('*'):
+            if item.is_file():return True
+    except Exception:pass
+    return False
+
+def _render_data_activity(root):
+    root=Path(root); newest=0
+    for candidate in (
+        root/'config'/'accounts.dat',
+        root/'config'/'terminal.ini',
+        root/'config'/'common.ini',
+        root/'bases',
+        root/'history'
+    ):
+        try:newest=max(newest,candidate.stat().st_mtime_ns)
+        except Exception:pass
+    return newest
+
+def _valid_mt5_render_data_dir(root):
+    root=Path(root)
+    accounts=root/'config'/'accounts.dat'
+    history_ok=_tree_has_file(root/'bases') or _tree_has_file(root/'history')
+    return root.is_dir() and accounts.is_file() and accounts.stat().st_size>0 and history_ok
+
+def resolve_mt5_render_data_dir(configured=None):
+    if configured:
+        root=Path(os.path.expandvars(os.path.expanduser(str(configured).strip().strip('"'))))
+        if not _valid_mt5_render_data_dir(root):
+            raise RuntimeError(
+                f'MT5 data folder is not usable for rendering: {root}. '
+                'Expected config/accounts.dat plus non-empty bases/ or history/.')
+        return root
+    base=metatrader_data_root()
+    candidates=[]
+    if base.exists():
+        for root in base.iterdir():
+            if not root.is_dir():continue
+            try:
+                if _valid_mt5_render_data_dir(root):
+                    candidates.append((_render_data_activity(root),root))
+            except Exception:pass
+    if not candidates:
+        raise RuntimeError(
+            'No logged-in MT5 data folder was found. Set the MT5 data folder in Settings '
+            '(the MetaQuotes\\Terminal\\<hash> folder containing config\\accounts.dat and history).')
+    candidates.sort(key=lambda x:x[0],reverse=True)
+    return candidates[0][1]
 
 def observed_data_folders(base=None):
     base=Path(base) if base is not None else metatrader_data_root()
@@ -440,14 +515,19 @@ def seed_mql_runtime(t,rt,kind):
     if preview_dir.exists():shutil.rmtree(preview_dir,ignore_errors=True)
     return not marker_valid
 
+def runtime_path(t,out,kind,worker_id=None):
+    live=Path(t['data_dir'])
+    terminal_src=Path(t['terminal'])
+    token=hashlib.sha1((str(terminal_src)+'|'+str(live)).lower().encode()).hexdigest()[:10]
+    worker_suffix=('-'+safe_job_id(worker_id)) if worker_id else ''
+    return Path(out).parent/'preview-runtime'/'v5'/f'{kind.lower()}-{token}{worker_suffix}'
+
 def clone_runtime(t,out,kind,worker_id=None):
     install=Path(t['install_dir'])
     live=Path(t['data_dir'])
     terminal_src=Path(t['terminal'])
     editor_src=Path(t['editor'])
-    token=hashlib.sha1((str(terminal_src)+'|'+str(live)).lower().encode()).hexdigest()[:10]
-    worker_suffix=('-'+safe_job_id(worker_id)) if worker_id else ''
-    rt=out.parent/'preview-runtime'/'v5'/f'{kind.lower()}-{token}{worker_suffix}'
+    rt=runtime_path(t,out,kind,worker_id)
     stamp=f'v5:{terminal_src.stat().st_size}:{terminal_src.stat().st_mtime_ns}:{editor_src.stat().st_size}:{editor_src.stat().st_mtime_ns}:{str(live).lower()}'
     marker=rt/'.stamp'
     if not rt.exists() or not marker.exists() or marker.read_text(errors='ignore')!=stamp:
@@ -528,6 +608,71 @@ def copy_mt5_history(live,rt):
     try:shutil.copytree(src,dst)
     except Exception:pass
     return src.name
+
+
+def seed_render_runtime_from_data_dir(real_data,rt):
+    real_data=resolve_mt5_render_data_dir(real_data)
+    rt=Path(rt)
+    cfg_src=real_data/'config'; cfg_dst=rt/'config'; cfg_dst.mkdir(parents=True,exist_ok=True)
+    copied=[]
+    for name in ('accounts.dat','servers.dat','common.ini','terminal.ini'):
+        src=cfg_src/name
+        if src.is_file():
+            shutil.copy2(src,cfg_dst/name);copied.append(name)
+    if not (cfg_dst/'accounts.dat').is_file():
+        raise RuntimeError(f'Render seed is missing config/accounts.dat in {real_data}')
+    origin=real_data/'origin.txt'
+    if origin.is_file():
+        try:shutil.copy2(origin,rt/'origin.txt')
+        except Exception:pass
+    symbol=copy_mt5_history(real_data,rt)
+    if symbol=='EURUSD':
+        # Keep the existing MT5 history copier as the primary source; legacy history is a fallback.
+        legacy=real_data/'history'
+        if legacy.exists() and not (rt/'history').exists():
+            try:shutil.copytree(legacy,rt/'history',dirs_exist_ok=True)
+            except Exception:pass
+    return symbol,copied
+
+def seed_render_dependencies_from_data_dir(real_data,rt):
+    """Seed helper indicators/includes once per render-runtime build without touching preview work dirs."""
+    real_data=resolve_mt5_render_data_dir(real_data)
+    rt=Path(rt)
+    src_mql=real_data/'MQL5'; dst_mql=rt/'MQL5'
+    dst_mql.mkdir(parents=True,exist_ok=True)
+    marker=rt/'.render-dependencies-seed-v1'
+    stamp=rt/'.stamp'
+    try:runtime_stamp=stamp.read_text(encoding='utf-8',errors='ignore').strip()
+    except Exception:runtime_stamp=''
+    key=f'v1\n{str(real_data.resolve()).lower()}\n{runtime_stamp}'
+    if marker.is_file():
+        try:
+            if marker.read_text(encoding='utf-8',errors='ignore')==key:
+                return {'cached':True,'source':str(real_data),'trees':[]}
+        except Exception:pass
+
+    copied=[]
+    for name in ('Indicators','Include','Libraries','Files'):
+        src=src_mql/name
+        if not src.is_dir():continue
+        dst=dst_mql/name
+        def ignore_workdirs(path,names,root=src,name=name):
+            if Path(path)==root:
+                blocked=set()
+                if name=='Indicators' and 'MQLLibraryPreview' in names:blocked.add('MQLLibraryPreview')
+                if name=='Files' and 'MQLLibRender' in names:blocked.add('MQLLibRender')
+                return blocked
+            return set()
+        shutil.copytree(src,dst,dirs_exist_ok=True,ignore=ignore_workdirs)
+        copied.append(f'MQL5/{name}')
+
+    common_src=real_data.parent/'Common'
+    if common_src.is_dir():
+        shutil.copytree(common_src,rt/'Common',dirs_exist_ok=True)
+        copied.append('Common')
+
+    marker.write_text(key,encoding='utf-8')
+    return {'cached':False,'source':str(real_data),'trees':copied}
 
 def startupinfo():
     if os.name!='nt':return None
@@ -771,6 +916,18 @@ def _resident_indicator_rel(job,binary):
     return f'MQLLibraryPreview/{safe_job_id(job)}/{Path(binary).stem}'
 
 
+def _render_runtime_ready_marker(rt,runtime_id):
+    return Path(rt)/f'.render-runtime-ready-{safe_job_id(runtime_id)}'
+
+def _wait_for_render_runtime(rt,runtime_id,timeout=120):
+    marker=_render_runtime_ready_marker(rt,runtime_id)
+    deadline=time.time()+max(5,int(timeout))
+    while time.time()<deadline:
+        if marker.is_file() and (Path(rt)/'MQL5'/'Indicators').is_dir():
+            return marker
+        time.sleep(.25)
+    raise RuntimeError(f'Render runtime was not initialized for compile output: {rt}')
+
 def _resident_job_paths(mql):
     root=Path(mql)/'Files'/'MQLLibRender'
     root.mkdir(parents=True,exist_ok=True)
@@ -793,6 +950,20 @@ def _read_resident_heartbeat(hb):
     except Exception:return None
 
 
+def _wait_for_resident_startup(hb,proc,timeout=60):
+    start=time.time()
+    while time.time()-start<max(1,int(timeout)):
+        if proc.poll() is not None:
+            raise RenderStartupError(f'Render terminal exited before resident EA heartbeat (exit={proc.returncode}).')
+        beat=_read_resident_heartbeat(hb)
+        if beat and beat.get('beat'):
+            return beat
+        time.sleep(.5)
+    raise RenderStartupError(
+        'Render terminal started but the capture EA is not running. Usually means '
+        'the MT5 clone has no account (login wizard is blocking) or Algo Trading is off. '
+        'Set your MT5 data folder in Settings.')
+
 def _install_resident_ea(mql,editor,job_id):
     experts=Path(mql)/'Experts';experts.mkdir(parents=True,exist_ok=True)
     src=experts/'MQLLibRenderServer.mq5';built=src.with_suffix('.ex5')
@@ -811,16 +982,28 @@ def _install_resident_ea(mql,editor,job_id):
 
 
 def _launch_resident_terminal(rt,terminalexe,sym,job_id):
-    _prepare_offline_runtime(rt)
+    _prepare_render_runtime(rt)
+    ea=Path(rt)/'MQL5'/'Experts'/'MQLLibRenderServer.ex5'
+    if not ea.is_file() or not ea.stat().st_size:
+        raise RenderStartupError(f'Resident capture EA is missing or empty: {ea}')
     cfg=Path(rt)/f'render-server-{safe_job_id(job_id)}.ini'
-    cfg.write_text(
+    cfg_text=(
         '[Common]\nNewsEnable=0\n\n'
-        '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
-        f'[StartUp]\nSymbol={sym}\nPeriod=H1\nExpert=MQLLibRenderServer\nShutdownTerminal=0\n',
-        encoding='utf-8')
+        '[Experts]\nEnabled=1\nAllowLiveTrading=1\nAllowDllImport=0\n\n'
+        f'[StartUp]\nSymbol={sym}\nPeriod=H1\nExpert=MQLLibRenderServer\nShutdownTerminal=0\n')
+    if 'Expert=MQLLibRenderServer' not in cfg_text:
+        raise RenderStartupError('Render startup config does not reference MQLLibRenderServer exactly.')
+    cfg.write_text(cfg_text,encoding='utf-8')
     return subprocess.Popen(
         [str(terminalexe),'/portable',f'/config:{cfg}'],
         cwd=str(rt),creationflags=CREATE_NO_WINDOW,startupinfo=startupinfo())
+
+
+def _render_failure_message(err_code):
+    code=str(err_code or '')
+    if code=='4802':
+        return 'indicator OnInit failed (err 4802) — needs dependencies/inputs'
+    return f'render failed err={code}'
 
 
 def _render_server_fail(con,row,err,max_attempts=2):
@@ -894,7 +1077,7 @@ def _compile_pool_claim(con,limit):
         con.rollback();raise
 
 
-def compile_pool(db,out,terminal=None,workers=4,job_id=None):
+def compile_pool(db,out,terminal=None,workers=4,job_id=None,runtime_id=None):
     job_id=safe_job_id(job_id);dest=Path(out);workers=max(1,min(int(workers),8))
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
@@ -908,10 +1091,13 @@ def compile_pool(db,out,terminal=None,workers=4,job_id=None):
     con.commit()
 
     sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
-    rt=clone_runtime(sel,dest,'MT5','compile-pool')
+    shared_runtime_id=safe_job_id(runtime_id or job_id)
+    rt=runtime_path(sel,dest,'MT5','render-server')
+    _wait_for_render_runtime(rt,shared_runtime_id,120)
     mql=rt/'MQL5'
     editor=rt/Path(sel['editor']).name
-    emit_stage(job_id,'compile_pool_start',f'Starting MT5 compile pool with {workers} workers.',workers=workers)
+    emit_stage(job_id,'compile_pool_start',f'Starting MT5 compile pool with {workers} workers in shared render runtime.',
+               workers=workers,runtime=str(rt),runtime_id=shared_runtime_id)
 
     def compile_one(row):
         src=Path(row['path']);sha=row['sha256']
@@ -963,7 +1149,7 @@ def compile_pool(db,out,terminal=None,workers=4,job_id=None):
     emit({'ok':True,'job_id':job_id,'component':'compile_pool','finished':True,'compiled_done':completed})
 
 
-def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2):
+def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2,mt5_data_dir=None,runtime_id=None):
     job_id=safe_job_id(job_id);dest=Path(out)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
@@ -976,32 +1162,66 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
     _propagate_existing_ready(con)
 
     sel=load_runtime_cache(dest,'MT5') or choose_runtime('MT5',terminal)
-    rt=clone_runtime(sel,dest,'MT5','render-server')
-    hard_kill(None,rt)
-    mql=rt/'MQL5'
-    files,cur,done,hb=_resident_job_paths(mql)
-    sym=copy_mt5_history(Path(sel['data_dir']),rt)
-    editor=rt/Path(sel['editor']).name
-    terminalexe=rt/Path(sel['terminal']).name
-    _install_resident_ea(mql,editor,job_id)
+    try:
+        render_data=resolve_mt5_render_data_dir(mt5_data_dir)
+        rt=clone_runtime(sel,dest,'MT5','render-server')
+        hard_kill(None,rt)
+        sym,copied_cfg=seed_render_runtime_from_data_dir(render_data,rt)
+        emit_stage(job_id,'render_runtime_seeded','Seeded render runtime from logged-in MT5 data folder.',
+                   data_dir=str(render_data),symbol=sym,config_files=copied_cfg)
+        dependency_seed=seed_render_dependencies_from_data_dir(render_data,rt)
+        emit_stage(job_id,'render_dependencies_seeded','Seeded real MT5 indicator/include dependencies into render runtime.',
+                   data_dir=str(render_data),cached=dependency_seed.get('cached',False),
+                   trees=dependency_seed.get('trees',[]))
+        mql=rt/'MQL5'
+        files,cur,done,hb=_resident_job_paths(mql)
+        editor=rt/Path(sel['editor']).name
+        terminalexe=rt/Path(sel['terminal']).name
+        resident_ex5=_install_resident_ea(mql,editor,job_id)
+        if not resident_ex5 or not Path(resident_ex5).is_file() or not Path(resident_ex5).stat().st_size:
+            raise RenderStartupError('Resident capture EA did not compile to MQLLibRenderServer.ex5.')
+        shared_runtime_id=safe_job_id(runtime_id or job_id)
+        ready_marker=_render_runtime_ready_marker(rt,shared_runtime_id)
+        for stale in rt.glob('.render-runtime-ready-*'):
+            if stale!=ready_marker:
+                try:stale.unlink(missing_ok=True)
+                except Exception:pass
+        ready_marker.write_text(str(time.time()),encoding='utf-8')
+        emit_stage(job_id,'render_runtime_ready','Shared render runtime is ready for compile output.',
+                   runtime=str(rt),runtime_id=shared_runtime_id)
+    except Exception as e:
+        msg=str(e)
+        emit({'type':'fatal','job_id':job_id,'component':'render-server',
+              'fatal_kind':'render_startup_config','exit_code':RENDER_STARTUP_EXIT,'error':msg})
+        con.close()
+        raise SystemExit(RENDER_STARTUP_EXIT)
 
     for p in (cur,done,hb):
         try:p.unlink(missing_ok=True)
         except Exception:pass
 
     def launch():
-        for p in (cur,done,hb):
-            try:p.unlink(missing_ok=True)
+        for path in (cur,done,hb):
+            try:path.unlink(missing_ok=True)
             except Exception:pass
         proc=_launch_resident_terminal(rt,terminalexe,sym,job_id)
-        emit_stage(job_id,'resident_terminal_launch','Launching warm MT5 render terminal.',runtime=str(rt))
+        emit_stage(job_id,'resident_terminal_launch','Launching warm MT5 render terminal; waiting for resident EA heartbeat.',runtime=str(rt))
+        try:
+            beat=_wait_for_resident_startup(hb,proc,60)
+        except RenderStartupError:
+            hard_kill(proc,rt)
+            raise
+        emit_stage(job_id,'resident_ea_ready','Resident capture EA heartbeat received; render server is ready.',
+                   ea_beat=beat.get('beat'),inflight=beat.get('inflight'))
         return proc
 
-    proc=launch()
+    proc=None
     last_host_heartbeat=0.0
     idle_since=time.time()
+    relaunch_counts={}
 
     try:
+        proc=launch()
         while True:
             pause_reason=_worker_pause_reason(con,dest)
             if pause_reason:
@@ -1039,6 +1259,16 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
                 continue
 
             rel=_resident_indicator_rel(job,binary)
+            expected_ex5=mql/'Indicators'/'MQLLibraryPreview'/job/(Path(binary).stem+'.ex5')
+            if not expected_ex5.is_file() or not expected_ex5.stat().st_size:
+                err=f'ex5 missing in render runtime: {expected_ex5}'
+                con.execute(
+                    "UPDATE indicators SET preview_status='failed',preview_error=?,worker_id=NULL,"
+                    "preview_updated_at=datetime('now') WHERE sha256=?",
+                    (err[:800],sha));con.commit()
+                emit_stage(job_id,'render_artifact_missing','Compiled indicator is not staged in the render runtime.',
+                           source=str(src),expected_ex5=str(expected_ex5),sha256=sha)
+                continue
             shot=f'MQLLibRender/out_{job}.png'
             shotfile=mql/'Files'/shot
             shotfile.parent.mkdir(parents=True,exist_ok=True)
@@ -1081,19 +1311,38 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
                     "preview_updated_at=datetime('now'),preview_priority=0,worker_id=NULL WHERE sha256=?",
                     (str(final),sha,sha));con.commit()
             else:
-                err='render hang/timeout'
                 if done_payload and not done_payload.get('ok'):
-                    err=f"render failed err={done_payload.get('err')}"
-                _render_server_fail(con,row,err,max_attempts)
-                hard_kill(proc,rt)
-                try:cur.unlink(missing_ok=True)
-                except Exception:pass
-                proc=launch()
+                    err_code=str(done_payload.get('err') or '')
+                    err=_render_failure_message(err_code)
+                    _render_server_fail(con,row,err,max_attempts)
+                    emit_stage(job_id,'resident_job_failed',f'Resident EA completed with failure: {src.name}',
+                               source=str(src),error=err,error_code=err_code)
+                else:
+                    err='render hang/timeout'
+                    _render_server_fail(con,row,err,max_attempts)
+                    relaunch_counts[sha]=relaunch_counts.get(sha,0)+1
+                    count=relaunch_counts[sha]
+                    if count>=3:
+                        con.execute(
+                            "UPDATE indicators SET preview_status='failed',preview_error=?,worker_id=NULL,"
+                            "preview_updated_at=datetime('now') WHERE sha256=?",
+                            (f'{err}; relaunch cap reached ({count}/3)',sha));con.commit()
+                    emit_stage(job_id,'resident_job_hang',f'Resident EA heartbeat froze mid-job: {src.name}',
+                               source=str(src),relaunch_count=count,relaunch_cap=3)
+                    hard_kill(proc,rt)
+                    try:cur.unlink(missing_ok=True)
+                    except Exception:pass
+                    proc=launch()
 
             ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
             total=con.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
             emit({'type':'progress','job_id':job_id,'done':ready,'total':total})
             idle_since=time.time()
+    except RenderStartupError as e:
+        msg=str(e)
+        emit({'type':'fatal','job_id':job_id,'component':'render-server',
+              'fatal_kind':'render_startup_config','exit_code':RENDER_STARTUP_EXIT,'error':msg})
+        raise SystemExit(RENDER_STARTUP_EXIT)
     finally:
         hard_kill(proc,rt)
         con.close()
@@ -2005,6 +2254,48 @@ def self_test_discovery():
         checks['runtime_selection_cache_written']=cache.is_file()
     return checks
 
+def self_test_render_dependencies():
+    checks={}
+    with tempfile.TemporaryDirectory() as td:
+        root=Path(td)
+        real=root/'Terminal'/'ABC123'; rt=root/'render'
+        (real/'config').mkdir(parents=True)
+        (real/'config'/'accounts.dat').write_bytes(b'account')
+        hist=real/'bases'/'broker'/'history'/'EURUSD';hist.mkdir(parents=True)
+        (hist/'2026.hcc').write_bytes(b'bars')
+
+        for path,data in (
+            (real/'MQL5'/'Indicators'/'Helpers'/'Helper.ex5',b'helper'),
+            (real/'MQL5'/'Include'/'Custom'/'Helper.mqh',b'header'),
+            (real/'MQL5'/'Libraries'/'CustomLib.ex5',b'library'),
+            (real/'MQL5'/'Files'/'settings.dat',b'data'),
+            (real.parent/'Common'/'Files'/'shared.dat',b'common'),
+            (real/'MQL5'/'Indicators'/'MQLLibraryPreview'/'stale.ex5',b'stale-preview'),
+            (real/'MQL5'/'Files'/'MQLLibRender'/'stale.txt',b'stale-protocol'),
+        ):
+            path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+
+        preview_keep=rt/'MQL5'/'Indicators'/'MQLLibraryPreview'/'live.ex5'
+        protocol_keep=rt/'MQL5'/'Files'/'MQLLibRender'/'current.job'
+        preview_keep.parent.mkdir(parents=True,exist_ok=True);preview_keep.write_bytes(b'live-preview')
+        protocol_keep.parent.mkdir(parents=True,exist_ok=True);protocol_keep.write_text('live-job',encoding='utf-8')
+        (rt/'.stamp').write_text('runtime-v1',encoding='utf-8')
+
+        seeded=seed_render_dependencies_from_data_dir(real,rt)
+        checks['dependency_seed_not_cached_first']=not seeded.get('cached',True)
+        checks['helper_indicator_seeded']=(rt/'MQL5'/'Indicators'/'Helpers'/'Helper.ex5').read_bytes()==b'helper'
+        checks['include_seeded']=(rt/'MQL5'/'Include'/'Custom'/'Helper.mqh').read_bytes()==b'header'
+        checks['library_seeded']=(rt/'MQL5'/'Libraries'/'CustomLib.ex5').read_bytes()==b'library'
+        checks['files_seeded']=(rt/'MQL5'/'Files'/'settings.dat').read_bytes()==b'data'
+        checks['common_seeded']=(rt/'Common'/'Files'/'shared.dat').read_bytes()==b'common'
+        checks['preview_workdir_preserved']=preview_keep.read_bytes()==b'live-preview' and not (rt/'MQL5'/'Indicators'/'MQLLibraryPreview'/'stale.ex5').exists()
+        checks['protocol_workdir_preserved']=protocol_keep.read_text(encoding='utf-8')=='live-job' and not (rt/'MQL5'/'Files'/'MQLLibRender'/'stale.txt').exists()
+        cached=seed_render_dependencies_from_data_dir(real,rt)
+        checks['dependency_seed_cached_second']=bool(cached.get('cached'))
+    checks['residual_4802_classified']=_render_failure_message('4802')=='indicator OnInit failed (err 4802) — needs dependencies/inputs'
+    return checks
+
+
 def self_test():
     src=mt5_capture_source('MQLLibraryPreview\\abc\\demo','shot.png','0')
     checks={
@@ -2030,6 +2321,7 @@ def self_test():
         'resident_ea_forward_path_host':_resident_indicator_rel('abc',Path('demo.ex5'))=='MQLLibraryPreview/abc/demo',
     }
     checks.update(self_test_discovery())
+    checks.update(self_test_render_dependencies())
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
     emit({'ok':True,'checks':checks})
 
@@ -2040,8 +2332,8 @@ def main():
     p=s.add_parser('render');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=70);p.add_argument('--timeout',type=int,default=30);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id');p.add_argument('--worker-id');p.add_argument('--static-fast-fail',action='store_true',default=False)
-    p=s.add_parser('render-server');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--attempts',type=int,default=2)
-    p=s.add_parser('compile-pool');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--workers',type=int,default=4);p.add_argument('--job-id')
+    p=s.add_parser('render-server');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--attempts',type=int,default=2);p.add_argument('--mt5-data-dir');p.add_argument('--runtime-id')
+    p=s.add_parser('compile-pool');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--workers',type=int,default=4);p.add_argument('--job-id');p.add_argument('--runtime-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
     p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
@@ -2060,8 +2352,8 @@ def main():
             sel=load_runtime_cache(Path(x.out),'MT5') or choose_runtime('MT5',x.terminal)
             render_mt5_batch(mt5,x.out,sel,job)
     elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id,x.worker_id,x.static_fast_fail)
-    elif x.cmd=='render-server':render_server(x.db,x.out,x.terminal,x.job_id,x.hang_timeout,x.attempts)
-    elif x.cmd=='compile-pool':compile_pool(x.db,x.out,x.terminal,x.workers,x.job_id)
+    elif x.cmd=='render-server':render_server(x.db,x.out,x.terminal,x.job_id,x.hang_timeout,x.attempts,x.mt5_data_dir,x.runtime_id)
+    elif x.cmd=='compile-pool':compile_pool(x.db,x.out,x.terminal,x.workers,x.job_id,x.runtime_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)
     elif x.cmd=='remove-source':remove_source(x.db,x.source)
