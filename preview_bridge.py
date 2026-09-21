@@ -2467,7 +2467,7 @@ def _selftest_label_from_error(error):
         return 'COMPILE_FAIL'
     if 'timeout' in low or 'hang' in low:
         return 'TIMEOUT'
-    m=re.search(r'(?:err(?:or)?[ =:]*)\\(?([0-9]{3,5})\\)?',msg,re.I)
+    m=re.search(r'(?:err(?:or)?[ =:]*)\(?([0-9]{3,5})\)?',msg,re.I)
     return f'RENDER_FAIL({m.group(1)})' if m else 'RENDER_FAIL'
 
 def _selftest_contact_sheet(items,target):
@@ -2506,7 +2506,7 @@ def _selftest_print_summary(items,counts,draw_percent,passed):
     if bad:
         lines.append('');lines.append('BLANK / FAIL FILES')
         for item in bad:lines.append(f" - {item.get('label')}: {item.get('name')}")
-    sys.stderr.write('\\n'.join(lines)+'\\n');sys.stderr.flush()
+    sys.stderr.write('\n'.join(lines)+'\n');sys.stderr.flush()
 
 def preview_selftest(out,sample=30,source=None,db=None,terminal=None,workers=4,hang_timeout=40,min_draw_percent=60.0,mt5_data_dir=None):
     """Run a sampled preview test through production render code, then grade screenshots.
@@ -2549,9 +2549,24 @@ def preview_selftest(out,sample=30,source=None,db=None,terminal=None,workers=4,h
                      job_id='selftest-compile',runtime_id=runtime_id)
     except BaseException as e:
         compile_error=e
-    thread.join(timeout=max(120,hang_timeout*(max(1,len(mt5))+2)))
+    if compile_error:
+        cleanup=sqlite3.connect(testdb)
+        try:
+            cleanup.execute(
+                "UPDATE indicators SET preview_status='failed',preview_error=?,worker_id=NULL "
+                "WHERE preview_status IN ('pending','compiling','compiled','rendering')",
+                (('compile-pool aborted: '+str(compile_error))[:800],))
+            cleanup.commit()
+        finally:cleanup.close()
+    thread.join(timeout=max(90,hang_timeout*(max(1,len(mt5))+2)))
     if thread.is_alive():
         render_error.append(TimeoutError('Real resident render pipeline did not finish within the self-test deadline.'))
+        # The production render server is bounded by hang_timeout; this is a final self-test guard.
+        try:
+            sel=load_runtime_cache(pipeline_out,'MT5') or choose_runtime('MT5',terminal)
+            hard_kill(None,runtime_path(sel,pipeline_out,'MT5','render-server'))
+        except Exception:pass
+        thread.join(timeout=10)
     if compile_error and not baseline.is_file():
         raise RuntimeError(f'Real compile-pool self-test failed before baseline capture: {compile_error}')
     if render_error and not baseline.is_file():
@@ -2578,7 +2593,9 @@ def preview_selftest(out,sample=30,source=None,db=None,terminal=None,workers=4,h
             metrics=_selftest_image_metrics(baseline,dst,'MT5')
             item.update(metrics);item['png_path']=str(dst);item['label']='OK_DREW' if metrics['drew'] else 'BLANK'
         else:
-            item['label']=_selftest_label_from_error(err or f"render status={r.get('preview_status') or 'missing'}")
+            fallback=err or (str(render_error[0]) if render_error else f"render status={r.get('preview_status') or 'missing'}")
+            item['err']=fallback
+            item['label']=_selftest_label_from_error(fallback)
         items.append(item)
 
     mt4_out=root/'mt4-real'/'previews';mt4_out.mkdir(parents=True,exist_ok=True)
