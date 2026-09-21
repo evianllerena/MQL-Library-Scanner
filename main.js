@@ -19,7 +19,7 @@ app.innerHTML=`<div class="app"><aside class="sidebar"><div class="brand">MQL In
 <section id="library" class="view active"><div class="title-row"><div><h1>Indicator Library</h1><div class="muted">Truth-first classification with explicit evidence and abstention.</div></div></div><div class="cards"><div class="card"><div class="muted">All Indicators</div><div class="n" id="statTotal">0</div></div><div class="card"><div class="muted">MQL4</div><div class="n" id="statMq4">0</div></div><div class="card"><div class="muted">MQL5</div><div class="n" id="statMq5">0</div></div><div class="card"><div class="muted">Needs Review</div><div class="n" id="statReview">0</div></div><div class="card"><div class="muted">Verified</div><div class="n" id="statVerified">0</div></div></div><div class="toolbar"><select id="platformFilter"><option>ALL</option><option>MQL4</option><option>MQL5</option></select><select id="categoryFilter"><option>ALL</option>${categories.map(x=>`<option>${x}</option>`).join('')}</select><button class="btn" id="previewAllBtn">Prioritize filtered previews</button><div class="preview-cache-meter" title="Background preview cache progress"><div id="previewCacheBar"></div></div><span class="status" id="previewAllStatus"></span><span class="status" id="resultCount"></span></div><div class="table-wrap"><table><thead><tr>${header('Name','name')}${header('Platform','platform')}${header('Function','function')}${header('Status','status')}${header('Visual','visual')}${header('Confidence','confidence')}</tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty">No indicators yet. Add a folder from Scan.</div></div><div class="pager"><button class="btn" id="prevBtn">Previous</button><span id="pageInfo" class="status"></span><button class="btn" id="nextBtn">Next</button></div></section>
 <section id="scan" class="view"><div class="title-row"><div><h1>Scan Library</h1><div class="muted">Browse folders inside the app. Files remain visible while you choose the folder to scan.</div></div></div><div class="scan-panel"><button class="btn" id="addFolderBtn">+ Add Folder</button><div class="sources" id="sources"></div><div id="folderPreview" class="folder-preview"><div class="muted">No folder preview yet.</div></div><div style="margin-top:14px"><button class="btn primary" id="scanBtn">Scan Library</button></div><div class="progress"><div id="progressBar"></div></div><div class="status" id="scanText">Ready</div><div class="scan-stats"><div class="scan-stat"><div class="muted">Processed</div><b id="processed">0</b></div><div class="scan-stat"><div class="muted">Skipped</div><b id="skipped">0</b></div><div class="scan-stat"><div class="muted">Failed</div><b id="failed">0</b></div><div class="scan-stat"><div class="muted">Current</div><b id="current">0 / 0</b></div></div></div></section>
 <section id="review" class="view"><div class="title-row"><div><h1>Review Queue</h1><div class="muted">Only uncertain, unverified classifications appear here.</div></div></div><div class="review-note">Unknown is a valid truthful result. Verify or correct only when you know what the indicator does.</div><div class="table-wrap"><table><thead><tr>${header('Name','name')}${header('Platform','platform')}${header('Possible Function','function')}${header('Status','status')}${header('Confidence','confidence')}</tr></thead><tbody id="reviewRows"></tbody></table></div><div class="pager"><button class="btn" id="reviewPrevBtn">Previous</button><span id="reviewPageInfo" class="status"></span><button class="btn" id="reviewNextBtn">Next</button></div></section>
-<section id="settings" class="view"><div class="title-row"><div><h1>Settings</h1><div class="muted">0.4.0 keeps the core offline and stores classification evidence locally.</div></div></div><div class="scan-panel"><h3>Performance</h3><p class="muted">Library browsing uses direct Rust → SQLite queries with 500-row pages, a 50-row virtual window, lazy thumbnails, and whole-library sorting.</p><div class="diagnostic-card" id="previewWorkerCard"><h3>Preview Pipeline</h3><p class="muted">One warm MT5 terminal runs the resident render EA. A separate headless MetaEditor pool compiles indicators in parallel. Changes apply on the next pipeline start.</p><div class="preview-settings-grid"><label style="grid-column:1/-1">MT5 data folder<input id="mt5DataDir" type="text" placeholder="%APPDATA%\\MetaQuotes\\Terminal\\<hash>" title="Logged-in MT5 data folder containing config/accounts.dat and chart history"></label><label>Render hang timeout (sec)<input id="previewItemTimeout" type="number" min="10" max="180" value="40"></label><label>Max render attempts<input id="previewMaxAttempts" type="number" min="1" max="10" value="2"></label><label>Compile workers<input id="previewWorkers" type="number" min="1" max="8" value="4" title="Parallel MetaEditor compile processes"></label><label>Render terminals<input id="previewRenderServers" type="number" value="1" disabled title="Resident-EA architecture uses exactly one warm terminal"></label></div><div style="display:flex;gap:8px;margin-top:12px"><button class="btn" id="savePreviewWorkerSettings">Save Preview Settings</button><button class="btn" id="pausePreviewWorker">Pause Worker</button></div><div class="status" id="previewWorkerSettingsStatus" style="margin-top:9px">RENDER_TERMINALS=1 • COMPILE_WORKERS=4</div></div><div class="diagnostic-card"><h3>Diagnostics</h3><p class="muted">Export a support bundle containing application logs, scan engine output, errors, database health, timings, delays, paths, counts and startup diagnostics. Indicator source code is not copied.</p><button class="btn primary" id="exportDiagBtn">Export Diagnostic Bundle</button><div class="status" id="diagStatus" style="margin-top:10px">Ready</div></div><h3>Data</h3><div class="muted">Database location</div><div id="dbLocation" style="margin-top:7px;word-break:break-all"></div></div></section></div></main><aside class="detail" id="detail"><button class="btn close" id="closeDetail">×</button><div id="detailBody"></div></aside></div>
+<section id="settings" class="view"><div class="title-row"><div><h1>Settings</h1><div class="muted">0.4.0 keeps the core offline and stores classification evidence locally.</div></div></div><div class="scan-panel"><h3>Performance</h3><p class="muted">Library browsing uses direct Rust → SQLite queries with 500-row pages, a 50-row virtual window, lazy thumbnails, and whole-library sorting.</p><div class="diagnostic-card" id="previewWorkerCard"><h3>Preview Pipeline</h3><p class="muted">One warm MT5 terminal runs the resident render EA. A separate headless MetaEditor pool compiles indicators in parallel. Changes apply on the next pipeline start.</p><div class="preview-settings-grid"><label style="grid-column:1/-1">MT5 data folder<input id="mt5DataDir" type="text" placeholder="%APPDATA%\\MetaQuotes\\Terminal\\<hash>" title="Logged-in MT5 data folder containing config/accounts.dat and chart history"></label><label>Render hang timeout (sec)<input id="previewItemTimeout" type="number" min="40" max="180" value="40"></label><label>Max render attempts<input id="previewMaxAttempts" type="number" min="1" max="10" value="2"></label><label>Compile workers<input id="previewWorkers" type="number" min="1" max="8" value="4" title="Parallel MetaEditor compile processes"></label><label>Render terminals<input id="previewRenderServers" type="number" value="1" disabled title="Resident-EA architecture uses exactly one warm terminal"></label></div><div style="display:flex;gap:8px;margin-top:12px"><button class="btn" id="savePreviewWorkerSettings">Save Preview Settings</button><button class="btn" id="pausePreviewWorker">Pause Worker</button></div><div class="status" id="previewWorkerSettingsStatus" style="margin-top:9px">RENDER_TERMINALS=1 • COMPILE_WORKERS=4</div></div><div class="diagnostic-card" id="previewSelfTestCard"><h3>Preview Self-Test</h3><p class="muted">Render a 30-file sample through the real compile pool and resident MetaTrader pipeline, then automatically grade blank vs drawn previews.</p><button class="btn primary" id="runPreviewSelfTest">Run preview self-test</button><div class="status" id="previewSelfTestStatus" style="margin-top:10px">Ready</div><img id="previewSelfTestSheet" alt="Preview self-test contact sheet" style="display:none;width:100%;max-width:1200px;margin-top:12px;border-radius:8px;border:1px solid rgba(127,127,127,.25)"/></div><div class="diagnostic-card"><h3>Diagnostics</h3><p class="muted">Export a support bundle containing application logs, scan engine output, errors, database health, timings, delays, paths, counts and startup diagnostics. Indicator source code is not copied.</p><button class="btn primary" id="exportDiagBtn">Export Diagnostic Bundle</button><div class="status" id="diagStatus" style="margin-top:10px">Ready</div></div><h3>Data</h3><div class="muted">Database location</div><div id="dbLocation" style="margin-top:7px;word-break:break-all"></div></div></section></div></main><aside class="detail" id="detail"><button class="btn close" id="closeDetail">×</button><div id="detailBody"></div></aside></div>
 <div id="folderBrowser" class="browser-overlay hidden"><div class="browser-modal"><div class="browser-header"><div><h2>Select Folder</h2><div class="muted">Folders and files are shown together. Double-click a folder to open it.</div></div><button class="btn" id="browserClose">×</button></div><div class="browser-toolbar"><button class="btn" id="browserPc">This PC</button><button class="btn" id="browserUp">↑ Up</button><div class="browser-path" id="browserPath">This PC</div></div><div class="browser-list" id="browserList"></div><div class="browser-footer"><span class="status" id="browserStatus"></span><div><button class="btn" id="browserCancel">Cancel</button><button class="btn primary" id="browserUse">Use This Folder</button></div></div></div></div>`;
 
 const el=id=>document.getElementById(id);
@@ -35,7 +35,7 @@ function defaultPreviewWorkers(){
   return Math.min(4,cpuCap);
 }
 function previewWorkerConfig(){
-  const timeout=clampInt(localStorage.getItem('preview.timeout')||el('previewItemTimeout')?.value,40,10,180);
+  const timeout=clampInt(localStorage.getItem('preview.timeout')||el('previewItemTimeout')?.value,40,40,180);
   const attempts=clampInt(localStorage.getItem('preview.attempts')||el('previewMaxAttempts')?.value,2,1,10);
   const workers=clampInt(localStorage.getItem('preview.workers')||el('previewWorkers')?.value,defaultPreviewWorkers(),1,8);
   const mt5DataDir=(localStorage.getItem('preview.mt5DataDir')||el('mt5DataDir')?.value||'').trim();
@@ -51,7 +51,7 @@ function loadPreviewWorkerSettings(){
 }
 function savePreviewWorkerSettings(){
   const cfg={
-    timeout:clampInt(el('previewItemTimeout')?.value,40,10,180),
+    timeout:clampInt(el('previewItemTimeout')?.value,40,40,180),
     attempts:clampInt(el('previewMaxAttempts')?.value,2,1,10),
     workers:clampInt(el('previewWorkers')?.value,defaultPreviewWorkers(),1,8),
     mt5DataDir:(el('mt5DataDir')?.value||'').trim()
@@ -117,6 +117,72 @@ async function previewAllFiltered(){
 }
 
 window.__mqlQueuePreview=prioritizePreviewPaths;
+
+function parsePreviewSelfTestSummary(stdout){
+  const lines=String(stdout||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+  for(let i=lines.length-1;i>=0;i--){
+    try{const v=JSON.parse(lines[i]);if(v?.selftest)return v;}catch{}
+  }
+  return null;
+}
+
+async function runPreviewSelfTest(){
+  const button=el('runPreviewSelfTest'),status=el('previewSelfTestStatus'),sheet=el('previewSelfTestSheet');
+  button.disabled=true;sheet.style.display='none';sheet.removeAttribute('src');
+  status.textContent='Running real preview pipeline self-test…';
+  const cfg=previewWorkerConfig();
+  const wasPaused=previewWorkerPaused;
+  let pausedBySelfTest=false;
+  try{
+    if(!wasPaused){
+      const pause=await invoke('preview_worker_pause',{dbPath,paused:true});
+      previewWorkerPaused=!!pause.paused;
+      pausedBySelfTest=previewWorkerPaused;
+      el('pausePreviewWorker').textContent='Resume Worker';
+    }
+    const base=await appDataDir();
+    const args=['preview-selftest','--sample','30','--out',base,'--db',dbPath,
+      '--workers',String(cfg.workers),'--hang-timeout',String(Math.max(40,cfg.timeout)),
+      '--min-draw-percent','60'];
+    if(state.sources.length===1)args.push('--source',state.sources[0]);
+    if(cfg.mt5DataDir)args.push('--mt5-data-dir',cfg.mt5DataDir);
+    await logEvent('INFO','preview_selftest_requested',{sample:30,source:state.sources.length===1?state.sources[0]:null,workers:cfg.workers});
+    const cmd=Command.sidecar('binaries/mql-preview',args);
+    const result=await cmd.execute();
+    const summary=parsePreviewSelfTestSummary(result.stdout);
+    if(!summary)throw new Error(result.stderr||`Self-test exited ${result.code} without a summary`);
+    const counts=summary.counts||{};
+    const pieces=[`${Number(counts.OK_DREW||0)} OK_DREW`];
+    for(const [label,count] of Object.entries(counts)){
+      if(label==='OK_DREW')continue;
+      pieces.push(`${Number(count)} ${label}`);
+    }
+    status.textContent=`${pieces.join(' • ')} • ${Number(summary.draw_percent||0).toFixed(1)}% drew${summary.ok?'':' • below 60% threshold'}`;
+    if(summary.contact_sheet){
+      sheet.src=convertFileSrc(summary.contact_sheet)+`?cache=${Date.now()}`;
+      sheet.style.display='block';
+    }
+    await logEvent(summary.ok?'INFO':'WARN','preview_selftest_complete',{
+      code:result.code,counts,drawPercent:summary.draw_percent,report:summary.report,
+      contactSheet:summary.contact_sheet,failedFiles:summary.failed_files||[]
+    });
+  }catch(e){
+    status.textContent=`Preview self-test failed: ${e.message||e}`;
+    await logEvent('ERROR','preview_selftest_failed',{error:String(e)});
+  }finally{
+    if(pausedBySelfTest){
+      try{
+        await invoke('preview_worker_pause',{dbPath,paused:false});
+        previewWorkerPaused=false;el('pausePreviewWorker').textContent='Pause Worker';
+        void startPreviewLibraryWorker();
+      }catch(e){
+        await logEvent('ERROR','preview_selftest_resume_failed',{error:String(e)});
+      }
+    }
+    button.disabled=false;
+  }
+}
+
 async function ensureDb(){await timed('ensure_database',()=>engine(['stats','--db',dbPath]));}
 function queryArgs(reviewOnly,offset){return{dbPath,search:reviewOnly?'':state.search,platform:reviewOnly?'ALL':state.platform,category:reviewOnly?'ALL':state.category,reviewOnly,limit:state.pageSize,offset,sortBy:state.sortBy,sortDir:state.sortDir};}
 
@@ -278,7 +344,7 @@ document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>switchView(b.d
 document.querySelectorAll('th[data-sort]').forEach(h=>h.onclick=()=>changeSort(h.dataset.sort));
 el('searchBox').oninput=()=>{clearTimeout(window.__st);window.__st=setTimeout(()=>{state.search=el('searchBox').value;state.page=0;loadRows();},180);};
 el('platformFilter').onchange=()=>{state.platform=el('platformFilter').value;state.page=0;loadRows();};el('categoryFilter').onchange=()=>{state.category=el('categoryFilter').value;state.page=0;loadRows();};
-el('refreshBtn').onclick=reloadAll;el('previewAllBtn').onclick=previewAllFiltered;el('savePreviewWorkerSettings').onclick=savePreviewWorkerSettings;el('pausePreviewWorker').onclick=togglePreviewWorkerPause;addFolderBtn.onclick=openFolderBrowser;scanBtn.onclick=startScan;el('exportDiagBtn').onclick=exportDiagnostics;el('closeDetail').onclick=()=>el('detail').classList.remove('open');
+el('refreshBtn').onclick=reloadAll;el('previewAllBtn').onclick=previewAllFiltered;el('savePreviewWorkerSettings').onclick=savePreviewWorkerSettings;el('pausePreviewWorker').onclick=togglePreviewWorkerPause;el('runPreviewSelfTest').onclick=runPreviewSelfTest;addFolderBtn.onclick=openFolderBrowser;scanBtn.onclick=startScan;el('exportDiagBtn').onclick=exportDiagnostics;el('closeDetail').onclick=()=>el('detail').classList.remove('open');
 el('prevBtn').onclick=()=>{if(state.page>0){state.page--;loadRows();}};el('nextBtn').onclick=()=>{if((state.page+1)*state.pageSize<state.totalRows){state.page++;loadRows();}};
 el('reviewPrevBtn').onclick=()=>{if(state.reviewPage>0){state.reviewPage--;loadReview();}};el('reviewNextBtn').onclick=()=>{if((state.reviewPage+1)*state.pageSize<state.totalReview){state.reviewPage++;loadReview();}};
 el('browserClose').onclick=closeFolderBrowser;el('browserCancel').onclick=closeFolderBrowser;el('browserPc').onclick=()=>browseTo(null);el('browserUp').onclick=()=>{if(state.browserData?.parent)browseTo(state.browserData.parent);else browseTo(null);};el('browserUse').onclick=useBrowserFolder;
