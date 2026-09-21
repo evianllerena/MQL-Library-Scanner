@@ -194,6 +194,7 @@ function previewStateText(r){
   if(r.preview_status==='compiling')return 'Compiling preview…';
   if(r.preview_status==='compiled')return 'Compiled • waiting for render';
   if(r.preview_status==='rendering')return 'Rendering in warm terminal…';
+  if(r.preview_status==='failed'&&String(r.preview_error||'').includes('indicator OnInit failed (err 4802)'))return "Can't preview (indicator won't initialize)";
   if(r.preview_status==='failed')return "Can't preview";
   return 'Preview pending';
 }
