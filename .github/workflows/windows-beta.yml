@@ -184,7 +184,7 @@ jobs:
           if($lib -notmatch '"--runtime-id"' -or $lib -notmatch 'render_args.push'){throw '4802 fix: Rust runtime generation wiring missing'}
           if($bridge -notmatch 'seed_render_dependencies_from_data_dir' -or $bridge -notmatch "for name in \('Indicators','Include','Libraries','Files'\)"){throw 'Residual 4802 fix: render dependency seeding missing'}
           if($bridge -notmatch "common_src=real_data.parent/'Common'"){throw 'Residual 4802 fix: Terminal Common seed missing'}
-          if($bridge -notmatch 'if\(bc>0\)' -or $bridge -notmatch 'stable>=5' -or $bridge -notmatch 'for\(int i=0;i<60;i\)'){throw 'Overlay fix: resident EA does not wait for calculated buffers'}
+          if($bridge -notmatch 'if\(bc>0\)' -or $bridge -notmatch 'stable>=5' -or $bridge -notmatch 'for\(int i=0;i<60;i\+\+\)'){throw 'Overlay fix: resident EA does not wait for calculated buffers'}
           if($bridge -notmatch 'CopyRates\(_Symbol,_Period,0,3000,rr\)' -or $bridge -notmatch 'ChartNavigate\(0,CHART_END,0\)'){throw 'Overlay fix: deep history/end-of-chart paint setup missing'}
           if($bridge -notmatch 'hang_timeout=max\(40' ){throw 'Overlay fix: render-server hang timeout is not clamped to >=40 seconds'}
           if($bridge -notmatch 'def preview_selftest' -or $bridge -notmatch "add_parser\('preview-selftest'\)"){throw 'Real preview-selftest command missing'}
