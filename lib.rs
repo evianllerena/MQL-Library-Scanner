@@ -261,6 +261,65 @@ fn start_preview_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Value
 }
 
 #[tauri::command]
+fn start_backtest_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, String> {
+    let cmd0 = args.first().map(String::as_str);
+    if cmd0 != Some("plan") && cmd0 != Some("run") {
+        return Err("Only the plan and run commands are permitted through start_backtest_batch".into());
+    }
+    let db_path = args.windows(2).find(|w| w[0] == "--db").map(|w| w[1].clone()).unwrap_or_default();
+    let current = std::env::current_exe().map_err(|e| format!("Cannot resolve app executable: {}", e))?;
+    let dir = current.parent().ok_or_else(|| "Cannot resolve application folder".to_string())?;
+    #[cfg(target_os = "windows")]
+    let engine_path = dir.join("mql-backtest-batch.exe");
+    #[cfg(not(target_os = "windows"))]
+    let engine_path = dir.join("mql-backtest-batch");
+    if !engine_path.exists() {
+        append_log(&db_path,"ERROR","backtest_batch_missing",json!({"path":engine_path}),None);
+        return Err(format!("Batch backtest engine was not found at {}", engine_path.display()));
+    }
+    append_log(&db_path,"INFO","backtest_batch_start",json!({"engine":engine_path,"args":args}),None);
+    let mut cmd = ProcessCommand::new(&engine_path);
+    cmd.args(&args)
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        append_log(&db_path,"ERROR","backtest_batch_spawn_failed",json!({"error":e.to_string()}),None);
+        format!("Could not start batch backtest engine: {}", e)
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| "Could not capture batch output".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "Could not capture batch errors".to_string())?;
+    let app_out = app.clone();
+    let db_out = db_path.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            append_log(&db_out,"INFO","backtest_batch_stdout",json!({"line":line}),None);
+            let _ = app_out.emit("backtest-batch-line", json!({"line": line}));
+        }
+    });
+    let app_err = app.clone();
+    let db_err = db_path.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            append_log(&db_err,"ERROR","backtest_batch_stderr",json!({"line":line}),None);
+            let _ = app_err.emit("backtest-batch-stderr", json!({"line": line}));
+        }
+    });
+    std::thread::spawn(move || {
+        let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+        append_log(&db_path, if code==0{"INFO"}else{"ERROR"}, "backtest_batch_done", json!({"code":code}), None);
+        let _ = app.emit("backtest-batch-done", json!({"code": code}));
+    });
+    Ok(json!({"started":true,"engine":engine_path.to_string_lossy()}))
+}
+
+#[tauri::command]
 fn db_stats(db_path: String) -> Result<Value, String> {
     let started=Instant::now();
     let conn = open_db(&db_path)?;
@@ -344,6 +403,78 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
     let mut rows_out=Vec::new();
     for row in mapped { rows_out.push(row.map_err(|e|e.to_string())?); }
     Ok(json!({"rows":rows_out,"total":total,"limit":limit,"offset":offset,"sort_by":sort_by,"sort_dir":sort_dir}))
+}
+
+fn backtest_sort_sql(sort_by: &str, sort_dir: &str) -> String {
+    let col = match sort_by {
+        "expectancy" => "bt.expectancy_pips",
+        "profit_factor" => "bt.profit_factor",
+        "max_drawdown" => "bt.max_drawdown",
+        "win_rate" => "bt.win_rate",
+        "trades" => "bt.trades",
+        "name" => "i.filename COLLATE NOCASE",
+        _ => "bt.expectancy_pips",
+    };
+    let dir = if sort_dir.eq_ignore_ascii_case("asc") { "ASC" } else { "DESC" };
+    format!("{} {}", col, dir)
+}
+
+#[tauri::command]
+fn db_backtest_query(db_path:String, slot:String, bed:String, search:String, min_trades:Option<i64>, limit:i64, offset:i64, sort_by:Option<String>, sort_dir:Option<String>) -> Result<Value,String> {
+    let conn=open_db(&db_path)?;
+    let min_trades=min_trades.unwrap_or(30).max(0);
+    let mut clauses:Vec<String>=vec!["bt.bed != ''".into()]; // '' rows are pre-test candidacy from nnfx_map, not results
+    let mut vals:Vec<String>=Vec::new();
+    if slot!="ALL" && !slot.is_empty() { clauses.push("bt.slot=?".into()); vals.push(slot); }
+    if !bed.is_empty() { clauses.push("bt.bed=?".into()); vals.push(bed); }
+    if !search.trim().is_empty() {
+        clauses.push("i.filename LIKE ?".into());
+        vals.push(format!("%{}%",search));
+    }
+    let where_sql=format!(" WHERE {}",clauses.join(" AND "));
+    let total_sql=format!("SELECT COUNT(*) FROM backtest_results bt JOIN indicators i ON i.sha256=bt.sha256{}",where_sql);
+    let mut total_stmt=conn.prepare(&total_sql).map_err(|e|e.to_string())?;
+    let total:i64=total_stmt.query_row(rusqlite::params_from_iter(vals.iter()),|r|r.get(0)).map_err(|e|e.to_string())?;
+
+    // insufficient-sample rows (trades < min_trades) never rank above real
+    // results, regardless of the chosen sort column (NNFX_INTEGRATION_PLAN.txt
+    // STEP 5B: "Rows with trades < MIN ... never rank at the top").
+    let order=format!("CASE WHEN bt.trades>=? THEN 0 ELSE 1 END, {}", backtest_sort_sql(sort_by.as_deref().unwrap_or("expectancy"),sort_dir.as_deref().unwrap_or("desc")));
+    let sql=format!(
+        "SELECT bt.id,bt.sha256,bt.slot,bt.signal_type,bt.bed,bt.stage,bt.trades,bt.wins,bt.losses,bt.win_rate,\
+         bt.expectancy_pips,bt.profit_factor,bt.max_drawdown,bt.net_pips,bt.net_pips_saved,bt.bridge_skips,\
+         bt.continuation_trades,bt.trade_log_path,bt.tested_at,bt.mapping_source,bt.mapping_reason,\
+         bt.zero_reference,bt.buf_a,bt.buf_b,i.filename,i.path,i.platform \
+         FROM backtest_results bt JOIN indicators i ON i.sha256=bt.sha256{} ORDER BY {} LIMIT ? OFFSET ?",
+        where_sql, order
+    );
+    let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;
+    // params order: [min_trades_for_case, ...where-clause-vals..., limit, offset]
+    let mut bind:Vec<String>=Vec::new();
+    bind.push(min_trades.to_string());
+    bind.extend(vals.iter().cloned());
+    bind.push(limit.clamp(1,500).to_string());
+    bind.push(offset.max(0).to_string());
+    let mapped=stmt.query_map(rusqlite::params_from_iter(bind.iter()),|r| {
+        let trades:i64=r.get(6)?;
+        Ok(json!({
+          "id":r.get::<_,i64>(0)?, "sha256":r.get::<_,String>(1)?, "slot":r.get::<_,String>(2)?,
+          "signal_type":r.get::<_,Option<String>>(3)?, "bed":r.get::<_,String>(4)?, "stage":r.get::<_,Option<i64>>(5)?,
+          "trades":trades, "wins":r.get::<_,Option<i64>>(7)?, "losses":r.get::<_,Option<i64>>(8)?,
+          "win_rate":r.get::<_,Option<f64>>(9)?, "expectancy_pips":r.get::<_,Option<f64>>(10)?,
+          "profit_factor":r.get::<_,Option<f64>>(11)?, "max_drawdown":r.get::<_,Option<f64>>(12)?,
+          "net_pips":r.get::<_,Option<f64>>(13)?, "net_pips_saved":r.get::<_,Option<f64>>(14)?,
+          "bridge_skips":r.get::<_,Option<i64>>(15)?, "continuation_trades":r.get::<_,Option<i64>>(16)?,
+          "trade_log_path":r.get::<_,Option<String>>(17)?, "tested_at":r.get::<_,Option<String>>(18)?,
+          "mapping_source":r.get::<_,Option<String>>(19)?, "mapping_reason":r.get::<_,Option<String>>(20)?,
+          "zero_reference":r.get::<_,Option<f64>>(21)?, "buf_a":r.get::<_,Option<i64>>(22)?, "buf_b":r.get::<_,Option<i64>>(23)?,
+          "filename":r.get::<_,String>(24)?, "path":r.get::<_,String>(25)?, "platform":r.get::<_,String>(26)?,
+          "insufficient_sample": trades < min_trades
+        }))
+    }).map_err(|e|e.to_string())?;
+    let mut rows_out=Vec::new();
+    for row in mapped { rows_out.push(row.map_err(|e|e.to_string())?); }
+    Ok(json!({"rows":rows_out,"total":total,"limit":limit,"offset":offset,"min_trades":min_trades}))
 }
 
 #[tauri::command]
@@ -457,7 +588,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,app_log,export_diagnostics])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,app_log,export_diagnostics,start_backtest_batch,db_backtest_query])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }

@@ -78,6 +78,8 @@ jobs:
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
           Copy-Item "$r/preview_batch.py" 'engine/preview_batch.py' -Force
           Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
+          Copy-Item "$r/nnfx_backtest_batch.py" 'engine/nnfx_backtest_batch.py' -Force
+          Copy-Item "$r/nnfx_engine.py" 'engine/nnfx_engine.py' -Force
           Copy-Item "$r/main.js" 'ui/main.js' -Force
           Copy-Item "$r/preview_ui.js" 'ui/preview_ui.js' -Force
           Copy-Item "$r/index.html" 'index.html' -Force
@@ -105,7 +107,7 @@ jobs:
         shell: pwsh
         run: |
           Set-Location $env:APP_DIR
-          python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py
+          python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py engine/nnfx_backtest_batch.py engine/nnfx_engine.py
           node --check ui/main.js
           node --check ui/preview_ui.js
           $packageVersion=(Get-Content package.json -Raw | ConvertFrom-Json).version
@@ -157,11 +159,13 @@ jobs:
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview --distpath build-sidecar --workpath build-pyinstaller-preview --specpath build-pyinstaller-preview engine/preview_bridge.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-batch --distpath build-sidecar --workpath build-pyinstaller-preview-batch --specpath build-pyinstaller-preview-batch engine/preview_batch.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-control --distpath build-sidecar --workpath build-pyinstaller-control --specpath build-pyinstaller-control engine/preview_control.py
+          python -m PyInstaller --noconfirm --clean --onefile --name mql-backtest-batch --distpath build-sidecar --workpath build-pyinstaller-backtest-batch --specpath build-pyinstaller-backtest-batch engine/nnfx_backtest_batch.py
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
           Copy-Item build-sidecar/mql-engine.exe src-tauri/binaries/mql-engine-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview.exe src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview-batch.exe src-tauri/binaries/mql-preview-batch-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview-control.exe src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe -Force
+          Copy-Item build-sidecar/mql-backtest-batch.exe src-tauri/binaries/mql-backtest-batch-x86_64-pc-windows-msvc.exe -Force
 
       - name: Validate packaged engines
         shell: pwsh

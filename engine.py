@@ -3,10 +3,10 @@ import argparse, json, os, sqlite3, sys, time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable
-from engine_core import Analysis, analyze
+from engine_core import Analysis, analyze, nnfx_slot_signal
 
-SCHEMA_VERSION = 3
-JSON_FIELDS = ['draw_types','standard_indicators','custom_dependencies','secondary_categories','behavior_tags','techniques','evidence','warnings','user_tags']
+SCHEMA_VERSION = 4
+JSON_FIELDS = ['draw_types','standard_indicators','custom_dependencies','secondary_categories','behavior_tags','techniques','evidence','warnings','user_tags','line_buffer_indices']
 
 # Windows/PyInstaller can otherwise inherit a legacy ANSI console encoding even
 # when the parent process consumes UTF-8. Keep the engine protocol UTF-8.
@@ -64,6 +64,20 @@ def migrate(conn):
       id INTEGER PRIMARY KEY, indicator_id INTEGER, family_fingerprint TEXT, original_primary TEXT, corrected_primary TEXT,
       corrected_secondary TEXT DEFAULT '[]', evidence_snapshot TEXT DEFAULT '[]', created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS backtest_results(
+      id INTEGER PRIMARY KEY,
+      sha256 TEXT NOT NULL,
+      slot TEXT NOT NULL,            -- CONFIRMATION | BASELINE | VOLUME | EXIT
+      signal_type TEXT,             -- ZERO_CROSS | TWO_LINE_CROSS | ARROW
+      bed TEXT,                     -- e.g. "EURUSD|D1|2020-2025"
+      stage INTEGER,                -- 1 = standard bed, 2 = robustness basket
+      trades INTEGER, wins INTEGER, losses INTEGER,
+      win_rate REAL, expectancy_pips REAL, profit_factor REAL,
+      max_drawdown REAL, net_pips REAL, net_pips_saved REAL,  -- saved = VOLUME slot
+      bridge_skips INTEGER, continuation_trades INTEGER,      -- rule audit counts
+      trade_log_path TEXT, tested_at TEXT,
+      UNIQUE(sha256, slot, bed)
+    );
     CREATE INDEX IF NOT EXISTS idx_sha ON indicators(sha256);
     CREATE INDEX IF NOT EXISTS idx_primary ON indicators(primary_category);
     CREATE INDEX IF NOT EXISTS idx_status ON indicators(classification_status);
@@ -73,13 +87,32 @@ def migrate(conn):
     CREATE INDEX IF NOT EXISTS idx_mtime_size ON indicators(mtime_ns,size);
     CREATE INDEX IF NOT EXISTS idx_family ON indicators(family_fingerprint);
     CREATE INDEX IF NOT EXISTS idx_verified ON indicators(human_verified);
+    CREATE INDEX IF NOT EXISTS ix_bt_slot ON backtest_results(slot);
+    CREATE INDEX IF NOT EXISTS ix_bt_sha ON backtest_results(sha256);
     ''')
+    # backtest_results is new (STEP 1 of NNFX_INTEGRATION_PLAN.txt). CREATE TABLE
+    # IF NOT EXISTS above already makes existing DBs upgrade cleanly with zero
+    # rows lost; this table_info check is the same guard style used for
+    # `indicators` below. The columns mirror the indicators verify/correct flow
+    # (human_verified/verified_primary/verified_secondary/verified_at) so a
+    # per-indicator slot/signal_type override (STEP 2, wired up later) never
+    # needs another migration.
+    bt_additions={
+      'mapping_source':"TEXT DEFAULT 'auto'",'mapping_reason':'TEXT','human_verified':'INTEGER DEFAULT 0',
+      'verified_slot':'TEXT','verified_signal_type':'TEXT','verified_at':'TEXT','zero_reference':'REAL',
+      'buf_a':'INTEGER','buf_b':'INTEGER'  # real resolved buffer index/indices (fast/slow for
+                                            # CONFIRMATION_1, single main buffer -- buf_b NULL -- otherwise)
+    }
+    bt_existing=cols(conn,'backtest_results')
+    for name,decl in bt_additions.items():
+        if name not in bt_existing: conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {name} {decl}')
     additions={
       'techniques':"TEXT DEFAULT '[]'",'evidence':"TEXT DEFAULT '[]'",'classification_status':"TEXT DEFAULT 'Unknown'",
       'review_reason':"TEXT DEFAULT ''",'classifier_version':"TEXT DEFAULT ''",'family_fingerprint':"TEXT DEFAULT ''",
       'family_id':'TEXT','human_verified':'INTEGER DEFAULT 0','verified_primary':'TEXT','verified_secondary':"TEXT DEFAULT '[]'",
       'verified_at':'TEXT','mtime_ns':'INTEGER DEFAULT 0','scan_status':"TEXT DEFAULT 'complete'",'user_favorite':'INTEGER DEFAULT 0','user_tags':"TEXT DEFAULT '[]'",
-      'preview_status':"TEXT DEFAULT 'pending'",'preview_path':'TEXT','preview_hash':'TEXT','preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT'
+      'preview_status':"TEXT DEFAULT 'pending'",'preview_path':'TEXT','preview_hash':'TEXT','preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT',
+      'line_buffer_indices':"TEXT DEFAULT '[]'"
     }
     existing=cols(conn,'indicators')
     for name,decl in additions.items():
@@ -142,7 +175,7 @@ def save_analysis(conn,a:Analysis,mtime_ns:int):
 
 def unchanged(conn,p):
     st=p.stat(); row=conn.execute('SELECT size,mtime_ns,scan_status,classifier_version FROM indicators WHERE path=?',(display_path(p),)).fetchone()
-    return bool(row and row['scan_status']=='complete' and row['size']==st.st_size and row['mtime_ns']==st.st_mtime_ns and row['classifier_version']=='evidence-v4')
+    return bool(row and row['scan_status']=='complete' and row['size']==st.st_size and row['mtime_ns']==st.st_mtime_ns and row['classifier_version']=='evidence-v5')
 
 def empty_scan_message(diagnostics):
     parts=[]
@@ -211,13 +244,66 @@ def stats(db):
         print(json.dumps(result,ensure_ascii=True,default=str),flush=True)
     conn.close()
 
+def nnfx_map(db):
+    """NNFX_INTEGRATION_PLAN.txt STEP 2: derive slot/signal_type for every
+    non-duplicate indicator from fields the scanner already stored, and write
+    a pre-test candidacy row (bed='') into backtest_results. Never overwrites
+    a row a human has already corrected (mapping_source='user'), so it is
+    always safe to re-run after a rescan or a Review-queue correction."""
+    conn=connect(db)
+    rows=conn.execute(
+        "SELECT sha256, visual_category, display_location, primary_category, human_verified, verified_primary, "
+        "standard_indicators, techniques, path, line_plots, evidence, declared_buffers, line_buffer_indices "
+        "FROM indicators WHERE duplicate_of IS NULL AND sha256 IS NOT NULL"
+    ).fetchall()
+    counts={}; processed=0; skipped_user=0
+    for r in rows:
+        sha=r['sha256']
+        existing=conn.execute("SELECT mapping_source FROM backtest_results WHERE sha256=? AND bed=''",(sha,)).fetchone()
+        if existing and existing['mapping_source']=='user':
+            skipped_user+=1
+            continue
+        effective_primary=r['verified_primary'] if r['human_verified'] and r['verified_primary'] else r['primary_category']
+        try: std=json.loads(r['standard_indicators'] or '[]')
+        except Exception: std=[]
+        try: techs=json.loads(r['techniques'] or '[]')
+        except Exception: techs=[]
+        try: evidence=json.loads(r['evidence'] or '[]')
+        except Exception: evidence=[]
+        try: line_buf_idx=json.loads(r['line_buffer_indices'] or '[]')
+        except Exception: line_buf_idx=[]
+        slot,signal_type,zero_ref,buf_a,buf_b,reason=nnfx_slot_signal(
+            r['visual_category'],r['display_location'],effective_primary,std,techs,r['path'],
+            line_plots=r['line_plots'],evidence=evidence,declared_buffers=r['declared_buffers'],
+            line_buffer_indices=line_buf_idx
+        )
+        conn.execute("DELETE FROM backtest_results WHERE sha256=? AND bed='' AND mapping_source='auto'",(sha,))
+        conn.execute(
+            "INSERT INTO backtest_results(sha256,slot,signal_type,zero_reference,buf_a,buf_b,bed,mapping_source,mapping_reason) "
+            "VALUES(?,?,?,?,?,?,'','auto',?) "
+            "ON CONFLICT(sha256,slot,bed) DO UPDATE SET signal_type=excluded.signal_type,zero_reference=excluded.zero_reference,"
+            "buf_a=excluded.buf_a,buf_b=excluded.buf_b,mapping_reason=excluded.mapping_reason,mapping_source='auto'",
+            (sha,slot,signal_type,zero_ref,buf_a,buf_b,reason)
+        )
+        counts[slot]=counts.get(slot,0)+1; processed+=1
+    conn.commit()
+    result={'processed':processed,'skipped_user_overridden':skipped_user,'by_slot':counts}
+    text=json.dumps(result,ensure_ascii=False,default=str)+'\n'
+    try:
+        sys.stdout.buffer.write(text.encode('utf-8',errors='backslashreplace')); sys.stdout.buffer.flush()
+    except Exception:
+        print(json.dumps(result,ensure_ascii=True,default=str),flush=True)
+    conn.close()
+
 def main():
     ap=argparse.ArgumentParser(prog='mql-engine'); sub=ap.add_subparsers(dest='cmd',required=True)
     sp=sub.add_parser('scan'); sp.add_argument('--db',required=True); sp.add_argument('--source',action='append',required=True); sp.add_argument('--force',action='store_true')
     sp=sub.add_parser('stats'); sp.add_argument('--db',required=True)
+    sp=sub.add_parser('nnfx-map'); sp.add_argument('--db',required=True)
     args=ap.parse_args(); db=Path(args.db)
     if args.cmd=='scan': scan(db,[Path(x) for x in args.source],args.force)
     elif args.cmd=='stats': stats(db)
+    elif args.cmd=='nnfx-map': nnfx_map(db)
 if __name__=='__main__':
     try: main()
     except Exception as exc:
