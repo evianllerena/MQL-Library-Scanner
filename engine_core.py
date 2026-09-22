@@ -34,6 +34,7 @@ class Analysis:
     active_buffers: int = 0
     draw_types: list[str] = field(default_factory=list)
     line_plots: int = 0
+    line_buffer_indices: list[int] = field(default_factory=list)
     histogram_plots: int = 0
     arrow_plots: int = 0
     filling_plots: int = 0
@@ -48,7 +49,8 @@ class Analysis:
     evidence: list[dict] = field(default_factory=list)
     classification_status: str = 'Unknown'
     review_reason: str = ''
-    classifier_version: str = 'evidence-v4'
+    classifier_version: str = 'evidence-v5'  # v5: adds line_buffer_indices (NNFX Part B needs real
+                                              # buffer indices, not a 0/1 guess -- see nnfx_slot_signal)
     confidence: int = 0
     warnings: list[str] = field(default_factory=list)
     duplicate_of: str | None = None
@@ -118,6 +120,171 @@ def infer_visual(a: Analysis) -> str:
         return 'One-Line' if a.line_plots==1 else ('Two-Line' if a.line_plots==2 else 'Multi-Line')
     if a.object_usage: return 'Objects'
     return 'Unknown'
+
+ZERO_REFERENCE_BY_BUILTIN = {
+    # Bounded 0..100 (or similar) oscillators with NO true zero line: NNFX_RULESET_THE_TRUTH.txt
+    # SS4 explicitly allows treating the documented midpoint as the zero equivalent for these.
+    'irsi': 50.0, 'istochastic': 50.0, 'imfi': 50.0, 'iwpr': -50.0, 'idemarker': 0.5,
+    'imomentum': 100.0,  # iMomentum oscillates around 100 (ratio to N bars ago), not 0
+    # True zero-line oscillators: 0 is their actual centerline.
+    'icci': 0.0, 'imacd': 0.0, 'irvi': 0.0, 'ibearspower': 0.0, 'ibullspower': 0.0, 'iforce': 0.0,
+}
+
+def _builtin_names(standard_indicators) -> set[str]:
+    return {str(s).replace('MQL4_', '').lower() for s in (standard_indicators or [])}
+
+def zero_reference_for(standard_indicators) -> tuple[float | None, str | None]:
+    """Documented-builtin lookup ONLY. Returns (None, None) -- never a default
+    -- when the active builtins don't include one of the known bounded/centered
+    oscillators above."""
+    names = _builtin_names(standard_indicators)
+    for key, ref in ZERO_REFERENCE_BY_BUILTIN.items():
+        if key in names:
+            return ref, f"matched active builtin {key!r} -> documented centerline {ref}"
+    return None, None
+
+_LEVEL_PATTERNS = (
+    re.compile(r'#property\s+indicator_level\d+\s+(-?\d+(?:\.\d+)?)', re.I),
+    re.compile(r'\bSetLevelValue\s*\(\s*\d+\s*,\s*(-?\d+(?:\.\d+)?)\s*\)', re.I),
+    re.compile(r'IndicatorSetDouble\s*\(\s*INDICATOR_LEVELVALUE\s*,\s*\d+\s*,\s*(-?\d+(?:\.\d+)?)\s*\)', re.I),
+)
+
+def declared_zero_level(path) -> tuple[float | None, str | None]:
+    """Look for an unambiguous single declared level line in the indicator's
+    own source (#property indicator_levelN, SetLevelValue, or MQL5's
+    IndicatorSetDouble(INDICATOR_LEVELVALUE,...)). Only trusted when exactly
+    ONE distinct level value is declared -- classic overbought/oversold pairs
+    (e.g. 30 and 70) are ambiguous and must never be guessed at as a
+    centerline. Returns (None, reason) if no path, unreadable, zero, or
+    multiple distinct levels are found."""
+    if not path:
+        return None, None
+    try:
+        code = strip_comments(normalize_newlines(read_text(Path(path))))
+    except Exception:
+        return None, None
+    values = set()
+    for pat in _LEVEL_PATTERNS:
+        for m in pat.finditer(code):
+            values.add(float(m.group(1)))
+    if len(values) == 1:
+        v = next(iter(values))
+        return v, f"single declared level line found in source (value={v})"
+    if len(values) > 1:
+        return None, f"multiple declared level lines found {sorted(values)} -- ambiguous, not usable as a centerline"
+    return None, None
+
+def _calls_atr(standard_indicators, techniques) -> bool:
+    if 'iatr' in _builtin_names(standard_indicators):
+        return True
+    return 'ATR' in (techniques or [])
+
+_COMPETING_ATR_CATEGORIES = ('Trend', 'Support/Resistance')
+
+def _competing_atr_evidence(evidence) -> str | None:
+    """A genuine ATR indicator is a bare readout of the ATR value -- if the
+    evidence also shows Trend/Support-Resistance scoring, or any band/channel
+    structure, the indicator is using ATR as an ingredient (e.g. a channel
+    width), not displaying ATR itself."""
+    for e in (evidence or []):
+        if not isinstance(e, dict):
+            continue
+        cat = e.get('category')
+        detail = str(e.get('detail', '')).lower()
+        if cat in _COMPETING_ATR_CATEGORIES:
+            return f"competing {cat} evidence: {e.get('detail')}"
+        if 'band' in detail or 'channel' in detail:
+            return f"competing band/channel evidence: {e.get('detail')}"
+    return None
+
+def is_atr_indicator(display_location, line_plots, evidence, standard_indicators, techniques) -> tuple[bool, str]:
+    """A genuine ATR indicator is a single-line readout in its OWN separate
+    window -- not a multi-line chart overlay that merely calls iATR() to scale
+    something else. Requires ALL of: an active iATR call, display_location=
+    'Separate Window', line_plots<=2, and no competing channel/band/Trend/
+    Support-Resistance evidence. Returns (is_atr, reason)."""
+    if not _calls_atr(standard_indicators, techniques):
+        return False, "no active ATR builtin call recorded"
+    if display_location != 'Separate Window':
+        return False, f"iATR is called but display_location={display_location!r}, not 'Separate Window' -- not a genuine ATR readout"
+    if (line_plots or 0) > 2:
+        return False, f"iATR is called but line_plots={line_plots} (>2) -- multi-line overlay, not a single ATR readout"
+    competing = _competing_atr_evidence(evidence)
+    if competing:
+        return False, f"iATR is called but {competing} -- ATR is an ingredient here, not the indicator's own readout"
+    return True, "single/dual-line ATR readout in its own separate window with no competing channel/band/trend/support-resistance evidence"
+
+def nnfx_slot_signal(visual_category: str, display_location: str, primary_category: str,
+                      standard_indicators=None, techniques=None, path=None,
+                      line_plots=0, evidence=None, declared_buffers=0,
+                      line_buffer_indices=None) -> tuple[str, str | None, float | None, int | None, int | None, str]:
+    """NNFX_INTEGRATION_PLAN.txt STEP 2 (final rules). Maps already-stored
+    classifier fields onto a backtest slot + signal_type + zero_reference +
+    the REAL buffer index/indices to read (buf_a/buf_b: for CONFIRMATION_1
+    these are fast/slow; for everything else buf_a is the single main buffer
+    and buf_b is None). Buffer indices come ONLY from line_buffer_indices
+    (literal indices resolved from the indicator's own SetIndexStyle/
+    PlotIndexSetInteger/#property indicator_typeN declarations -- see
+    engine_core.analyze()); a shape that would otherwise qualify but has no
+    resolved index is routed to NEEDS_REVIEW rather than guessing 0/1 (this is
+    exactly the bug a real pilot run caught: NNFXHarness.mq5 used to default to
+    buffer 0/1 for every candidate, which is wrong whenever the actual line
+    buffers aren't literally indices 0/1 in that file's own source).
+    zero_reference is trusted ONLY from a documented bounded builtin or an
+    unambiguous declared level line in the indicator's own source -- it is
+    NEVER assumed to be 0. Returns (slot, signal_type, zero_reference, buf_a,
+    buf_b, reason). slot is one of CONFIRMATION_1/CONFIRMATION_2/BASELINE/
+    VOLUME/ATR/EXCLUDED_NON_NNFX/NEEDS_REVIEW."""
+    idx = sorted(line_buffer_indices) if line_buffer_indices else []
+
+    atr, atr_reason = is_atr_indicator(display_location, line_plots, evidence, standard_indicators, techniques)
+    if atr:
+        return 'ATR', None, None, None, None, f"ATR slot: {atr_reason}"
+
+    if primary_category in ('Volume', 'Volatility'):
+        # declared_buffers (from #property indicator_buffers / IndicatorBuffers) is
+        # used here rather than line_plots: it's a mechanically simpler, more
+        # reliable already-stored signal -- line_plots depends on matching
+        # SetIndexStyle/PlotIndexSetInteger DRAW_LINE calls, which can miss on
+        # obfuscated/auto-converted files (seen directly on mth_FastTMALine_2.mq5,
+        # which has 6 declared buffers but line_plots=0). A real volatility-band
+        # filter (Bollinger/Keltner/Donchian-style) is typically 2-3 buffers;
+        # >3 plus competing Trend/S-R/band-channel evidence means Volatility/Volume
+        # is one ingredient of a larger multi-purpose overlay, not the point.
+        competing = _competing_atr_evidence(evidence) if (declared_buffers or 0) > 3 else None
+        if not competing:
+            if not idx:
+                return 'NEEDS_REVIEW', None, None, None, None, "primary_category indicates VOLUME but no resolved buffer index -- cannot wire the filter's own reading"
+            return 'VOLUME', None, None, idx[0], None, f"primary_category={primary_category!r} and not an ATR indicator -> VOLUME slot"
+        # Fall through and let it be routed by its actual visual shape below.
+
+    if visual_category == 'Two-Line':
+        if len(idx) < 2:
+            return 'NEEDS_REVIEW', None, None, None, None, f"visual_category='Two-Line' but only {len(idx)} buffer index(es) resolved -- cannot tell fast from slow"
+        return 'CONFIRMATION_1', 'TWO_LINE_CROSS', None, idx[0], idx[1], f"visual_category='Two-Line' -> two-line-cross confirmation (bridge-too-far eligible); buffers {idx[0]}/{idx[1]}"
+
+    if visual_category == 'One-Line':
+        if not idx:
+            return 'NEEDS_REVIEW', None, None, None, None, "visual_category='One-Line' but no resolved buffer index -- cannot wire the candidate's own reading"
+        if display_location == 'Separate Window':
+            zero_ref, zref_reason = zero_reference_for(standard_indicators)
+            if zero_ref is None:
+                declared_ref, declared_reason = declared_zero_level(path)
+                if declared_ref is not None:
+                    zero_ref, zref_reason = declared_ref, declared_reason
+                elif declared_reason:
+                    zref_reason = declared_reason
+            if zero_ref is None:
+                return 'NEEDS_REVIEW', None, None, None, None, "no declared/known neutral line — cannot use as zero-cross" + (f" ({zref_reason})" if zref_reason else "")
+            return 'CONFIRMATION_2', 'ZERO_CROSS', zero_ref, idx[0], None, f"visual_category='One-Line' + display_location='Separate Window' -> zero-cross confirmation; buffer {idx[0]}; {zref_reason}"
+        if display_location == 'Main Chart':
+            return 'BASELINE', None, None, idx[0], None, f"visual_category='One-Line' + display_location='Main Chart' -> baseline candidate; buffer {idx[0]}"
+        return 'NEEDS_REVIEW', None, None, None, None, "visual_category='One-Line' but display_location is not stored as 'Main Chart' or 'Separate Window'"
+
+    if visual_category in ('Arrow/Icon', 'Histogram'):
+        return 'EXCLUDED_NON_NNFX', None, None, None, None, f"visual_category={visual_category!r} is not part of the final 6-slot NNFX mapping -> excluded"
+
+    return 'NEEDS_REVIEW', None, None, None, None, f"visual_category={visual_category!r} (mixed/unknown shape) -> route to review"
 
 def add_evidence(evidence: list[dict], scores: dict[str,float], category: str, weight: float, kind: str, detail: str, technique: str | None = None):
     scores[category] = scores.get(category, 0.0) + weight
@@ -266,10 +433,22 @@ def analyze(path: Path) -> Analysis:
     for dt in DRAW_TYPES:
         if re.search(r'\b'+dt+r'\b',logic,re.I) or re.search(r'#property\s+indicator_type\d+\s+'+dt+r'\b',code,re.I): draw.append(dt)
     a.draw_types=sorted(set(draw))
-    types=[t.upper() for _,t in re.findall(r'(?:MQL4_)?SetIndexStyle\s*\(\s*([^,]+)\s*,\s*(DRAW_[A-Z0-9_]+)',logic,re.I)]
-    types += [t.upper() for t in re.findall(r'#property\s+indicator_type\d+\s+(DRAW_[A-Z0-9_]+)',code,re.I)]
-    types += [t.upper() for t in re.findall(r'PlotIndexSetInteger\s*\([^,]+,\s*PLOT_DRAW_TYPE\s*,\s*(DRAW_[A-Z0-9_]+)',logic,re.I)]
+    style_calls=re.findall(r'(?:MQL4_)?SetIndexStyle\s*\(\s*([^,]+)\s*,\s*(DRAW_[A-Z0-9_]+)',logic,re.I)
+    prop_calls=[(str(int(n)-1),t) for n,t in re.findall(r'#property\s+indicator_type(\d+)\s+(DRAW_[A-Z0-9_]+)',code,re.I)]
+    plot_calls=re.findall(r'PlotIndexSetInteger\s*\(\s*([^,]+),\s*PLOT_DRAW_TYPE\s*,\s*(DRAW_[A-Z0-9_]+)',logic,re.I)
+    types=[t.upper() for _,t in style_calls]+[t.upper() for _,t in prop_calls]+[t.upper() for _,t in plot_calls]
     a.line_plots=sum(t in ('DRAW_LINE','DRAW_COLOR_LINE','DRAW_SECTION','DRAW_ZIGZAG') for t in types); a.histogram_plots=sum(t in ('DRAW_HISTOGRAM','DRAW_HISTOGRAM2') for t in types); a.arrow_plots=sum(t in ('DRAW_ARROW','DRAW_COLOR_ARROW') for t in types); a.filling_plots=sum(t=='DRAW_FILLING' for t in types)
+    # Which buffer INDEX is each line plot -- not just how many exist. Only trusted when the
+    # index argument is a literal integer (#property indicator_typeN always is: N-1; a
+    # SetIndexStyle/PlotIndexSetInteger call is only usable when its own index arg is a literal,
+    # not a variable/expression -- those are left unresolved rather than guessed at). Sorted
+    # ascending: ascending buffer index is the near-universal plot-stacking convention.
+    line_idx=set()
+    for idx_s,t in style_calls+prop_calls+plot_calls:
+        if t.upper() not in ('DRAW_LINE','DRAW_COLOR_LINE','DRAW_SECTION','DRAW_ZIGZAG'): continue
+        idx_s=idx_s.strip()
+        if re.fullmatch(r'\d+',idx_s): line_idx.add(int(idx_s))
+    a.line_buffer_indices=sorted(line_idx)
     a.object_usage=bool(re.search(r'ObjectCreate\s*\(|OBJ_(?:HLINE|VLINE|TREND|RECTANGLE|TEXT|LABEL|ARROW|FIBO)',logic,re.I))
     stds=[]
     for base in BUILTINS:

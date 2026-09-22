@@ -37,7 +37,7 @@
     "active": true,
     "targets": ["nsis"],
     "createUpdaterArtifacts": false,
-    "externalBin": ["binaries/mql-engine", "binaries/mql-preview", "binaries/mql-preview-control", "binaries/mql-preview-batch"],
+    "externalBin": ["binaries/mql-engine", "binaries/mql-preview", "binaries/mql-preview-control", "binaries/mql-preview-batch", "binaries/mql-backtest-batch"],
     "windows": {
       "nsis": {
         "installMode": "currentUser",
