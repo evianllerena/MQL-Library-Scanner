@@ -846,7 +846,20 @@ RESIDENT_EA_SOURCE = r'''#property strict
 input string Dir = "MQLLibRender";
 long g_beat = 0;
 
-int OnInit(){ EventSetMillisecondTimer(150); return(INIT_SUCCEEDED); }
+void warmHistory(){
+  MqlRates rr[];
+  ArraySetAsSeries(rr,true);
+  for(int i=0;i<40;i++){
+    int got=CopyRates(_Symbol,_Period,0,3000,rr);
+    if(got>=2000) break;
+    Sleep(100);
+  }
+  ChartSetInteger(0,CHART_AUTOSCROLL,true);
+  ChartNavigate(0,CHART_END,0);
+  ChartRedraw(0);
+}
+
+int OnInit(){ warmHistory(); EventSetMillisecondTimer(150); return(INIT_SUCCEEDED); }
 void OnDeinit(const int r){ EventKillTimer(); }
 
 void beat(string inflight){
@@ -866,7 +879,7 @@ void clearChart(){
       ChartIndicatorDelete(0,w,nm);
     }
   }
-  ChartRedraw();
+  ChartRedraw(0);
 }
 
 void writeDone(string id,bool ok,int err,string shot){
@@ -889,19 +902,46 @@ void OnTimer(){
 
   beat(id);
   clearChart();
+
+  // Self-test baseline: same resident terminal / chart pipeline, deliberately no indicator.
+  if(rel=="__MQLLIB_EMPTY_CHART__"){
+    ChartSetInteger(0,CHART_AUTOSCROLL,true);
+    ChartNavigate(0,CHART_END,0);
+    for(int i=0;i<6;i++){ beat(id); ChartRedraw(0); Sleep(200); }
+    ResetLastError();
+    bool empty_ok=ChartScreenShot(0,shot,1200,720,ALIGN_RIGHT);
+    int empty_err=GetLastError();
+    writeDone(id,empty_ok,empty_err,shot);
+    FileDelete(Dir+"\\current.job");
+    beat("");
+    return;
+  }
+
   ResetLastError();
   int h=iCustom(_Symbol,_Period,rel);
   int err=GetLastError();
   bool ok=false;
   if(h!=INVALID_HANDLE){
-    int w=win;
-    if(w==1) w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);
-    if(ChartIndicatorAdd(0,w,h)){
-      ChartRedraw();
-      for(int i=0;i<15;i++){ if(BarsCalculated(h)>=0) break; Sleep(150); }
-      Sleep(400);
-      ok=ChartScreenShot(0,shot,1200,720,ALIGN_RIGHT);
-      err=GetLastError();
+    int need=Bars(_Symbol,_Period); if(need<=0) need=500;
+    int prev=-1, stable=0;
+    for(int i=0;i<60;i++){
+      int bc=BarsCalculated(h);
+      beat(id);
+      if(bc>0){
+        if(bc>=need-2) break;
+        if(bc==prev){ stable++; if(stable>=5) break; } else stable=0;
+      }
+      prev=bc; Sleep(200);
+    }
+    int w=win; if(w==1) w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL);
+    ResetLastError();
+    bool added=ChartIndicatorAdd(0,w,h); err=GetLastError();
+    if(added){
+      ChartSetInteger(0,CHART_AUTOSCROLL,true);
+      ChartNavigate(0,CHART_END,0);
+      for(int i=0;i<6;i++){ beat(id); ChartRedraw(0); Sleep(200); }
+      ResetLastError();
+      ok=ChartScreenShot(0,shot,1200,720,ALIGN_RIGHT); err=GetLastError();
     }
     IndicatorRelease(h);
   }
@@ -1149,7 +1189,40 @@ def compile_pool(db,out,terminal=None,workers=4,job_id=None,runtime_id=None):
     emit({'ok':True,'job_id':job_id,'component':'compile_pool','finished':True,'compiled_done':completed})
 
 
-def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2,mt5_data_dir=None,runtime_id=None):
+def _capture_resident_baseline(cur,done,hb,proc,mql,target,hang_timeout=40):
+    """Capture a candles-only reference through the same resident MT5 terminal used by production renders."""
+    target=Path(target);target.parent.mkdir(parents=True,exist_ok=True)
+    baseline_id='selftest-baseline'
+    shot='MQLLibRender/selftest_empty_chart.png'
+    shotfile=Path(mql)/'Files'/shot
+    shotfile.parent.mkdir(parents=True,exist_ok=True)
+    for p in (done,shotfile):
+        try:Path(p).unlink(missing_ok=True)
+        except Exception:pass
+    cur.write_text(f'{baseline_id}\t__MQLLIB_EMPTY_CHART__\t{shot}\t0',encoding='utf-8')
+    deadline=time.time()+max(40,int(hang_timeout or 40))
+    last_beat=None;last_change=time.time()
+    while time.time()<deadline:
+        payload=_read_resident_done(done) if Path(done).exists() else None
+        if payload and payload.get('id')==baseline_id:
+            if payload.get('ok') and shotfile.is_file() and shotfile.stat().st_size:
+                shutil.copy2(shotfile,target)
+                return target
+            raise RuntimeError(f"Empty-chart baseline capture failed err={payload.get('err')}")
+        beat=_read_resident_heartbeat(hb)
+        beat_key=(beat or {}).get('beat')
+        if beat_key!=last_beat:
+            last_beat=beat_key;last_change=time.time()
+        if proc.poll() is not None:
+            raise RuntimeError(f'Empty-chart baseline terminal exited early ({proc.returncode}).')
+        if time.time()-last_change>max(40,int(hang_timeout or 40)):
+            break
+        time.sleep(.25)
+    raise TimeoutError('Empty-chart baseline capture timed out in the resident render pipeline.')
+
+
+def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=2,mt5_data_dir=None,runtime_id=None,baseline_target=None):
+    hang_timeout=max(40,int(hang_timeout or 40))
     job_id=safe_job_id(job_id);dest=Path(out)
     con=sqlite3.connect(db,timeout=30);con.row_factory=sqlite3.Row
     con.execute('PRAGMA journal_mode=WAL');con.execute('PRAGMA synchronous=NORMAL');con.execute('PRAGMA busy_timeout=5000')
@@ -1222,6 +1295,10 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
 
     try:
         proc=launch()
+        if baseline_target:
+            emit_stage(job_id,'selftest_baseline_capture','Capturing empty-chart reference through resident render terminal.')
+            _capture_resident_baseline(cur,done,hb,proc,mql,baseline_target,hang_timeout)
+            emit_stage(job_id,'selftest_baseline_ready','Empty-chart reference captured.',path=str(baseline_target))
         while True:
             pause_reason=_worker_pause_reason(con,dest)
             if pause_reason:
@@ -1285,7 +1362,7 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
             cur.write_text(f"{row['id']}\t{rel}\t{shot}\t{win}",encoding='utf-8')
             emit_stage(job_id,'resident_job_queued',f'Rendering {src.name} in warm MT5 terminal.',source=str(src),rel=rel)
 
-            deadline=time.time()+max(10,int(hang_timeout))
+            deadline=time.time()+hang_timeout
             last_beat=None;last_change=time.time();result=None;done_payload=None
             while time.time()<deadline:
                 done_payload=_read_resident_done(done) if done.exists() else None
@@ -1300,7 +1377,7 @@ def render_server(db,out,terminal=None,job_id=None,hang_timeout=40,max_attempts=
                     ready=con.execute("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'").fetchone()[0]
                     emit_heartbeat(job_id,ready,str(src),stage='render_server',ea_beat=beat_key)
                     last_host_heartbeat=now
-                if now-last_change>max(5,int(hang_timeout)):break
+                if now-last_change>hang_timeout:break
                 if proc.poll() is not None:break
                 time.sleep(.4)
 
@@ -2216,6 +2293,357 @@ def open_source(source):
     subprocess.Popen([target,str(src)] if low.endswith('editor.exe') or low.endswith('editor64.exe') else [target])
     emit({'ok':True,'opened':target,'kind':kind})
 
+
+def _selftest_default_db():
+    appdata=Path(os.environ.get('APPDATA',''))
+    return appdata/'com.mqlindicatorlibrary.app'/'library.sqlite3'
+
+def _selftest_source_text(path):
+    p=Path(path)
+    return read_text(p).lower() if p.suffix.lower() in ('.mq4','.mq5') else ''
+
+def _selftest_rank(path):
+    p=Path(path);name=p.name.lower();text=_selftest_source_text(p)
+    score=0
+    if 'my tma+channel' in name or ('tma' in name and 'channel' in name):score+=2000
+    if re.search(r'(^|[^a-z0-9])3ls([^a-z0-9]|$)',name):score+=1900
+    if 'indicator_separate_window' in text:score+=1200
+    if any(x in name for x in ('mtf','multi timeframe','multi-timeframe','multitimeframe')):score+=1000
+    if any(x in name for x in ('rsi','macd','stoch','osc','moving average','ma_','average')):score+=250
+    if p.suffix.lower() in ('.mq5','.ex5'):score+=50
+    return (-score,name.lower(),str(p).lower())
+
+def _selftest_candidates(source=None,db=None,sample=30):
+    paths=[]
+    if source:
+        root=Path(source)
+        if not root.exists():raise RuntimeError(f'Self-test source folder does not exist: {root}')
+        allowed={'.mq4','.ex4','.mq5','.ex5'}
+        paths=[p for p in root.rglob('*') if p.is_file() and p.suffix.lower() in allowed]
+    else:
+        dbp=Path(db) if db else _selftest_default_db()
+        if not dbp.is_file():raise RuntimeError(f'Self-test needs --source or an existing library database: {dbp}')
+        con=sqlite3.connect(dbp)
+        try:
+            rows=con.execute("SELECT path FROM indicators WHERE path IS NOT NULL AND path!='' ORDER BY id").fetchall()
+        finally:con.close()
+        for (raw,) in rows:
+            p=Path(raw)
+            if p.is_file() and p.suffix.lower() in ('.mq4','.ex4','.mq5','.ex5'):paths.append(p)
+    unique=[];seen=set()
+    for p in paths:
+        try:key=os.path.normcase(str(p.resolve()))
+        except Exception:key=os.path.normcase(str(p))
+        if key in seen:continue
+        seen.add(key);unique.append(p)
+    n=max(1,int(sample or 30))
+    mt5=sorted([p for p in unique if p.suffix.lower() in ('.mq5','.ex5')],key=_selftest_rank)
+    mt4=sorted([p for p in unique if p.suffix.lower() in ('.mq4','.ex4')],key=_selftest_rank)
+    selected=[]
+    if mt5 and mt4 and n>=4:
+        mt4_n=min(len(mt4),max(2,min(6,n//4)))
+        mt5_n=min(len(mt5),n-mt4_n)
+        selected.extend(mt5[:mt5_n]);selected.extend(mt4[:mt4_n])
+        remain=n-len(selected)
+        if remain>0:
+            extras=mt5[mt5_n:]+mt4[mt4_n:]
+            selected.extend(sorted(extras,key=_selftest_rank)[:remain])
+    else:
+        selected=sorted(unique,key=_selftest_rank)[:n]
+    return sorted(selected,key=_selftest_rank)[:n]
+
+def _selftest_db(path,mt5_paths):
+    path=Path(path)
+    try:path.unlink(missing_ok=True)
+    except Exception:pass
+    con=sqlite3.connect(path)
+    try:
+        con.execute("""CREATE TABLE indicators(
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL,
+            filename TEXT,
+            platform TEXT,
+            sha256 TEXT,
+            duplicate_of INTEGER,
+            user_favorite INTEGER DEFAULT 0,
+            analyzed_at TEXT,
+            preview_status TEXT DEFAULT 'pending',
+            preview_path TEXT,
+            preview_hash TEXT,
+            preview_error TEXT DEFAULT '',
+            preview_updated_at TEXT,
+            preview_attempts INTEGER DEFAULT 0,
+            preview_priority INTEGER DEFAULT 0,
+            worker_id TEXT
+        )""")
+        con.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)")
+        for i,p in enumerate(mt5_paths,1):
+            h=hashlib.sha256(Path(p).read_bytes()).hexdigest()
+            con.execute(
+                "INSERT INTO indicators(id,path,filename,platform,sha256,duplicate_of,user_favorite,analyzed_at,preview_priority) "
+                "VALUES(?,?,?,?,?,NULL,0,datetime('now'),1000)",
+                (i,str(p),Path(p).name,'MQL5',h))
+        con.commit()
+    finally:con.close()
+    return path
+
+def _selftest_chart_crop(im):
+    w,h=im.size
+    left=max(0,int(w*.04));top=max(0,int(h*.04));right=max(left+1,int(w*.97));bottom=max(top+1,int(h*.93))
+    return im.crop((left,top,right,bottom))
+
+def _selftest_dominant_color(im):
+    q=im.resize((120,72)).convert('RGB').quantize(colors=8)
+    colors=q.getcolors() or []
+    if not colors:return (0,0,0)
+    idx=max(colors,key=lambda x:x[0])[1]
+    palette=q.getpalette() or []
+    base=idx*3
+    return tuple(palette[base:base+3]) if len(palette)>=base+3 else (0,0,0)
+
+def _selftest_nonbg_coverage(im,bg,threshold=48):
+    px=im.resize((480,288)).convert('RGB').getdata()
+    total=0;changed=0
+    br,bg0,bb=bg
+    for r,g,b in px:
+        total+=1
+        if abs(r-br)+abs(g-bg0)+abs(b-bb)>threshold:changed+=1
+    return changed/max(1,total)
+
+def _selftest_saturated_colors(im):
+    colors=set()
+    for r,g,b in im.resize((160,96)).convert('RGB').getdata():
+        if max(r,g,b)-min(r,g,b)>=50:
+            colors.add((r//32,g//32,b//32))
+    return colors
+
+def _selftest_image_metrics(reference,candidate,kind='MT5'):
+    from PIL import Image,ImageChops
+    with Image.open(reference) as rb, Image.open(candidate) as rc:
+        base=_selftest_chart_crop(rb.convert('RGB'))
+        cand=_selftest_chart_crop(rc.convert('RGB'))
+        size=(480,288)
+        base=base.resize(size);cand=cand.resize(size)
+        bg=_selftest_dominant_color(base)
+        base_nonbg=_selftest_nonbg_coverage(base,bg)
+        cand_nonbg=_selftest_nonbg_coverage(cand,bg)
+        delta=max(0.0,cand_nonbg-base_nonbg)
+        diff=ImageChops.difference(cand,base)
+        changed=sum(1 for p in diff.getdata() if max(p)>28)
+        diff_coverage=changed/(size[0]*size[1])
+        base_colors=_selftest_saturated_colors(base)
+        cand_colors=_selftest_saturated_colors(cand)
+        novel_colors=len(cand_colors-base_colors)
+        blank_ceiling=max(.0015,min(.012,base_nonbg*.06))
+        if str(kind).upper()=='MT5':
+            drew=(diff_coverage>blank_ceiling) or (delta>.0015 and novel_colors>=1)
+            coverage=diff_coverage
+        else:
+            mt4_ceiling=max(.0030,min(.02,base_nonbg*.08))
+            drew=(delta>mt4_ceiling) or (delta>.0015 and novel_colors>=4)
+            coverage=delta
+        return {
+            'coverage':round(float(coverage),6),
+            'diff_coverage':round(float(diff_coverage),6),
+            'non_background':round(float(cand_nonbg),6),
+            'baseline_non_background':round(float(base_nonbg),6),
+            'coverage_delta':round(float(delta),6),
+            'novel_saturated_colors':novel_colors,
+            'blank_ceiling':round(float(blank_ceiling),6),
+            'drew':bool(drew)
+        }
+
+def _selftest_copy_png(source,target):
+    from PIL import Image
+    source=Path(source);target=Path(target);target.parent.mkdir(parents=True,exist_ok=True)
+    with Image.open(source) as im:
+        im.convert('RGB').save(target,format='PNG',optimize=True)
+    return target
+
+def _selftest_label_from_error(error):
+    msg=str(error or '')
+    low=msg.lower()
+    if low.startswith('compile:') or 'compile failed' in low or 'compile-pool' in low or 'produced no ex' in low:
+        return 'COMPILE_FAIL'
+    if 'timeout' in low or 'hang' in low:
+        return 'TIMEOUT'
+    m=re.search(r'(?:err(?:or)?[ =:]*)\(?([0-9]{3,5})\)?',msg,re.I)
+    return f'RENDER_FAIL({m.group(1)})' if m else 'RENDER_FAIL'
+
+def _selftest_contact_sheet(items,target):
+    from PIL import Image,ImageDraw,ImageFont
+    cols=5;thumb_w=220;thumb_h=132;label_h=48;pad=10
+    rows=max(1,(len(items)+cols-1)//cols)
+    sheet=Image.new('RGB',(pad+cols*(thumb_w+pad),pad+rows*(thumb_h+label_h+pad)),(32,32,32))
+    draw=ImageDraw.Draw(sheet);font=ImageFont.load_default()
+    for idx,item in enumerate(items):
+        col=idx%cols;row=idx//cols;x=pad+col*(thumb_w+pad);y=pad+row*(thumb_h+label_h+pad)
+        p=Path(item.get('png_path') or '')
+        if p.is_file():
+            try:
+                with Image.open(p) as im:
+                    tile=im.convert('RGB');tile.thumbnail((thumb_w,thumb_h))
+                    ox=x+(thumb_w-tile.width)//2;oy=y+(thumb_h-tile.height)//2
+                    sheet.paste(tile,(ox,oy))
+            except Exception:pass
+        else:
+            draw.rectangle((x,y,x+thumb_w,y+thumb_h),outline=(110,110,110),width=1)
+            draw.text((x+8,y+52),'NO IMAGE',font=font,fill=(220,220,220))
+        name=str(item.get('name') or '')
+        if len(name)>31:name=name[:28]+'...'
+        draw.text((x,y+thumb_h+5),name,font=font,fill=(235,235,235))
+        label=str(item.get('label') or '')
+        draw.text((x,y+thumb_h+22),label,font=font,fill=(235,235,235))
+    target=Path(target);target.parent.mkdir(parents=True,exist_ok=True);sheet.save(target,format='PNG',optimize=True)
+    return target
+
+def _selftest_print_summary(items,counts,draw_percent,passed):
+    lines=['','Preview self-test','='*72,f'{"LABEL":<28} COUNT','-'*36]
+    for label,count in sorted(counts.items(),key=lambda x:(x[0]!='OK_DREW',x[0])):
+        lines.append(f'{label:<28} {count}')
+    lines.extend(['-'*36,f'DRAW RATE                    {draw_percent:.1f}%',f'RESULT                       {"PASS" if passed else "FAIL"}'])
+    bad=[i for i in items if i.get('label')!='OK_DREW']
+    if bad:
+        lines.append('');lines.append('BLANK / FAIL FILES')
+        for item in bad:lines.append(f" - {item.get('label')}: {item.get('name')}")
+    sys.stderr.write('\n'.join(lines)+'\n');sys.stderr.flush()
+
+def preview_selftest(out,sample=30,source=None,db=None,terminal=None,workers=4,hang_timeout=40,min_draw_percent=60.0,mt5_data_dir=None):
+    """Run a sampled preview test through production render code, then grade screenshots.
+
+    MT5 uses the actual compile_pool + resident render_server. MT4 uses the existing
+    real per-file MT4 renderer. No render path is mocked.
+    """
+    sample=max(1,min(int(sample or 30),200))
+    workers=max(1,min(int(workers or 4),8))
+    hang_timeout=max(40,int(hang_timeout or 40))
+    root=Path(out)/'selftest'
+    if root.exists():shutil.rmtree(root,ignore_errors=True)
+    pngdir=root/'pngs';pngdir.mkdir(parents=True,exist_ok=True)
+    selected=_selftest_candidates(source,db,sample)
+    if not selected:raise RuntimeError('Preview self-test found no MQL4/MQL5 indicator files to test.')
+    mt5=[p for p in selected if p.suffix.lower() in ('.mq5','.ex5')]
+    mt4=[p for p in selected if p.suffix.lower() in ('.mq4','.ex4')]
+    baseline=root/'reference_empty_chart.png'
+    pipeline_out=root/'pipeline'/'previews'
+    pipeline_out.mkdir(parents=True,exist_ok=True)
+    testdb=_selftest_db(root/'selftest.sqlite3',mt5)
+    runtime_id=safe_job_id(f'selftest-{time.time_ns()}')
+    render_error=[]
+
+    def render_thread():
+        try:
+            render_server(
+                str(testdb),str(pipeline_out),terminal=terminal,job_id='selftest-render',
+                hang_timeout=hang_timeout,max_attempts=1,mt5_data_dir=mt5_data_dir,
+                runtime_id=runtime_id,baseline_target=baseline)
+        except BaseException as e:
+            render_error.append(e)
+
+    import threading
+    thread=threading.Thread(target=render_thread,name='mql-preview-selftest-render',daemon=True)
+    thread.start()
+    compile_error=None
+    try:
+        compile_pool(str(testdb),str(pipeline_out),terminal=terminal,workers=workers,
+                     job_id='selftest-compile',runtime_id=runtime_id)
+    except BaseException as e:
+        compile_error=e
+    if compile_error:
+        cleanup=sqlite3.connect(testdb)
+        try:
+            cleanup.execute(
+                "UPDATE indicators SET preview_status='failed',preview_error=?,worker_id=NULL "
+                "WHERE preview_status IN ('pending','compiling','compiled','rendering')",
+                (('compile-pool aborted: '+str(compile_error))[:800],))
+            cleanup.commit()
+        finally:cleanup.close()
+    thread.join(timeout=max(90,hang_timeout*(max(1,len(mt5))+2)))
+    if thread.is_alive():
+        render_error.append(TimeoutError('Real resident render pipeline did not finish within the self-test deadline.'))
+        # The production render server is bounded by hang_timeout; this is a final self-test guard.
+        try:
+            sel=load_runtime_cache(pipeline_out,'MT5') or choose_runtime('MT5',terminal)
+            hard_kill(None,runtime_path(sel,pipeline_out,'MT5','render-server'))
+        except Exception:pass
+        thread.join(timeout=10)
+    if compile_error and not baseline.is_file():
+        raise RuntimeError(f'Real compile-pool self-test failed before baseline capture: {compile_error}')
+    if render_error and not baseline.is_file():
+        raise RuntimeError(f'Real resident render self-test failed before baseline capture: {render_error[0]}')
+    if not baseline.is_file():
+        raise RuntimeError('Real resident render self-test did not produce the empty-chart baseline.')
+
+    rows={}
+    con=sqlite3.connect(testdb);con.row_factory=sqlite3.Row
+    try:
+        for r in con.execute("SELECT path,sha256,preview_status,preview_path,preview_error FROM indicators"):
+            rows[os.path.normcase(str(Path(r['path'])))] = dict(r)
+    finally:con.close()
+
+    items=[]
+    for p in mt5:
+        key=os.path.normcase(str(Path(p)))
+        r=rows.get(key) or {}
+        err=str(r.get('preview_error') or '')
+        item={'name':p.name,'source':str(p),'kind':'MT5','pipeline':'compile-pool+resident-ea',
+              'label':None,'err':err or None,'png_path':None,'coverage':None}
+        if r.get('preview_status')=='ready' and r.get('preview_path') and Path(r['preview_path']).is_file():
+            dst=_selftest_copy_png(r['preview_path'],pngdir/f'{str(r.get("sha256") or "")[:10]}_{safe_name(p).rsplit(".",1)[0]}.png')
+            metrics=_selftest_image_metrics(baseline,dst,'MT5')
+            item.update(metrics);item['png_path']=str(dst);item['label']='OK_DREW' if metrics['drew'] else 'BLANK'
+        else:
+            fallback=err or (str(render_error[0]) if render_error else f"render status={r.get('preview_status') or 'missing'}")
+            item['err']=fallback
+            item['label']=_selftest_label_from_error(fallback)
+        items.append(item)
+
+    mt4_out=root/'mt4-real'/'previews';mt4_out.mkdir(parents=True,exist_ok=True)
+    for p in mt4:
+        item={'name':p.name,'source':str(p),'kind':'MT4','pipeline':'real-mt4-render',
+              'label':None,'err':None,'png_path':None,'coverage':None}
+        try:
+            before=set(mt4_out.glob('*'))
+            render(str(p),str(mt4_out),terminal=terminal,job_id=f'selftest-mt4-{hashlib.sha1(str(p).encode()).hexdigest()[:8]}')
+            after=[x for x in mt4_out.glob('*') if x.is_file() and x not in before and x.suffix.lower() in ('.gif','.png')]
+            if not after:
+                # render() is hash-stable and may overwrite an existing result on rerun.
+                expected=mt4_out/(hashlib.sha1(('MT4|'+str(p.resolve()).lower()).encode()).hexdigest()[:16]+'.gif')
+                after=[expected] if expected.is_file() else []
+            if not after:raise RuntimeError('real MT4 renderer returned without an image')
+            dst=_selftest_copy_png(after[-1],pngdir/f'mt4_{hashlib.sha256(p.read_bytes()).hexdigest()[:10]}_{safe_name(p).rsplit(".",1)[0]}.png')
+            metrics=_selftest_image_metrics(baseline,dst,'MT4')
+            item.update(metrics);item['png_path']=str(dst);item['label']='OK_DREW' if metrics['drew'] else 'BLANK'
+        except Exception as e:
+            item['err']=f'{type(e).__name__}: {e}';item['label']=_selftest_label_from_error(item['err'])
+        items.append(item)
+
+    order={os.path.normcase(str(p)):i for i,p in enumerate(selected)}
+    items.sort(key=lambda x:order.get(os.path.normcase(x['source']),999999))
+    counts={}
+    for item in items:counts[item['label']]=counts.get(item['label'],0)+1
+    ok_count=counts.get('OK_DREW',0)
+    draw_percent=(100.0*ok_count/max(1,len(items)))
+    passed=draw_percent>=float(min_draw_percent)
+    contact=_selftest_contact_sheet(items,root/'selftest_contact_sheet.png')
+    report={
+        'generated_at':time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'sample_requested':sample,'sample_count':len(items),
+        'mt5_count':len(mt5),'mt4_count':len(mt4),
+        'baseline_path':str(baseline),'contact_sheet':str(contact),
+        'min_draw_percent':float(min_draw_percent),'draw_percent':round(draw_percent,2),
+        'passed':passed,'counts':counts,'items':items
+    }
+    report_path=root/'selftest_report.json'
+    report_path.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    _selftest_print_summary(items,counts,draw_percent,passed)
+    emit({'ok':passed,'selftest':True,'real_pipeline':True,'sample_count':len(items),'counts':counts,
+          'draw_percent':round(draw_percent,2),'min_draw_percent':float(min_draw_percent),
+          'report':str(report_path),'contact_sheet':str(contact),'baseline':str(baseline),
+          'failed_files':[x['name'] for x in items if x['label']!='OK_DREW']})
+    if not passed:raise SystemExit(3)
+
+
 def self_test_discovery():
     checks={}
     with tempfile.TemporaryDirectory() as tmp:
@@ -2319,6 +2747,11 @@ def self_test():
         'resident_ea_job_protocol':all(x in RESIDENT_EA_SOURCE for x in ('current.job','current.done','heartbeat.txt')),
         'resident_ea_warm_terminal':'TerminalClose' not in RESIDENT_EA_SOURCE,
         'resident_ea_forward_path_host':_resident_indicator_rel('abc',Path('demo.ex5'))=='MQLLibraryPreview/abc/demo',
+        'resident_waits_for_positive_bars':'if(bc>0)' in RESIDENT_EA_SOURCE and 'stable>=5' in RESIDENT_EA_SOURCE,
+        'resident_wait_budget_12s':'for(int i=0;i<60;i++)' in RESIDENT_EA_SOURCE and 'Sleep(200)' in RESIDENT_EA_SOURCE,
+        'resident_repaints_before_shot':'ChartNavigate(0,CHART_END,0)' in RESIDENT_EA_SOURCE and 'for(int i=0;i<6;i++)' in RESIDENT_EA_SOURCE,
+        'resident_deep_history_warmup':'CopyRates(_Symbol,_Period,0,3000,rr)' in RESIDENT_EA_SOURCE,
+        'selftest_real_baseline_sentinel':'__MQLLIB_EMPTY_CHART__' in RESIDENT_EA_SOURCE,
     }
     checks.update(self_test_discovery())
     checks.update(self_test_render_dependencies())
@@ -2333,6 +2766,7 @@ def main():
     p=s.add_parser('render-batch');p.add_argument('--sources',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id')
     p=s.add_parser('render-library');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--chunk',type=int,default=70);p.add_argument('--timeout',type=int,default=30);p.add_argument('--attempts',type=int,default=2);p.add_argument('--job-id');p.add_argument('--worker-id');p.add_argument('--static-fast-fail',action='store_true',default=False)
     p=s.add_parser('render-server');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--job-id');p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--attempts',type=int,default=2);p.add_argument('--mt5-data-dir');p.add_argument('--runtime-id')
+    p=s.add_parser('preview-selftest');p.add_argument('--sample',type=int,default=30);p.add_argument('--out',required=True);p.add_argument('--source');p.add_argument('--db');p.add_argument('--terminal');p.add_argument('--workers',type=int,default=4);p.add_argument('--hang-timeout',type=int,default=40);p.add_argument('--min-draw-percent',type=float,default=60.0);p.add_argument('--mt5-data-dir')
     p=s.add_parser('compile-pool');p.add_argument('--db',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal');p.add_argument('--workers',type=int,default=4);p.add_argument('--job-id');p.add_argument('--runtime-id')
     p=s.add_parser('open-source');p.add_argument('--source',required=True)
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
@@ -2353,6 +2787,7 @@ def main():
             render_mt5_batch(mt5,x.out,sel,job)
     elif x.cmd=='render-library':render_library(x.db,x.out,x.terminal,x.chunk,x.timeout,x.attempts,x.job_id,x.worker_id,x.static_fast_fail)
     elif x.cmd=='render-server':render_server(x.db,x.out,x.terminal,x.job_id,x.hang_timeout,x.attempts,x.mt5_data_dir,x.runtime_id)
+    elif x.cmd=='preview-selftest':preview_selftest(x.out,x.sample,x.source,x.db,x.terminal,x.workers,x.hang_timeout,x.min_draw_percent,x.mt5_data_dir)
     elif x.cmd=='compile-pool':compile_pool(x.db,x.out,x.terminal,x.workers,x.job_id,x.runtime_id)
     elif x.cmd=='open-source':open_source(x.source)
     elif x.cmd=='memory-stats':memory_stats(x.db)

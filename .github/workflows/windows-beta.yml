@@ -26,7 +26,7 @@ on:
       - 'tauri.conf.json'
       - 'windows/**'
   push:
-    branches: [main]
+    branches: [main, fix/overlay-selftest-real-pipeline]
     paths:
       - '.github/workflows/windows-beta.yml'
       - 'MQL-Indicator-Library-Repo-Ready.zip'
@@ -184,6 +184,14 @@ jobs:
           if($lib -notmatch '"--runtime-id"' -or $lib -notmatch 'render_args.push'){throw '4802 fix: Rust runtime generation wiring missing'}
           if($bridge -notmatch 'seed_render_dependencies_from_data_dir' -or $bridge -notmatch "for name in \('Indicators','Include','Libraries','Files'\)"){throw 'Residual 4802 fix: render dependency seeding missing'}
           if($bridge -notmatch "common_src=real_data.parent/'Common'"){throw 'Residual 4802 fix: Terminal Common seed missing'}
+          if($bridge -notmatch 'if\(bc>0\)' -or $bridge -notmatch 'stable>=5' -or $bridge -notmatch 'for\(int i=0;i<60;i\+\+\)'){throw 'Overlay fix: resident EA does not wait for calculated buffers'}
+          if($bridge -notmatch 'CopyRates\(_Symbol,_Period,0,3000,rr\)' -or $bridge -notmatch 'ChartNavigate\(0,CHART_END,0\)'){throw 'Overlay fix: deep history/end-of-chart paint setup missing'}
+          if($bridge -notmatch 'hang_timeout=max\(40' ){throw 'Overlay fix: render-server hang timeout is not clamped to >=40 seconds'}
+          if($bridge -notmatch 'def preview_selftest' -or $bridge -notmatch "add_parser\('preview-selftest'\)"){throw 'Real preview-selftest command missing'}
+          if($bridge -notmatch '__MQLLIB_EMPTY_CHART__' -or $bridge -notmatch 'selftest_report.json' -or $bridge -notmatch 'selftest_contact_sheet.png'){throw 'Preview self-test baseline/report/contact sheet missing'}
+          if($bridge -notmatch "pipeline':'compile-pool\+resident-ea" -or $bridge -notmatch 'compile_pool\(' -or $bridge -notmatch 'render_server\('){throw 'Preview self-test must exercise real compile-pool + resident-EA pipeline'}
+          if($main -notmatch 'Run preview self-test' -or $main -notmatch "'preview-selftest'"){throw 'Preview self-test UI wiring missing'}
+          if($main -notmatch 'previewSelfTestSheet' -or $main -notmatch '40,40,180'){throw 'Preview self-test result sheet or >=40s timeout clamp missing'}
           if($bridge -notmatch "f'/inc:{mqlroot}'"){throw 'Residual 4802 fix: MetaEditor /inc render-root compile flag missing'}
           if($bridge -notmatch 'indicator OnInit failed \(err 4802\)' ){throw 'Residual 4802 fix: terminal OnInit failure classification missing'}
           $previewUi=Get-Content ui/preview_ui.js -Raw
@@ -277,6 +285,7 @@ jobs:
           if($bundle -notmatch 'preview_refresh_queued'){throw 'Explicit preview refresh queueing was not bundled'}
           if($bundle -notmatch 'preview_queue_stats'){throw 'Preview queue progress/statistics were not bundled'}
           if($bundle -notmatch 'preview_worker_pause'){throw 'Preview worker pause/resume control was not bundled'}
+          if($bundle -notmatch 'Run preview self-test' -or $bundle -notmatch 'preview-selftest'){throw 'Preview self-test UI was not bundled'}
           if($bundle -match 'preview_scheduled'){throw 'Old synchronous click-preview scheduler was bundled unexpectedly'}
 
       - name: Frontend readiness smoke test
