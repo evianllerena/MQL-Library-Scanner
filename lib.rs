@@ -4,8 +4,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 use zip::write::SimpleFileOptions;
 
@@ -13,6 +14,22 @@ static PREVIEW_LIBRARY_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pid=child.id();
+    #[cfg(target_os = "windows")]
+    {
+        let _=ProcessCommand::new("taskkill")
+            .args(["/F","/T","/PID",&pid.to_string()])
+            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    let _=child.kill();
+    let _=child.wait();
 }
 
 fn log_startup_error(message: &str) {
@@ -264,81 +281,361 @@ fn start_preview_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Value
     Ok(json!({"started":true,"engine":engine_path.to_string_lossy()}))
 }
 
+fn preview_worker_args(base:&[String],worker_id:&str)->Vec<String> {
+    let mut out=Vec::new();
+    let mut i=0usize;
+    let mut base_job=String::from("library");
+    while i<base.len() {
+        if base[i]=="--worker-id" {
+            i+=2;continue;
+        }
+        if base[i]=="--job-id" {
+            if i+1<base.len() { base_job=base[i+1].clone(); }
+            i+=2;continue;
+        }
+        out.push(base[i].clone());i+=1;
+    }
+    out.push("--job-id".into());
+    out.push(format!("{}-{}",base_job,worker_id));
+    out.push("--worker-id".into());
+    out.push(worker_id.into());
+    out
+}
+
+fn run_preview_worker_supervisor(
+    app:tauri::AppHandle,
+    engine_path:PathBuf,
+    args:Vec<String>,
+    db_path:String,
+    worker_id:String,
+    remaining:Arc<AtomicUsize>,
+    group_failed:Arc<AtomicBool>
+) {
+    const HEARTBEAT_TIMEOUT_SECS:u64=120;
+    const MAX_RESTARTS:u32=20;
+    let mut restarts=0u32;
+    let mut final_code=0i32;
+
+    loop {
+        append_log(&db_path,"INFO","preview_library_start",json!({
+            "engine":engine_path,
+            "args":args,
+            "worker_id":worker_id,
+            "restart_count":restarts
+        }),None);
+
+        let mut cmd=ProcessCommand::new(&engine_path);
+        cmd.args(&args)
+            .env("PYTHONUTF8","1")
+            .env("PYTHONIOENCODING","utf-8")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+
+        let mut child=match cmd.spawn() {
+            Ok(v)=>v,
+            Err(e)=>{
+                final_code=-1;
+                append_log(&db_path,"ERROR","preview_library_spawn_failed",json!({
+                    "error":e.to_string(),"worker_id":worker_id,"restart_count":restarts
+                }),None);
+                if restarts>=MAX_RESTARTS { break; }
+                restarts+=1;
+                append_log(&db_path,"WARN","preview_library_restart",json!({
+                    "reason":"spawn_failed","worker_id":worker_id,"restart_count":restarts
+                }),None);
+                let _=app.emit("preview-library-restart",json!({
+                    "reason":"spawn_failed","worker_id":worker_id,"restart_count":restarts
+                }));
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+
+        let stdout=child.stdout.take();
+        let stderr=child.stderr.take();
+        let last_heartbeat=Arc::new(AtomicU64::new(now_secs()));
+
+        let out_thread=stdout.map(|stdout|{
+            let app_out=app.clone();
+            let db_out=db_path.clone();
+            let hb=last_heartbeat.clone();
+            let wid=worker_id.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if let Ok(v)=serde_json::from_str::<Value>(&line) {
+                        if matches!(v.get("type").and_then(Value::as_str),Some("heartbeat")|Some("progress")) {
+                            hb.store(now_secs(),Ordering::SeqCst);
+                        }
+                    }
+                    append_log(&db_out,"INFO","preview_library_stdout",json!({"line":line,"worker_id":wid}),None);
+                    let _=app_out.emit("preview-library-line",json!({"line":line,"worker_id":wid}));
+                }
+            })
+        });
+        let err_thread=stderr.map(|stderr|{
+            let app_err=app.clone();
+            let db_err=db_path.clone();
+            let wid=worker_id.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    append_log(&db_err,"ERROR","preview_library_stderr",json!({"line":line,"worker_id":wid}),None);
+                    let _=app_err.emit("preview-library-stderr",json!({"line":line,"worker_id":wid}));
+                }
+            })
+        });
+
+        let mut restart_reason:Option<&'static str>=None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status))=>{ final_code=status.code().unwrap_or(-1); break; }
+                Ok(None)=>{}
+                Err(e)=>{
+                    final_code=-1;
+                    append_log(&db_path,"ERROR","preview_library_poll_failed",json!({
+                        "error":e.to_string(),"worker_id":worker_id
+                    }),None);
+                    restart_reason=Some("poll_failed");
+                    kill_process_tree(&mut child);
+                    break;
+                }
+            }
+            let age=now_secs().saturating_sub(last_heartbeat.load(Ordering::SeqCst));
+            if age>HEARTBEAT_TIMEOUT_SECS {
+                restart_reason=Some("heartbeat_timeout");
+                final_code=-2;
+                append_log(&db_path,"ERROR","preview_library_heartbeat_timeout",json!({
+                    "age_seconds":age,"worker_id":worker_id,"restart_count":restarts
+                }),None);
+                kill_process_tree(&mut child);
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+
+        if let Some(t)=out_thread { let _=t.join(); }
+        if let Some(t)=err_thread { let _=t.join(); }
+
+        if restart_reason.is_none() && final_code==0 {
+            append_log(&db_path,"INFO","preview_library_worker_done",json!({
+                "code":0,"worker_id":worker_id,"restarts":restarts
+            }),None);
+            break;
+        }
+
+        if worker_id=="render-server" && final_code==42 {
+            group_failed.store(true,Ordering::SeqCst);
+            append_log(&db_path,"ERROR","preview_library_config_error",json!({
+                "code":final_code,"worker_id":worker_id,
+                "message":"Render terminal started but the capture EA did not heartbeat. Check MT5 data folder/account and Algo Trading."
+            }),None);
+            let _=app.emit("preview-library-config-error",json!({
+                "code":final_code,"worker_id":worker_id,
+                "message":"Render terminal started but the capture EA is not running. Usually means the MT5 clone has no account or Algo Trading is off. Set your MT5 data folder in Settings."
+            }));
+            break;
+        }
+
+        if restarts>=MAX_RESTARTS {
+            group_failed.store(true,Ordering::SeqCst);
+            append_log(&db_path,"ERROR","preview_library_restart_cap",json!({
+                "code":final_code,"worker_id":worker_id,"restart_count":restarts,
+                "reason":restart_reason.unwrap_or("worker_exit")
+            }),None);
+            let _=app.emit("preview-library-restart-cap",json!({
+                "code":final_code,"worker_id":worker_id,"restart_count":restarts
+            }));
+            break;
+        }
+
+        restarts+=1;
+        let reason=restart_reason.unwrap_or("worker_exit");
+        append_log(&db_path,"WARN","preview_library_restart",json!({
+            "reason":reason,"code":final_code,"worker_id":worker_id,"restart_count":restarts
+        }),None);
+        let _=app.emit("preview-library-restart",json!({
+            "reason":reason,"code":final_code,"worker_id":worker_id,"restart_count":restarts
+        }));
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let _=app.emit("preview-library-worker-done",json!({
+        "code":final_code,"worker_id":worker_id,"restarts":restarts
+    }));
+    if final_code!=0 { group_failed.store(true,Ordering::SeqCst); }
+    if remaining.fetch_sub(1,Ordering::SeqCst)==1 {
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
+        let code=if group_failed.load(Ordering::SeqCst){-2}else{0};
+        append_log(&db_path,if code==0{"INFO"}else{"ERROR"},"preview_library_done",json!({
+            "code":code
+        }),None);
+        let _=app.emit("preview-library-done",json!({"code":code}));
+    }
+}
+
+fn cli_arg(args:&[String],name:&str)->Option<String> {
+    args.windows(2).find(|w|w[0]==name).map(|w|w[1].clone())
+}
+
+fn run_compile_pool_process(
+    app:tauri::AppHandle,
+    engine_path:PathBuf,
+    args:Vec<String>,
+    db_path:String,
+    remaining:Arc<AtomicUsize>,
+    group_failed:Arc<AtomicBool>
+) {
+    let mut attempts=0u32;
+    let mut final_code=-1i32;
+    loop {
+        attempts+=1;
+        append_log(&db_path,"INFO","preview_compile_pool_start",json!({"args":args,"attempt":attempts}),None);
+        let mut cmd=ProcessCommand::new(&engine_path);
+        cmd.args(&args)
+            .env("PYTHONUTF8","1")
+            .env("PYTHONIOENCODING","utf-8")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let mut child=match cmd.spawn() {
+            Ok(v)=>v,
+            Err(e)=>{
+                append_log(&db_path,"ERROR","preview_compile_pool_spawn_failed",json!({"error":e.to_string(),"attempt":attempts}),None);
+                if attempts>=5 { group_failed.store(true,Ordering::SeqCst); break; }
+                std::thread::sleep(Duration::from_secs(2));continue;
+            }
+        };
+        let stdout=child.stdout.take();
+        let stderr=child.stderr.take();
+        let out_thread=stdout.map(|stdout|{
+            let app_out=app.clone();let db_out=db_path.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    append_log(&db_out,"INFO","preview_compile_pool_stdout",json!({"line":line}),None);
+                    let _=app_out.emit("preview-library-line",json!({"line":line,"component":"compile-pool"}));
+                }
+            })
+        });
+        let err_thread=stderr.map(|stderr|{
+            let app_err=app.clone();let db_err=db_path.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    append_log(&db_err,"ERROR","preview_compile_pool_stderr",json!({"line":line}),None);
+                    let _=app_err.emit("preview-library-stderr",json!({"line":line,"component":"compile-pool"}));
+                }
+            })
+        });
+        final_code=child.wait().ok().and_then(|s|s.code()).unwrap_or(-1);
+        if let Some(t)=out_thread { let _=t.join(); }
+        if let Some(t)=err_thread { let _=t.join(); }
+        if final_code==0 { break; }
+        append_log(&db_path,"WARN","preview_compile_pool_restart",json!({"code":final_code,"attempt":attempts}),None);
+        let _=app.emit("preview-library-restart",json!({"component":"compile-pool","reason":"worker_exit","restart_count":attempts}));
+        if attempts>=5 { group_failed.store(true,Ordering::SeqCst); break; }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let _=app.emit("preview-library-worker-done",json!({"component":"compile-pool","code":final_code}));
+    if final_code!=0 { group_failed.store(true,Ordering::SeqCst); }
+    if remaining.fetch_sub(1,Ordering::SeqCst)==1 {
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
+        let code=if group_failed.load(Ordering::SeqCst){-2}else{0};
+        let _=app.emit("preview-library-done",json!({"code":code}));
+    }
+}
+
 #[tauri::command]
-fn start_preview_library(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, String> {
-    if args.first().map(String::as_str) != Some("render-library") {
-        return Err("Only render-library is permitted through start_preview_library".into());
+fn start_preview_library(app: tauri::AppHandle, args: Vec<String>, workers: Option<u32>) -> Result<Value, String> {
+    if args.first().map(String::as_str) != Some("render-server") {
+        return Err("Only render-server is permitted through start_preview_library".into());
     }
     if PREVIEW_LIBRARY_RUNNING.swap(true, Ordering::SeqCst) {
         return Ok(json!({"started":false,"already_running":true}));
     }
-    let db_path = args.windows(2).find(|w| w[0] == "--db").map(|w| w[1].clone()).unwrap_or_default();
-    let current = match std::env::current_exe() {
+    let db_path=cli_arg(&args,"--db").unwrap_or_default();
+    let out_path=cli_arg(&args,"--out").unwrap_or_default();
+    if db_path.is_empty() || out_path.is_empty() {
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
+        return Err("render-server requires --db and --out".into());
+    }
+    let current=match std::env::current_exe() {
         Ok(v)=>v,
-        Err(e)=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err(format!("Cannot resolve app executable: {}",e)); }
+        Err(e)=>{PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);return Err(format!("Cannot resolve app executable: {}",e));}
     };
-    let dir = match current.parent() {
-        Some(v)=>v,
-        None=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err("Cannot resolve application folder".into()); }
+    let dir=match current.parent() {
+        Some(v)=>v.to_path_buf(),
+        None=>{PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);return Err("Cannot resolve application folder".into());}
     };
     #[cfg(target_os = "windows")]
-    let engine_path = dir.join("mql-preview.exe");
+    let engine_path=dir.join("mql-preview.exe");
     #[cfg(not(target_os = "windows"))]
-    let engine_path = dir.join("mql-preview");
+    let engine_path=dir.join("mql-preview");
     if !engine_path.exists() {
-        PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst);
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
         append_log(&db_path,"ERROR","preview_library_missing",json!({"path":engine_path}),None);
         return Err(format!("Preview engine was not found at {}",engine_path.display()));
     }
-    append_log(&db_path,"INFO","preview_library_start",json!({"engine":engine_path,"args":args}),None);
-    let mut cmd=ProcessCommand::new(&engine_path);
-    cmd.args(&args)
-        .env("PYTHONUTF8","1")
-        .env("PYTHONIOENCODING","utf-8")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(target_os = "windows")]
+
+    let compile_workers=workers.unwrap_or(4).clamp(1,8);
+    let job_id=cli_arg(&args,"--job-id").unwrap_or_else(||format!("library-{}",now_ms()));
+    let runtime_id=job_id.clone();
+    let terminal=cli_arg(&args,"--terminal");
+    let mut render_args=args.clone();
+    render_args.push("--runtime-id".into());
+    render_args.push(runtime_id.clone());
+    let mut compile_args=vec![
+        "compile-pool".to_string(),
+        "--db".to_string(),db_path.clone(),
+        "--out".to_string(),out_path.clone(),
+        "--workers".to_string(),compile_workers.to_string(),
+        "--job-id".to_string(),format!("{}-compile",job_id),
+        "--runtime-id".to_string(),runtime_id.clone()
+    ];
+    if let Some(t)=terminal { compile_args.push("--terminal".into());compile_args.push(t); }
+
+    let remaining=Arc::new(AtomicUsize::new(2));
+    let group_failed=Arc::new(AtomicBool::new(false));
+
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+        let app_render=app.clone();
+        let engine_render=engine_path.clone();
+        let args_render=render_args;
+        let db_render=db_path.clone();
+        let remaining_render=remaining.clone();
+        let failed_render=group_failed.clone();
+        std::thread::spawn(move || {
+            run_preview_worker_supervisor(
+                app_render,engine_render,args_render,db_render,"render-server".into(),
+                remaining_render,failed_render
+            );
+        });
     }
-    let mut child=match cmd.spawn() {
-        Ok(v)=>v,
-        Err(e)=>{
-            PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst);
-            append_log(&db_path,"ERROR","preview_library_spawn_failed",json!({"error":e.to_string()}),None);
-            return Err(format!("Could not start preview library worker: {}",e));
-        }
-    };
-    let stdout=match child.stdout.take() {
-        Some(v)=>v,
-        None=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err("Could not capture preview worker output".into()); }
-    };
-    let stderr=match child.stderr.take() {
-        Some(v)=>v,
-        None=>{ PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst); return Err("Could not capture preview worker errors".into()); }
-    };
-    let app_out=app.clone();let db_out=db_path.clone();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            append_log(&db_out,"INFO","preview_library_stdout",json!({"line":line}),None);
-            let _=app_out.emit("preview-library-line",json!({"line":line}));
-        }
-    });
-    let app_err=app.clone();let db_err=db_path.clone();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            append_log(&db_err,"ERROR","preview_library_stderr",json!({"line":line}),None);
-            let _=app_err.emit("preview-library-stderr",json!({"line":line}));
-        }
-    });
-    std::thread::spawn(move || {
-        let code=child.wait().ok().and_then(|s|s.code()).unwrap_or(-1);
-        PREVIEW_LIBRARY_RUNNING.store(false, Ordering::SeqCst);
-        append_log(&db_path,if code==0{"INFO"}else{"ERROR"},"preview_library_done",json!({"code":code}),None);
-        let _=app.emit("preview-library-done",json!({"code":code}));
-    });
-    Ok(json!({"started":true,"already_running":false,"engine":engine_path.to_string_lossy()}))
+    {
+        let app_compile=app.clone();
+        let engine_compile=engine_path.clone();
+        let db_compile=db_path.clone();
+        let remaining_compile=remaining.clone();
+        let failed_compile=group_failed.clone();
+        std::thread::spawn(move || {
+            run_compile_pool_process(
+                app_compile,engine_compile,compile_args,db_compile,
+                remaining_compile,failed_compile
+            );
+        });
+    }
+
+    Ok(json!({
+        "started":true,"already_running":false,"engine":engine_path.to_string_lossy(),
+        "render_server":1,"compile_workers":compile_workers,"runtime_id":runtime_id,
+        "heartbeat_timeout_seconds":120,"max_render_restarts":20
+    }))
 }
 
 #[tauri::command]
@@ -391,7 +688,8 @@ fn ensure_preview_columns(conn:&Connection) -> Result<(),String> {
         ("preview_path","TEXT"),
         ("preview_hash","TEXT"),
         ("preview_error","TEXT DEFAULT ''"),
-        ("preview_updated_at","TEXT")
+        ("preview_updated_at","TEXT"),
+        ("worker_id","TEXT")
     ];
     for (name,decl) in additions {
         if !cols.contains(name) {
@@ -446,6 +744,8 @@ fn preview_queue_stats(db_path:String) -> Result<Value,String> {
         "total":one("SELECT COUNT(*) FROM indicators")?,
         "ready":one("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'")?,
         "pending":one("SELECT COUNT(*) FROM indicators WHERE preview_status='pending'")?,
+        "compiling":one("SELECT COUNT(*) FROM indicators WHERE preview_status='compiling'")?,
+        "compiled":one("SELECT COUNT(*) FROM indicators WHERE preview_status='compiled'")?,
         "rendering":one("SELECT COUNT(*) FROM indicators WHERE preview_status='rendering'")?,
         "failed":one("SELECT COUNT(*) FROM indicators WHERE preview_status='failed'")?,
         "paused":paused

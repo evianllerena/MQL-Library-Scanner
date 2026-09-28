@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterable
 from engine_core import Analysis, analyze
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 JSON_FIELDS = ['draw_types','standard_indicators','custom_dependencies','secondary_categories','behavior_tags','techniques','evidence','warnings','user_tags']
 
 # Windows/PyInstaller can otherwise inherit a legacy ANSI console encoding even
@@ -80,13 +80,12 @@ def migrate(conn):
       'family_id':'TEXT','human_verified':'INTEGER DEFAULT 0','verified_primary':'TEXT','verified_secondary':"TEXT DEFAULT '[]'",
       'verified_at':'TEXT','mtime_ns':'INTEGER DEFAULT 0','scan_status':"TEXT DEFAULT 'complete'",'user_favorite':'INTEGER DEFAULT 0','user_tags':"TEXT DEFAULT '[]'",
       'preview_status':"TEXT DEFAULT 'pending'",'preview_path':'TEXT','preview_hash':'TEXT','preview_error':"TEXT DEFAULT ''",'preview_updated_at':'TEXT',
-      'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0'
+      'preview_attempts':'INTEGER DEFAULT 0','preview_priority':'INTEGER DEFAULT 0','worker_id':'TEXT'
     }
     existing=cols(conn,'indicators')
     for name,decl in additions.items():
         if name not in existing: conn.execute(f'ALTER TABLE indicators ADD COLUMN {name} {decl}')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_preview_status ON indicators(preview_status)')
-    conn.execute("UPDATE indicators SET preview_status='pending' WHERE preview_status='rendering'")
     conn.execute("UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='' "
                  "WHERE preview_status='ready' AND COALESCE(preview_hash,'')!=COALESCE(sha256,'')")
     conn.execute("INSERT INTO meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(SCHEMA_VERSION),))
@@ -149,7 +148,7 @@ def save_analysis(conn,a:Analysis,mtime_ns:int):
     if prior_sha != a.sha256:
         conn.execute(
             "UPDATE indicators SET preview_status='pending',preview_path=NULL,preview_hash=NULL,"
-            "preview_error='',preview_updated_at=NULL,preview_attempts=0 WHERE path=?",
+            "preview_error='',preview_updated_at=NULL,preview_attempts=0,worker_id=NULL WHERE path=?",
             (path,))
 
 def unchanged(conn,p):
