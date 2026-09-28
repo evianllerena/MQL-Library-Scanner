@@ -10,6 +10,7 @@ on:
       - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
+      - 'requirements-build.txt'
       - 'preview_bridge.py'
       - 'preview_batch.py'
       - 'preview_control.py'
@@ -25,12 +26,13 @@ on:
       - 'tauri.conf.json'
       - 'windows/**'
   push:
-    branches: [main]
+    branches: [main, fix/overlay-selftest-real-pipeline]
     paths:
       - '.github/workflows/windows-beta.yml'
       - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
+      - 'requirements-build.txt'
       - 'preview_bridge.py'
       - 'preview_batch.py'
       - 'preview_control.py'
@@ -75,6 +77,7 @@ jobs:
           Set-Location $env:APP_DIR
           Copy-Item "$r/engine.py" 'engine/engine.py' -Force
           Copy-Item "$r/engine_core.py" 'engine/engine_core.py' -Force
+          Copy-Item "$r/requirements-build.txt" 'engine/requirements-build.txt' -Force
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
           Copy-Item "$r/preview_batch.py" 'engine/preview_batch.py' -Force
           Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
@@ -106,8 +109,11 @@ jobs:
         run: |
           Set-Location $env:APP_DIR
           python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py
+          if($LASTEXITCODE -ne 0){throw 'Python source validation failed'}
           node --check ui/main.js
+          if($LASTEXITCODE -ne 0){throw 'main.js syntax validation failed'}
           node --check ui/preview_ui.js
+          if($LASTEXITCODE -ne 0){throw 'preview_ui.js syntax validation failed'}
           $packageVersion=(Get-Content package.json -Raw | ConvertFrom-Json).version
           $tauriVersion=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $cargoVersion=[regex]::Match((Get-Content src-tauri/Cargo.toml -Raw),'(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
@@ -144,6 +150,54 @@ jobs:
           if($bridge -match "copytree\(src,dst,dirs_exist_ok=True,ignore=ign\)"){throw 'Whole MQL tree seed must not return'}
           if($bridge -notmatch 'ShutdownTerminal=1'){throw 'MT5 shutdown config must use numeric documented value'}
           if($bridge -notmatch 'preview_engine_stage' -and $ui -notmatch 'preview_engine_stage'){throw 'Preview stage logging missing'}
+          if($bridge -notmatch 'def hard_kill' -or $bridge -notmatch 'psutil.process_iter'){throw 'Runtime-scoped MetaTrader hard kill missing'}
+          if($bridge -notmatch 'chunk_budget' -or $bridge -notmatch 'last_shot'){throw 'Hard chunk/no-progress deadline missing'}
+          if($bridge -notmatch 'emit_heartbeat' -or $bridge -notmatch "'type':'heartbeat'"){throw 'Preview worker heartbeat missing'}
+          if($bridge -notmatch 'BEGIN IMMEDIATE' -or $bridge -notmatch 'GROUP BY sha256'){throw 'Atomic SHA256 dedup claim missing'}
+          if($bridge -notmatch 'worker_id' -or $bridge -notmatch 'clone_runtime\(mt5_sel,dest,''MT5'',worker_id\)'){throw 'Worker-owned isolated runtime missing'}
+          if($bridge -notmatch '_mt5_static_fast_fail'){throw 'Known-bad MT5 static prefilter missing'}
+          if($bridge -notmatch 'static_fast_fail=False'){throw 'Static MT5 fast-fail must default OFF'}
+          if($bridge -notmatch "reason=_mt5_static_fast_fail\(r\['path'\]\) if static_fast_fail else None"){throw 'Static MT5 fast-fail is not guarded by opt-in setting'}
+          if($bridge -notmatch "preview_error LIKE 'MT4 source in .mq5:%'"){throw 'Legacy static-fast-fail rows are not recovered'}
+          if($bridge -notmatch "add_argument\('--static-fast-fail',action='store_true',default=False\)"){throw 'Static MT5 fast-fail opt-in CLI setting missing'}
+          if($bridge -notmatch 'RESIDENT_EA_SOURCE' -or $bridge -notmatch 'current.job' -or $bridge -notmatch 'current.done' -or $bridge -notmatch 'heartbeat.txt'){throw 'Resident EA file protocol missing'}
+          if($bridge -notmatch 'def render_server' -or $bridge -notmatch "add_parser\('render-server'\)"){throw 'Resident render-server command missing'}
+          if($bridge -notmatch 'def compile_pool' -or $bridge -notmatch "add_parser\('compile-pool'\)"){throw 'Parallel compile-pool command missing'}
+          if($bridge -notmatch '_resident_indicator_rel' -or $bridge -notmatch "MQLLibraryPreview/"){throw 'Forward-slash resident iCustom path missing'}
+          if($bridge -notmatch 'resolve_mt5_render_data_dir' -or $bridge -notmatch 'seed_render_runtime_from_data_dir'){throw 'FIX 1 logged-in MT5 render seed missing'}
+          if($bridge -notmatch 'AllowLiveTrading=1' -or $bridge -notmatch "add_argument\('--mt5-data-dir'"){throw 'FIX 1 render account/algo setting missing'}
+          if($bridge -notmatch 'RENDER_STARTUP_EXIT=42' -or $bridge -notmatch 'def _wait_for_resident_startup'){throw 'FIX 2 first-heartbeat handshake missing'}
+          if($bridge -notmatch 'resident_ea_ready' -or $bridge -notmatch 'relaunch_cap=3'){throw 'FIX 2 ready/hang recovery guard missing'}
+          $lib=Get-Content src-tauri/src/lib.rs -Raw
+          if($lib -notmatch 'preview_library_heartbeat_timeout' -or $lib -notmatch 'preview_library_restart'){throw 'Supervisor heartbeat restart missing'}
+          if($lib -notmatch 'run_preview_worker_supervisor' -or $lib -notmatch 'run_compile_pool_process'){throw 'Resident render-server + compile-pool supervisor missing'}
+          if($lib -notmatch '"render_server":1' -or $lib -notmatch '"compile_workers"'){throw 'One warm render server / compile worker split missing'}
+          if($lib -notmatch 'final_code==42' -or $lib -notmatch 'preview-library-config-error'){throw 'FIX 2 non-restarting startup configuration failure missing'}
+          $main=Get-Content ui/main.js -Raw
+          if($main -notmatch 'preview.workers' -or $main -notmatch 'defaultPreviewWorkers'){throw 'Compile worker settings missing'}
+          if($main -notmatch "'render-server'" -or $main -match "'render-library','--db'"){throw 'UI is not switched to resident render-server path'}
+          if($main -notmatch 'mt5DataDir' -or $main -notmatch 'preview.mt5DataDir'){throw 'FIX 1 mt5_data_dir Settings control missing'}
+          if($main -notmatch 'preview-library-config-error' -or $main -notmatch 'render_startup_config'){throw 'FIX 2 startup configuration error UI missing'}
+          if($bridge -notmatch "runtime_path\(sel,dest,'MT5','render-server'\)" -or $bridge -notmatch '_wait_for_render_runtime'){throw '4802 fix: compile pool is not targeting shared render runtime'}
+          if($bridge -notmatch 'render_artifact_missing' -or $bridge -notmatch 'ex5 missing in render runtime'){throw '4802 fix: pre-queue EX5 assertion missing'}
+          if($bridge -notmatch "add_argument\('--runtime-id'"){throw '4802 fix: runtime generation guard missing'}
+          if($lib -notmatch '"--runtime-id"' -or $lib -notmatch 'render_args.push'){throw '4802 fix: Rust runtime generation wiring missing'}
+          if($bridge -notmatch 'seed_render_dependencies_from_data_dir' -or $bridge -notmatch "for name in \('Indicators','Include','Libraries','Files'\)"){throw 'Residual 4802 fix: render dependency seeding missing'}
+          if($bridge -notmatch "common_src=real_data.parent/'Common'"){throw 'Residual 4802 fix: Terminal Common seed missing'}
+          if($bridge -notmatch 'if\(bc>0\)' -or $bridge -notmatch 'stable>=5' -or $bridge -notmatch 'for\(int i=0;i<60;i\+\+\)'){throw 'Overlay fix: resident EA does not wait for calculated buffers'}
+          if($bridge -notmatch 'CopyRates\(_Symbol,_Period,0,3000,rr\)' -or $bridge -notmatch 'ChartNavigate\(0,CHART_END,0\)'){throw 'Overlay fix: deep history/end-of-chart paint setup missing'}
+          if($bridge -notmatch 'hang_timeout=max\(40' ){throw 'Overlay fix: render-server hang timeout is not clamped to >=40 seconds'}
+          if($bridge -notmatch 'def preview_selftest' -or $bridge -notmatch "add_parser\('preview-selftest'\)"){throw 'Real preview-selftest command missing'}
+          if($bridge -notmatch '__MQLLIB_EMPTY_CHART__' -or $bridge -notmatch 'selftest_report.json' -or $bridge -notmatch 'selftest_contact_sheet.png'){throw 'Preview self-test baseline/report/contact sheet missing'}
+          if($bridge -notmatch "pipeline':'compile-pool\+resident-ea" -or $bridge -notmatch 'compile_pool\(' -or $bridge -notmatch 'render_server\('){throw 'Preview self-test must exercise real compile-pool + resident-EA pipeline'}
+          if($main -notmatch 'Run preview self-test' -or $main -notmatch "'preview-selftest'"){throw 'Preview self-test UI wiring missing'}
+          if($main -notmatch 'previewSelfTestSheet' -or $main -notmatch '40,40,180'){throw 'Preview self-test result sheet or >=40s timeout clamp missing'}
+          if($bridge -notmatch "f'/inc:{mqlroot}'"){throw 'Residual 4802 fix: MetaEditor /inc render-root compile flag missing'}
+          if($bridge -notmatch 'indicator OnInit failed \(err 4802\)' ){throw 'Residual 4802 fix: terminal OnInit failure classification missing'}
+          $previewUi=Get-Content ui/preview_ui.js -Raw
+          if($main -notmatch "Can't preview \(indicator won't initialize\)" -or $previewUi -notmatch "Can't preview \(indicator won't initialize\)"){throw 'Residual 4802 fix: cannot-preview UI label missing'}
+          $req=Get-Content engine/requirements-build.txt -Raw
+          if($req -notmatch '(?m)^psutil'){throw 'psutil build dependency missing'}
           python engine/preview_control.py self-test
           if($LASTEXITCODE -ne 0){throw 'Preview control self-test failed'}
 
@@ -223,12 +277,16 @@ jobs:
           if($bundle -notmatch 'Clear Application / Start Fresh'){throw 'Clear application control was not bundled into frontend'}
           if($bundle -match 'Create Archive Backup'){throw 'Archive UI was bundled unexpectedly'}
           if($bundle -notmatch 'mql-preview-control'){throw 'Preview control sidecar was not bundled into frontend'}
-          if($bundle -notmatch 'preview_cancel_result'){throw 'Verified preview cancellation logic was not bundled'}
+          if($bundle -notmatch 'preview_cache_hit'){throw 'Cache-first preview click path was not bundled'}
+          if($bundle -notmatch 'preview_queue_update'){throw 'SQLite preview queue controls were not bundled'}
+          if($bundle -notmatch 'start_preview_library'){throw 'Background preview library worker launcher was not bundled'}
           if($bundle -notmatch 'ui_event_loop_stall'){throw 'UI stall watchdog was not bundled'}
-          if($bundle -notmatch 'preview_engine_stage'){throw 'Preview engine stage diagnostics were not bundled'}
-          if($bundle -notmatch 'preview_preflight_start' -or $bundle -notmatch 'preview_preflight_failed' -or $bundle -notmatch 'preview_discovery_stage'){throw 'Preview runtime preflight/discovery diagnostics were not bundled'}
-          if($bundle -notmatch 'mt5_full_recompile'){throw 'MT5 first-use initialization status was not bundled'}
-          if($bundle -notmatch 'terminal_selected'){throw 'Bound terminal data-folder status was not bundled'}
+          if($bundle -notmatch 'preview_library_done_ui'){throw 'Background preview completion handling was not bundled'}
+          if($bundle -notmatch 'preview_refresh_queued'){throw 'Explicit preview refresh queueing was not bundled'}
+          if($bundle -notmatch 'preview_queue_stats'){throw 'Preview queue progress/statistics were not bundled'}
+          if($bundle -notmatch 'preview_worker_pause'){throw 'Preview worker pause/resume control was not bundled'}
+          if($bundle -notmatch 'Run preview self-test' -or $bundle -notmatch 'preview-selftest'){throw 'Preview self-test UI was not bundled'}
+          if($bundle -match 'preview_scheduled'){throw 'Old synchronous click-preview scheduler was bundled unexpectedly'}
 
       - name: Frontend readiness smoke test
         shell: pwsh
