@@ -427,6 +427,19 @@ fn run_preview_worker_supervisor(
             break;
         }
 
+        if worker_id=="render-server" && final_code==42 {
+            group_failed.store(true,Ordering::SeqCst);
+            append_log(&db_path,"ERROR","preview_library_config_error",json!({
+                "code":final_code,"worker_id":worker_id,
+                "message":"Render terminal started but the capture EA did not heartbeat. Check MT5 data folder/account and Algo Trading."
+            }),None);
+            let _=app.emit("preview-library-config-error",json!({
+                "code":final_code,"worker_id":worker_id,
+                "message":"Render terminal started but the capture EA is not running. Usually means the MT5 clone has no account or Algo Trading is off. Set your MT5 data folder in Settings."
+            }));
+            break;
+        }
+
         if restarts>=MAX_RESTARTS {
             group_failed.store(true,Ordering::SeqCst);
             append_log(&db_path,"ERROR","preview_library_restart_cap",json!({
@@ -572,13 +585,18 @@ fn start_preview_library(app: tauri::AppHandle, args: Vec<String>, workers: Opti
 
     let compile_workers=workers.unwrap_or(4).clamp(1,8);
     let job_id=cli_arg(&args,"--job-id").unwrap_or_else(||format!("library-{}",now_ms()));
+    let runtime_id=job_id.clone();
     let terminal=cli_arg(&args,"--terminal");
+    let mut render_args=args.clone();
+    render_args.push("--runtime-id".into());
+    render_args.push(runtime_id.clone());
     let mut compile_args=vec![
         "compile-pool".to_string(),
         "--db".to_string(),db_path.clone(),
         "--out".to_string(),out_path.clone(),
         "--workers".to_string(),compile_workers.to_string(),
-        "--job-id".to_string(),format!("{}-compile",job_id)
+        "--job-id".to_string(),format!("{}-compile",job_id),
+        "--runtime-id".to_string(),runtime_id.clone()
     ];
     if let Some(t)=terminal { compile_args.push("--terminal".into());compile_args.push(t); }
 
@@ -588,7 +606,7 @@ fn start_preview_library(app: tauri::AppHandle, args: Vec<String>, workers: Opti
     {
         let app_render=app.clone();
         let engine_render=engine_path.clone();
-        let args_render=args.clone();
+        let args_render=render_args;
         let db_render=db_path.clone();
         let remaining_render=remaining.clone();
         let failed_render=group_failed.clone();
@@ -615,7 +633,7 @@ fn start_preview_library(app: tauri::AppHandle, args: Vec<String>, workers: Opti
 
     Ok(json!({
         "started":true,"already_running":false,"engine":engine_path.to_string_lossy(),
-        "render_server":1,"compile_workers":compile_workers,
+        "render_server":1,"compile_workers":compile_workers,"runtime_id":runtime_id,
         "heartbeat_timeout_seconds":120,"max_render_restarts":20
     }))
 }

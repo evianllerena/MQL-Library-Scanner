@@ -418,7 +418,9 @@ function injectPreview(){
     message:queueStatus==='rendering'
       ?'Background preview is rendering…'
       :queueStatus==='failed'
-        ?`Can't preview: ${queueError||'render failed after retry limit'}`
+        ?(queueError.includes('indicator OnInit failed (err 4802)')
+          ?"Can't preview (indicator won't initialize)"
+          :`Can't preview: ${queueError||'render failed after retry limit'}`)
         :'Preview queued in background…'
   };
   applyPreviewState();
