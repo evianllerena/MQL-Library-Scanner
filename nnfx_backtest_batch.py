@@ -176,6 +176,7 @@ void OnStart(){
     int h_ma=iCustom(sym,PERIOD_D1,"Examples\\Custom Moving Average",20,0,MODE_SMA);
     int h_macd=iCustom(sym,PERIOD_D1,"Examples\\MACD");
     int h_rvi=iCustom(sym,PERIOD_D1,"Examples\\RVI");
+    int h_mom=iCustom(sym,PERIOD_D1,"Examples\\Momentum");
     int h_atr=iATR(sym,PERIOD_D1,14);
 
     int handles[]; ArrayResize(handles,njobs);
@@ -183,16 +184,17 @@ void OnStart(){
 
     int waited=0;
     while(waited<20){
-      bool ready=(BarsCalculated(h_ma)>0 && BarsCalculated(h_macd)>0 && BarsCalculated(h_rvi)>0 && BarsCalculated(h_atr)>0);
+      bool ready=(BarsCalculated(h_ma)>0 && BarsCalculated(h_macd)>0 && BarsCalculated(h_rvi)>0 && BarsCalculated(h_mom)>0 && BarsCalculated(h_atr)>0);
       for(int k=0;k<njobs;k++) if(BarsCalculated(handles[k])<=0) ready=false;
       if(ready) break;
       Sleep(100); waited++;
     }
 
-    double ma[],macdM[],macdS[],rvi[],atr[];
-    ArraySetAsSeries(ma,true);ArraySetAsSeries(macdM,true);ArraySetAsSeries(macdS,true);ArraySetAsSeries(rvi,true);ArraySetAsSeries(atr,true);
+    double ma[],macdM[],macdS[],rvi[],mom[],atr[];
+    ArraySetAsSeries(ma,true);ArraySetAsSeries(macdM,true);ArraySetAsSeries(macdS,true);ArraySetAsSeries(rvi,true);ArraySetAsSeries(mom,true);ArraySetAsSeries(atr,true);
     CopyBuffer(h_ma,0,0,total,ma);CopyBuffer(h_macd,0,0,total,macdM);CopyBuffer(h_macd,1,0,total,macdS);
     CopyBuffer(h_rvi,0,0,total,rvi);CopyBuffer(h_atr,0,0,total,atr);
+    int gotMom=CopyBuffer(h_mom,0,0,total,mom);
 
     double allA[]; ArrayResize(allA,njobs*total);
     double allB[]; ArrayResize(allB,njobs*total);
@@ -211,20 +213,20 @@ void OnStart(){
     string outfile="nnfx_batch_extract_"+sym+".csv";
     int fh=FileOpen(outfile,FILE_WRITE|FILE_TXT|FILE_ANSI);
     if(fh==INVALID_HANDLE){ AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"cannot_open_output\"}"); continue; }
-    string header="date,close,high,low,ma,macd_m,macd_s,rvi,atr";
+    string header="date,close,high,low,ma,macd_m,macd_s,rvi,atr,mom";
     for(int k=0;k<njobs;k++){ header+=","+keys[k]+"_a"; if(bufB[k]>=0) header+=","+keys[k]+"_b"; }
     FileWriteString(fh,header+"\r\n");
     for(int i=total-1;i>=0;i--){
       datetime t=iTime(sym,PERIOD_D1,i);
       string line=TimeToString(t,TIME_DATE)+","+DoubleToString(iClose(sym,PERIOD_D1,i),8)+","+
                   DoubleToString(iHigh(sym,PERIOD_D1,i),8)+","+DoubleToString(iLow(sym,PERIOD_D1,i),8)+","+
-                  EV(ma[i])+","+EV(macdM[i])+","+EV(macdS[i])+","+EV(rvi[i])+","+EV(atr[i]);
+                  EV(ma[i])+","+EV(macdM[i])+","+EV(macdS[i])+","+EV(rvi[i])+","+EV(atr[i])+","+EV(i<gotMom?mom[i]:EMPTY_VALUE);
       for(int k=0;k<njobs;k++){ line+=","+EV(allA[k*total+i]); if(bufB[k]>=0) line+=","+EV(allB[k*total+i]); }
       FileWriteString(fh,line+"\r\n");
     }
     FileClose(fh);
     for(int k=0;k<njobs;k++) IndicatorRelease(handles[k]);
-    IndicatorRelease(h_ma); IndicatorRelease(h_macd); IndicatorRelease(h_rvi); IndicatorRelease(h_atr);
+    IndicatorRelease(h_ma); IndicatorRelease(h_macd); IndicatorRelease(h_rvi); IndicatorRelease(h_mom); IndicatorRelease(h_atr);
     AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"done\",\"rows\":"+IntegerToString(total)+"}");
   }
   int f=FileOpen("nnfx_batch_done.flag",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
@@ -347,6 +349,8 @@ def rolling_avg(vals, window=20):
             out[i] = sum(window_vals) / window
     return out
 
+REF_EXIT_ZERO_REFERENCE = 100.0  # Examples\Momentum = close/close[n]*100, so its centre line is 100
+
 def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
     per_symbol = {}
     pooled_trades = []
@@ -389,7 +393,10 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
                        close_prev=prev_close if prev_close is not None else fnum(r['close']),
                        baseline=base, baseline_prev=prev_baseline if prev_baseline is not None else base,
                        c1_fast=c1f, c1_slow=c1s, c2_value=c2v, c2_zero_reference=c2z,
-                       volume_value=volv, volume_avg=volavg, atr=atrv)
+                       volume_value=volv, volume_avg=volavg, atr=atrv,
+                       # X2 reference exit: Examples\Momentum(14), centre line 100 (not 0). Missing
+                       # column (pre-FIX-2 extract) or warm-up EMPTY -> no exit indicator that bar.
+                       exit_value=fnum(r.get('mom')), exit_zero_reference=REF_EXIT_ZERO_REFERENCE)
             rec = eng.process_bar(bar)
             rec['date'] = r['date']
             records.append(rec)

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from nnfx_engine import (
     NNFXEngine, NNFXParams,
-    c2_direction, baseline_cross_closed, c1_direction_run_length,
+    c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction,
 )
 
 
@@ -319,6 +319,58 @@ def unit_tests() -> Check:
     c.that('X4: the wrong-side close that triggered the exit also resets continuation -- no re-entry after it',
            r_c['action'] != 'enter', detail=str(r_c))
 
+    # --- X2 exit indicator (FIX 2). Reference exit = Momentum, centre line 100. ----------
+    c.that('X2 exit_direction: 100.4 vs centre line 100 -> long', exit_direction(100.4, 100.0) == 1)
+    c.that('X2 exit_direction: 99.6 vs centre line 100 -> SHORT, although 99.6 > 0 (never assume 0)',
+           exit_direction(99.6, 100.0) == -1)
+    c.that('X2 exit_direction: exactly on the centre line -> 0 (no signal)', exit_direction(100.0, 100.0) == 0)
+
+    def x2_bars(zero_ref=100.0, with_exit=True):
+        bars = [
+            _bar('2024-08-12', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                         # standard long entry
+            _bar('2024-08-13', 100.8, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.9, low=100.5),
+            _bar('2024-08-14', 100.4, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.8, high=100.8, low=100.3),
+        ]
+        for b, v in zip(bars, (100.5, 100.4, 99.6)):
+            if with_exit:
+                b.update(exit_value=v, exit_zero_reference=zero_ref)
+        return bars
+
+    eng_x2 = NNFXEngine(P())
+    r_x2 = [eng_x2.process_bar(b) for b in x2_bars()]
+    c.that('X2: exit indicator above its centre line (100.4 vs 100) holds the long', r_x2[1]['action'] == 'hold', detail=str(r_x2[1]))
+    c.that('X2: exit indicator crossing below its centre line (99.6 vs 100) closes the long at the close, with '
+           'C1 still long, price above the baseline and SL untouched',
+           r_x2[2]['action'] == 'exit' and r_x2[2]['reason'] == 'exit:exit_indicator' and r_x2[2]['pips'] == -0.2,
+           detail=str(r_x2[2]))
+
+    eng_x2_zero = NNFXEngine(P())
+    r_zero = [eng_x2_zero.process_bar(b) for b in x2_bars(zero_ref=0.0)]
+    c.that('X2 zero_reference proof: the SAME value 99.6 read against an assumed 0 would say "long" and hold -- '
+           'so the exit above can only come from the indicator\'s own centre line of 100',
+           r_zero[2]['action'] == 'hold' and eng_x2_zero.position is not None, detail=str(r_zero[2]))
+
+    eng_x2_off = NNFXEngine(P(enable_exit_indicator=False))
+    r_off2 = [eng_x2_off.process_bar(b) for b in x2_bars()]
+    c.that('X2 off (enable_exit_indicator=False): the same bars hold', r_off2[2]['action'] == 'hold', detail=str(r_off2[2]))
+
+    eng_short_x2 = NNFXEngine(P())
+    eng_short_x2.process_bar(dict(_bar('2024-08-20', 99.4, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5),
+                                  exit_value=99.0, exit_zero_reference=100.0))                        # short entry
+    r_sx = eng_short_x2.process_bar(dict(_bar('2024-08-21', 99.6, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=99.4,
+                                              high=99.7, low=99.3), exit_value=100.3, exit_zero_reference=100.0))
+    c.that('X2: mirrors for shorts -- exit indicator rising above its centre line closes a short',
+           r_sx['reason'] == 'exit:exit_indicator', detail=str(r_sx))
+
+    # No exit indicator supplied => bar-for-bar identical to FIX 1 (regression guard). Run every
+    # existing trace fixture plus the X2 bars without exit keys vs with the feature disabled.
+    def actions(params, bars):
+        e = NNFXEngine(params)
+        return [(r['action'], r['reason'], r['pips']) for r in (e.process_bar(dict(b)) for b in bars)]
+    no_exit_bars = x4_bars() + x2_bars(with_exit=False)
+    c.that('X2 dormant: with no exit indicator on the bars, results equal the feature switched off',
+           actions(P(), no_exit_bars) == actions(P(enable_exit_indicator=False), no_exit_bars))
+
     return c
 
 
@@ -327,8 +379,8 @@ def unit_tests() -> Check:
 # ---------------------------------------------------------------------------
 
 TRACE_HEADER = ['date', 'close', 'high', 'low', 'baseline', 'c1_fast', 'c1_slow', 'c1_dir', 'c2_value', 'c2_dir',
-                'volume_value', 'volume_avg', 'direction_decision', 'action', 'reason', 'lots', 'atr', 'pips',
-                'sl_after']
+                'volume_value', 'volume_avg', 'exit_value', 'exit_dir', 'direction_decision', 'action', 'reason',
+                'lots', 'atr', 'pips', 'sl_after']
 
 
 def write_trace(out_dir: Path, filename: str, bars: list[dict], params: NNFXParams) -> Path:
@@ -409,6 +461,36 @@ def build_traces(out_dir: Path) -> list[Path]:
     ]
     paths.append(write_trace(out_dir, 'trace_6_x4_baseline_exit.csv', bars, P()))
     paths.append(write_trace(out_dir, 'trace_7_x4_off_control.csv', bars, P(enable_baseline_exit=False)))
+
+    # Trace 8 (FIX 2, X2): long entry; the exit indicator (Momentum, centre line 100) drops to
+    # 99.6 on 08-07 while C1 is long, price is above the baseline and SL is far away ->
+    # exit:exit_indicator. Later bars show what the trade would have run into: a wrong-side
+    # close on 08-08 (X4), the stop on 08-09, the C1 flip on 08-12.
+    # Trace 9 = the SAME bars with no exit indicator supplied (control): identical to FIX 1
+    # behavior -- the trade rides on and is closed by X4 on 08-08.
+    def x2_trace_bars(with_exit):
+        rows = [
+            ('2024-08-05', 100.6, None, None, 1.0, 0.9, 100.5, dict(close_prev=99.5)),                # standard long entry
+            ('2024-08-06', 100.9, 101.0, 100.5, 1.0, 0.9, 100.4, {}),                                 # exit ind. above 100: HOLD
+            ('2024-08-07', 100.5, 100.9, 100.4, 1.0, 0.9, 99.6, {}),                                  # exit ind. 99.6 < 100: X2 EXIT
+            ('2024-08-08', 99.8, 100.4, 99.7, 1.0, 0.9, 99.3, {}),                                    # wrong-side close (X4) here
+            ('2024-08-09', 99.2, 99.8, 99.0, 1.0, 0.9, 99.1, {}),                                     # SL 99.1 hit here
+            ('2024-08-12', 99.1, 99.3, 99.0, 0.9, 1.0, 98.9, {}),                                     # C1 flips here
+        ]
+        out, prev = [], None
+        for date, close, hi, lo, f, s, ev, extra in rows:
+            kw = dict(close_prev=prev if prev is not None else close)
+            kw.update(extra)
+            if hi is not None:
+                kw.update(high=hi, low=lo)
+            b = _bar(date, close, 100.0, f, s, 5.0, 10.0, **kw)
+            if with_exit:
+                b.update(exit_value=ev, exit_zero_reference=100.0)
+            out.append(b)
+            prev = close
+        return out
+    paths.append(write_trace(out_dir, 'trace_8_x2_exit_indicator.csv', x2_trace_bars(True), P()))
+    paths.append(write_trace(out_dir, 'trace_9_x2_no_exit_indicator_control.csv', x2_trace_bars(False), P()))
 
     return paths
 
