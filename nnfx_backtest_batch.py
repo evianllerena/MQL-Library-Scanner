@@ -262,6 +262,24 @@ def copy_history_for_symbols(live, rt, symbols):
                 pass
     return copied
 
+def restore_account_login(live, rt):
+    """pb.prime_mt5_runtime() runs pb._prepare_offline_runtime(), which deletes
+    config/accounts.dat from the clone -- fine for preview, but without the
+    saved login the batch session never connects, the controller's OnInit
+    waits on data until it times out, and every candidate scores 0 events.
+    Copy the live terminal's accounts.dat back after priming so the session
+    authorizes like the user's own terminal. Kept here so preview_bridge.py
+    behavior is unchanged."""
+    src = Path(live) / 'config' / 'accounts.dat'
+    if not src.is_file():
+        stage_event('account_login_missing', data_dir=str(live))
+        return False
+    dst = Path(rt) / 'config' / 'accounts.dat'
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    stage_event('account_login_restored')
+    return True
+
 def _read_jsonl(path):
     out = []
     if not path.exists():
@@ -468,6 +486,7 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
     stage_event('history_copied', symbols=copied)
     sym0 = copied[0] if copied else (pb.copy_mt5_history(Path(mt5['data_dir']), rt) or symbols[0])
     pb.prime_mt5_runtime(rt, terminal_exe, sym0, 'nnfx-backtest')
+    restore_account_login(Path(mt5['data_dir']), rt)
 
     # 1) stage every candidate source (mirrors render_shard's staging loop)
     prepared = {}
