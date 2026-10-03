@@ -279,6 +279,46 @@ def unit_tests() -> Check:
     c.that('entry_agreement: no fresh baseline cross (already on that side) -> no entry',
            try_entry(close=100.6, close_prev=100.6, baseline=100.0, baseline_prev=100.0)['action'] != 'enter')
 
+    # --- X4 wrong-side-baseline exit (FIX 1). Long entry at 100.6, SL 99.1, TP1 101.6.
+    #     C1 stays long the whole time, so neither SL nor a C1 flip can be the exit. -----
+    def x4_bars():
+        return [
+            _bar('2024-06-10', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                         # standard long entry
+            _bar('2024-06-11', 100.2, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.7, low=99.7),  # dips below intrabar, CLOSES above
+            _bar('2024-06-12', 100.0, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.2, high=100.3, low=99.8),  # closes exactly ON the baseline
+            _bar('2024-06-13', 99.7, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.0, high=100.1, low=99.6),   # CLOSES below; low 99.6 > SL 99.1
+        ]
+    eng_x4 = NNFXEngine(P())
+    r_x4 = [eng_x4.process_bar(b) for b in x4_bars()]
+    c.that('X4: an intrabar dip below the baseline that CLOSES above does not exit',
+           r_x4[1]['action'] == 'hold', detail=str(r_x4[1]))
+    c.that('X4: a close exactly ON the baseline (side 0) does not exit', r_x4[2]['action'] == 'hold', detail=str(r_x4[2]))
+    c.that('X4: a CLOSE on the wrong side of the baseline exits the whole position at the close, '
+           'with SL untouched and C1 still agreeing',
+           r_x4[3]['action'] == 'exit' and r_x4[3]['reason'] == 'exit:baseline_cross' and r_x4[3]['pips'] == -0.9
+           and eng_x4.position is None, detail=str(r_x4[3]))
+
+    eng_x4_off = NNFXEngine(P(enable_baseline_exit=False))
+    r_off = [eng_x4_off.process_bar(b) for b in x4_bars()]
+    c.that('X4 off (enable_baseline_exit=False): the same wrong-side close leaves the trade open (pre-FIX-1 behavior)',
+           r_off[3]['action'] == 'hold' and eng_x4_off.position is not None, detail=str(r_off[3]))
+
+    eng_x4_short = NNFXEngine(P())
+    eng_x4_short.process_bar(_bar('2024-06-20', 99.4, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5))      # standard short entry
+    r_s = eng_x4_short.process_bar(_bar('2024-06-21', 100.3, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=99.4,
+                                        high=100.4, low=99.9))                                              # closes ABOVE: wrong side for a short
+    c.that('X4: mirrors for shorts -- a close above the baseline exits a short', r_s['reason'] == 'exit:baseline_cross', detail=str(r_s))
+
+    # X4 exit also breaks the continuation sequence: price closed across the baseline after
+    # the original entry, so a later fresh long C1 + C2 back above must NOT continuation-enter.
+    eng_x4_cont = NNFXEngine(P())
+    for b in x4_bars():
+        eng_x4_cont.process_bar(b)
+    eng_x4_cont.process_bar(_bar('2024-06-14', 100.4, 100.0, 0.9, 1.0, -1.0, 10.0, close_prev=99.7))        # back above; C1 short -> no entry
+    r_c = eng_x4_cont.process_bar(_bar('2024-06-15', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.4))  # fresh long C1, C2 agrees
+    c.that('X4: the wrong-side close that triggered the exit also resets continuation -- no re-entry after it',
+           r_c['action'] != 'enter', detail=str(r_c))
+
     return c
 
 
@@ -286,8 +326,9 @@ def unit_tests() -> Check:
 # 2. TRACE MODE -- 5 named scenarios, bar-by-bar CSV
 # ---------------------------------------------------------------------------
 
-TRACE_HEADER = ['date', 'baseline', 'c1_fast', 'c1_slow', 'c1_dir', 'c2_value', 'c2_dir',
-                'volume_value', 'volume_avg', 'direction_decision', 'action', 'reason', 'lots', 'atr', 'pips']
+TRACE_HEADER = ['date', 'close', 'high', 'low', 'baseline', 'c1_fast', 'c1_slow', 'c1_dir', 'c2_value', 'c2_dir',
+                'volume_value', 'volume_avg', 'direction_decision', 'action', 'reason', 'lots', 'atr', 'pips',
+                'sl_after']
 
 
 def write_trace(out_dir: Path, filename: str, bars: list[dict], params: NNFXParams) -> Path:
@@ -298,7 +339,10 @@ def write_trace(out_dir: Path, filename: str, bars: list[dict], params: NNFXPara
         w.writeheader()
         for bar in bars:
             rec = eng.process_bar(bar)
-            w.writerow({k: rec.get(k, '') for k in TRACE_HEADER})
+            row = {k: rec.get(k, '') for k in TRACE_HEADER}
+            row.update(close=bar['close'], high=round(bar['high'], 5), low=round(bar['low'], 5),
+                       sl_after=round(eng.position.sl, 4) if eng.position else '')
+            w.writerow(row)
     return path
 
 
@@ -348,6 +392,23 @@ def build_traces(out_dir: Path) -> list[Path]:
         _bar('2024-10-03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.0),                   # fresh cross, within 1xATR -> standard entry
     ]
     paths.append(write_trace(out_dir, 'trace_5_volume_then_pullback_skips.csv', bars, P()))
+
+    # Trace 6 (FIX 1, X4 ON): long entry, an intrabar dip below the baseline that closes
+    # above (no exit), a close exactly on the baseline (no exit), then a close below it ->
+    # exit:baseline_cross. SL (99.1) is never touched and C1 never flips. The bars after the
+    # exit show what the trade would have run into: SL on 07-09, C1 flip on 07-10.
+    # Trace 7 = the SAME bars with X4 off (control): the trade survives the wrong-side
+    # close and is only stopped out two bars later at the full -1.5xATR.
+    bars = [
+        _bar('2024-07-03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                         # standard long entry
+        _bar('2024-07-04', 100.2, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.7, low=99.7),  # dip below intrabar, close above: HOLD
+        _bar('2024-07-05', 100.0, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.2, high=100.3, low=99.8),  # close ON baseline: HOLD
+        _bar('2024-07-08', 99.7, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.0, high=100.1, low=99.6),   # close BELOW: X4 EXIT (-0.9)
+        _bar('2024-07-09', 99.3, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.7, high=99.6, low=99.0),     # would hit SL 99.1 here
+        _bar('2024-07-10', 99.2, 100.0, 0.9, 1.0, -1.0, 10.0, close_prev=99.3, high=99.4, low=99.1),    # C1 flips short here
+    ]
+    paths.append(write_trace(out_dir, 'trace_6_x4_baseline_exit.csv', bars, P()))
+    paths.append(write_trace(out_dir, 'trace_7_x4_off_control.csv', bars, P(enable_baseline_exit=False)))
 
     return paths
 

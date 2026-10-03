@@ -124,6 +124,9 @@ class NNFXParams:
     # it would be inventing an unstated third exemption; set False only once
     # VP's exact wording on this is available, per SS12's own instruction.
     require_c2_for_continuation: bool = True
+    # X4 (NNFX_RULESET_THE_TRUTH.txt SS5, label B, Decision 2): a close on the
+    # wrong side of the baseline closes what is left. False = pre-FIX-1 behavior.
+    enable_baseline_exit: bool = True
     volume_threshold_mult: float = 1.0
     pip_size: float = 0.0001
 
@@ -222,6 +225,20 @@ class NNFXEngine:
                 if record['action'] == 'exit_half':
                     rec['pips'] = round((record['pips'] + rec['pips']) / 2.0, 1)
                 record.update(rec)
+                return record
+
+            # X4: whole remaining position closes on a close on the wrong side of the
+            # baseline. That same close also breaks the continuation sequence (SS6: price
+            # must not have crossed the baseline since the original entry), so apply the
+            # reset here -- this branch returns before the bookkeeping block below runs.
+            if p.enable_baseline_exit and pos.half2_open and side != 0 and side != pos.direction:
+                rec = self._close_all(bar['close'], 'exit:baseline_cross')
+                if record['action'] == 'exit_half':
+                    rec['pips'] = round((record['pips'] + rec['pips']) / 2.0, 1)
+                record.update(rec)
+                if self.trend_dir != 0 and side != self.trend_dir:
+                    self.trend_dir = 0
+                    self.continuation_ok = False
                 return record
 
             if record['action'] == 'exit_half':

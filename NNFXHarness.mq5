@@ -94,6 +94,9 @@ input bool   EnableContinuation = true;
 // false only once VP's exact wording on this is available, per SS12's own instruction.
 input bool   RequireC2ForContinuation = true;
 
+// --- X4 wrong-side-baseline exit (NNFX_RULESET_THE_TRUTH.txt SS5, label B) --
+input bool   EnableBaselineExit = true;  // false = pre-FIX-1 behavior
+
 // --- chart layout: each role in its OWN subwindow, never shared -----
 #define WIN_MAIN   0
 #define WIN_C1     1
@@ -577,6 +580,14 @@ void OnNewDailyBar()
          g_lastExitDir=g_posDir;
          CloseAllHalves("exit:c1_flip");
       }
+   }
+
+   // --- X4: a close on the wrong side of the baseline closes what is left. The
+   //     continuation reset just below then sees the same wrong-side close. -----------
+   if(g_posDir!=0 && EnableBaselineExit && side!=0 && side!=g_posDir)
+   {
+      g_lastExitDir=g_posDir;
+      CloseAllHalves("exit:baseline_cross");
    }
 
    // --- continuation bookkeeping: the sequence resets the moment a candle closes on the
