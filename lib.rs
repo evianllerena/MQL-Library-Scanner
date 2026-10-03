@@ -4,12 +4,32 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 use zip::write::SimpleFileOptions;
 
+static PREVIEW_LIBRARY_RUNNING: AtomicBool = AtomicBool::new(false);
+
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pid=child.id();
+    #[cfg(target_os = "windows")]
+    {
+        let _=ProcessCommand::new("taskkill")
+            .args(["/F","/T","/PID",&pid.to_string()])
+            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    let _=child.kill();
+    let _=child.wait();
 }
 
 fn log_startup_error(message: &str) {
@@ -54,6 +74,7 @@ fn app_log(db_path: String, level: String, event: String, details: Value, durati
 fn open_db(path: &str) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;").map_err(|e|e.to_string())?;
     Ok(conn)
 }
 
@@ -260,6 +281,363 @@ fn start_preview_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Value
     Ok(json!({"started":true,"engine":engine_path.to_string_lossy()}))
 }
 
+fn preview_worker_args(base:&[String],worker_id:&str)->Vec<String> {
+    let mut out=Vec::new();
+    let mut i=0usize;
+    let mut base_job=String::from("library");
+    while i<base.len() {
+        if base[i]=="--worker-id" {
+            i+=2;continue;
+        }
+        if base[i]=="--job-id" {
+            if i+1<base.len() { base_job=base[i+1].clone(); }
+            i+=2;continue;
+        }
+        out.push(base[i].clone());i+=1;
+    }
+    out.push("--job-id".into());
+    out.push(format!("{}-{}",base_job,worker_id));
+    out.push("--worker-id".into());
+    out.push(worker_id.into());
+    out
+}
+
+fn run_preview_worker_supervisor(
+    app:tauri::AppHandle,
+    engine_path:PathBuf,
+    args:Vec<String>,
+    db_path:String,
+    worker_id:String,
+    remaining:Arc<AtomicUsize>,
+    group_failed:Arc<AtomicBool>
+) {
+    const HEARTBEAT_TIMEOUT_SECS:u64=120;
+    const MAX_RESTARTS:u32=20;
+    let mut restarts=0u32;
+    let mut final_code=0i32;
+
+    loop {
+        append_log(&db_path,"INFO","preview_library_start",json!({
+            "engine":engine_path,
+            "args":args,
+            "worker_id":worker_id,
+            "restart_count":restarts
+        }),None);
+
+        let mut cmd=ProcessCommand::new(&engine_path);
+        cmd.args(&args)
+            .env("PYTHONUTF8","1")
+            .env("PYTHONIOENCODING","utf-8")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+
+        let mut child=match cmd.spawn() {
+            Ok(v)=>v,
+            Err(e)=>{
+                final_code=-1;
+                append_log(&db_path,"ERROR","preview_library_spawn_failed",json!({
+                    "error":e.to_string(),"worker_id":worker_id,"restart_count":restarts
+                }),None);
+                if restarts>=MAX_RESTARTS { break; }
+                restarts+=1;
+                append_log(&db_path,"WARN","preview_library_restart",json!({
+                    "reason":"spawn_failed","worker_id":worker_id,"restart_count":restarts
+                }),None);
+                let _=app.emit("preview-library-restart",json!({
+                    "reason":"spawn_failed","worker_id":worker_id,"restart_count":restarts
+                }));
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+
+        let stdout=child.stdout.take();
+        let stderr=child.stderr.take();
+        let last_heartbeat=Arc::new(AtomicU64::new(now_secs()));
+
+        let out_thread=stdout.map(|stdout|{
+            let app_out=app.clone();
+            let db_out=db_path.clone();
+            let hb=last_heartbeat.clone();
+            let wid=worker_id.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if let Ok(v)=serde_json::from_str::<Value>(&line) {
+                        if matches!(v.get("type").and_then(Value::as_str),Some("heartbeat")|Some("progress")) {
+                            hb.store(now_secs(),Ordering::SeqCst);
+                        }
+                    }
+                    append_log(&db_out,"INFO","preview_library_stdout",json!({"line":line,"worker_id":wid}),None);
+                    let _=app_out.emit("preview-library-line",json!({"line":line,"worker_id":wid}));
+                }
+            })
+        });
+        let err_thread=stderr.map(|stderr|{
+            let app_err=app.clone();
+            let db_err=db_path.clone();
+            let wid=worker_id.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    append_log(&db_err,"ERROR","preview_library_stderr",json!({"line":line,"worker_id":wid}),None);
+                    let _=app_err.emit("preview-library-stderr",json!({"line":line,"worker_id":wid}));
+                }
+            })
+        });
+
+        let mut restart_reason:Option<&'static str>=None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status))=>{ final_code=status.code().unwrap_or(-1); break; }
+                Ok(None)=>{}
+                Err(e)=>{
+                    final_code=-1;
+                    append_log(&db_path,"ERROR","preview_library_poll_failed",json!({
+                        "error":e.to_string(),"worker_id":worker_id
+                    }),None);
+                    restart_reason=Some("poll_failed");
+                    kill_process_tree(&mut child);
+                    break;
+                }
+            }
+            let age=now_secs().saturating_sub(last_heartbeat.load(Ordering::SeqCst));
+            if age>HEARTBEAT_TIMEOUT_SECS {
+                restart_reason=Some("heartbeat_timeout");
+                final_code=-2;
+                append_log(&db_path,"ERROR","preview_library_heartbeat_timeout",json!({
+                    "age_seconds":age,"worker_id":worker_id,"restart_count":restarts
+                }),None);
+                kill_process_tree(&mut child);
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+
+        if let Some(t)=out_thread { let _=t.join(); }
+        if let Some(t)=err_thread { let _=t.join(); }
+
+        if restart_reason.is_none() && final_code==0 {
+            append_log(&db_path,"INFO","preview_library_worker_done",json!({
+                "code":0,"worker_id":worker_id,"restarts":restarts
+            }),None);
+            break;
+        }
+
+        if worker_id=="render-server" && final_code==42 {
+            group_failed.store(true,Ordering::SeqCst);
+            append_log(&db_path,"ERROR","preview_library_config_error",json!({
+                "code":final_code,"worker_id":worker_id,
+                "message":"Render terminal started but the capture EA did not heartbeat. Check MT5 data folder/account and Algo Trading."
+            }),None);
+            let _=app.emit("preview-library-config-error",json!({
+                "code":final_code,"worker_id":worker_id,
+                "message":"Render terminal started but the capture EA is not running. Usually means the MT5 clone has no account or Algo Trading is off. Set your MT5 data folder in Settings."
+            }));
+            break;
+        }
+
+        if restarts>=MAX_RESTARTS {
+            group_failed.store(true,Ordering::SeqCst);
+            append_log(&db_path,"ERROR","preview_library_restart_cap",json!({
+                "code":final_code,"worker_id":worker_id,"restart_count":restarts,
+                "reason":restart_reason.unwrap_or("worker_exit")
+            }),None);
+            let _=app.emit("preview-library-restart-cap",json!({
+                "code":final_code,"worker_id":worker_id,"restart_count":restarts
+            }));
+            break;
+        }
+
+        restarts+=1;
+        let reason=restart_reason.unwrap_or("worker_exit");
+        append_log(&db_path,"WARN","preview_library_restart",json!({
+            "reason":reason,"code":final_code,"worker_id":worker_id,"restart_count":restarts
+        }),None);
+        let _=app.emit("preview-library-restart",json!({
+            "reason":reason,"code":final_code,"worker_id":worker_id,"restart_count":restarts
+        }));
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let _=app.emit("preview-library-worker-done",json!({
+        "code":final_code,"worker_id":worker_id,"restarts":restarts
+    }));
+    if final_code!=0 { group_failed.store(true,Ordering::SeqCst); }
+    if remaining.fetch_sub(1,Ordering::SeqCst)==1 {
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
+        let code=if group_failed.load(Ordering::SeqCst){-2}else{0};
+        append_log(&db_path,if code==0{"INFO"}else{"ERROR"},"preview_library_done",json!({
+            "code":code
+        }),None);
+        let _=app.emit("preview-library-done",json!({"code":code}));
+    }
+}
+
+fn cli_arg(args:&[String],name:&str)->Option<String> {
+    args.windows(2).find(|w|w[0]==name).map(|w|w[1].clone())
+}
+
+fn run_compile_pool_process(
+    app:tauri::AppHandle,
+    engine_path:PathBuf,
+    args:Vec<String>,
+    db_path:String,
+    remaining:Arc<AtomicUsize>,
+    group_failed:Arc<AtomicBool>
+) {
+    let mut attempts=0u32;
+    let mut final_code=-1i32;
+    loop {
+        attempts+=1;
+        append_log(&db_path,"INFO","preview_compile_pool_start",json!({"args":args,"attempt":attempts}),None);
+        let mut cmd=ProcessCommand::new(&engine_path);
+        cmd.args(&args)
+            .env("PYTHONUTF8","1")
+            .env("PYTHONIOENCODING","utf-8")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let mut child=match cmd.spawn() {
+            Ok(v)=>v,
+            Err(e)=>{
+                append_log(&db_path,"ERROR","preview_compile_pool_spawn_failed",json!({"error":e.to_string(),"attempt":attempts}),None);
+                if attempts>=5 { group_failed.store(true,Ordering::SeqCst); break; }
+                std::thread::sleep(Duration::from_secs(2));continue;
+            }
+        };
+        let stdout=child.stdout.take();
+        let stderr=child.stderr.take();
+        let out_thread=stdout.map(|stdout|{
+            let app_out=app.clone();let db_out=db_path.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    append_log(&db_out,"INFO","preview_compile_pool_stdout",json!({"line":line}),None);
+                    let _=app_out.emit("preview-library-line",json!({"line":line,"component":"compile-pool"}));
+                }
+            })
+        });
+        let err_thread=stderr.map(|stderr|{
+            let app_err=app.clone();let db_err=db_path.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    append_log(&db_err,"ERROR","preview_compile_pool_stderr",json!({"line":line}),None);
+                    let _=app_err.emit("preview-library-stderr",json!({"line":line,"component":"compile-pool"}));
+                }
+            })
+        });
+        final_code=child.wait().ok().and_then(|s|s.code()).unwrap_or(-1);
+        if let Some(t)=out_thread { let _=t.join(); }
+        if let Some(t)=err_thread { let _=t.join(); }
+        if final_code==0 { break; }
+        append_log(&db_path,"WARN","preview_compile_pool_restart",json!({"code":final_code,"attempt":attempts}),None);
+        let _=app.emit("preview-library-restart",json!({"component":"compile-pool","reason":"worker_exit","restart_count":attempts}));
+        if attempts>=5 { group_failed.store(true,Ordering::SeqCst); break; }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let _=app.emit("preview-library-worker-done",json!({"component":"compile-pool","code":final_code}));
+    if final_code!=0 { group_failed.store(true,Ordering::SeqCst); }
+    if remaining.fetch_sub(1,Ordering::SeqCst)==1 {
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
+        let code=if group_failed.load(Ordering::SeqCst){-2}else{0};
+        let _=app.emit("preview-library-done",json!({"code":code}));
+    }
+}
+
+#[tauri::command]
+fn start_preview_library(app: tauri::AppHandle, args: Vec<String>, workers: Option<u32>) -> Result<Value, String> {
+    if args.first().map(String::as_str) != Some("render-server") {
+        return Err("Only render-server is permitted through start_preview_library".into());
+    }
+    if PREVIEW_LIBRARY_RUNNING.swap(true, Ordering::SeqCst) {
+        return Ok(json!({"started":false,"already_running":true}));
+    }
+    let db_path=cli_arg(&args,"--db").unwrap_or_default();
+    let out_path=cli_arg(&args,"--out").unwrap_or_default();
+    if db_path.is_empty() || out_path.is_empty() {
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
+        return Err("render-server requires --db and --out".into());
+    }
+    let current=match std::env::current_exe() {
+        Ok(v)=>v,
+        Err(e)=>{PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);return Err(format!("Cannot resolve app executable: {}",e));}
+    };
+    let dir=match current.parent() {
+        Some(v)=>v.to_path_buf(),
+        None=>{PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);return Err("Cannot resolve application folder".into());}
+    };
+    #[cfg(target_os = "windows")]
+    let engine_path=dir.join("mql-preview.exe");
+    #[cfg(not(target_os = "windows"))]
+    let engine_path=dir.join("mql-preview");
+    if !engine_path.exists() {
+        PREVIEW_LIBRARY_RUNNING.store(false,Ordering::SeqCst);
+        append_log(&db_path,"ERROR","preview_library_missing",json!({"path":engine_path}),None);
+        return Err(format!("Preview engine was not found at {}",engine_path.display()));
+    }
+
+    let compile_workers=workers.unwrap_or(4).clamp(1,8);
+    let job_id=cli_arg(&args,"--job-id").unwrap_or_else(||format!("library-{}",now_ms()));
+    let runtime_id=job_id.clone();
+    let terminal=cli_arg(&args,"--terminal");
+    let mut render_args=args.clone();
+    render_args.push("--runtime-id".into());
+    render_args.push(runtime_id.clone());
+    let mut compile_args=vec![
+        "compile-pool".to_string(),
+        "--db".to_string(),db_path.clone(),
+        "--out".to_string(),out_path.clone(),
+        "--workers".to_string(),compile_workers.to_string(),
+        "--job-id".to_string(),format!("{}-compile",job_id),
+        "--runtime-id".to_string(),runtime_id.clone()
+    ];
+    if let Some(t)=terminal { compile_args.push("--terminal".into());compile_args.push(t); }
+
+    let remaining=Arc::new(AtomicUsize::new(2));
+    let group_failed=Arc::new(AtomicBool::new(false));
+
+    {
+        let app_render=app.clone();
+        let engine_render=engine_path.clone();
+        let args_render=render_args;
+        let db_render=db_path.clone();
+        let remaining_render=remaining.clone();
+        let failed_render=group_failed.clone();
+        std::thread::spawn(move || {
+            run_preview_worker_supervisor(
+                app_render,engine_render,args_render,db_render,"render-server".into(),
+                remaining_render,failed_render
+            );
+        });
+    }
+    {
+        let app_compile=app.clone();
+        let engine_compile=engine_path.clone();
+        let db_compile=db_path.clone();
+        let remaining_compile=remaining.clone();
+        let failed_compile=group_failed.clone();
+        std::thread::spawn(move || {
+            run_compile_pool_process(
+                app_compile,engine_compile,compile_args,db_compile,
+                remaining_compile,failed_compile
+            );
+        });
+    }
+
+    Ok(json!({
+        "started":true,"already_running":false,"engine":engine_path.to_string_lossy(),
+        "render_server":1,"compile_workers":compile_workers,"runtime_id":runtime_id,
+        "heartbeat_timeout_seconds":120,"max_render_restarts":20
+    }))
+}
+
 #[tauri::command]
 fn start_backtest_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, String> {
     let cmd0 = args.first().map(String::as_str);
@@ -357,6 +735,90 @@ fn sort_sql(sort_by: &str, sort_dir: &str) -> String {
     format!("{} {}", col, dir)
 }
 
+fn ensure_preview_columns(conn:&Connection) -> Result<(),String> {
+    let mut stmt=conn.prepare("PRAGMA table_info(indicators)").map_err(|e|e.to_string())?;
+    let names=stmt.query_map([],|r|r.get::<_,String>(1)).map_err(|e|e.to_string())?;
+    let mut cols=std::collections::HashSet::new();
+    for name in names { cols.insert(name.map_err(|e|e.to_string())?); }
+    let additions=[
+        ("preview_attempts","INTEGER DEFAULT 0"),
+        ("preview_priority","INTEGER DEFAULT 0"),
+        ("preview_status","TEXT DEFAULT 'pending'"),
+        ("preview_path","TEXT"),
+        ("preview_hash","TEXT"),
+        ("preview_error","TEXT DEFAULT ''"),
+        ("preview_updated_at","TEXT"),
+        ("worker_id","TEXT")
+    ];
+    for (name,decl) in additions {
+        if !cols.contains(name) {
+            conn.execute(&format!("ALTER TABLE indicators ADD COLUMN {} {}",name,decl),[]).map_err(|e|e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn preview_queue_update(db_path:String, paths:Vec<String>, priority:i64, force:bool) -> Result<Value,String> {
+    let mut conn=open_db(&db_path)?;
+    ensure_preview_columns(&conn)?;
+    let tx=conn.transaction().map_err(|e|e.to_string())?;
+    let p=priority.clamp(0,10000);
+    let mut changed=0usize;
+    for path in paths.iter() {
+        let n=if force {
+            tx.execute(
+                "UPDATE indicators SET preview_status='pending',preview_attempts=0,preview_error='',preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END WHERE path=?",
+                params![p,p,path]).map_err(|e|e.to_string())?
+        } else {
+            tx.execute(
+                "UPDATE indicators SET preview_priority=CASE WHEN COALESCE(preview_priority,0)<? THEN ? ELSE preview_priority END WHERE path=?",
+                params![p,p,path]).map_err(|e|e.to_string())?
+        };
+        changed+=n;
+    }
+    tx.commit().map_err(|e|e.to_string())?;
+    Ok(json!({"ok":true,"changed":changed,"force":force,"priority":p}))
+}
+
+#[tauri::command]
+fn preview_worker_pause(db_path:String, paused:bool) -> Result<Value,String> {
+    let conn=open_db(&db_path)?;
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",[]).map_err(|e|e.to_string())?;
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('preview_paused',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![if paused {"1"} else {"0"}]).map_err(|e|e.to_string())?;
+    Ok(json!({"ok":true,"paused":paused}))
+}
+
+#[tauri::command]
+fn preview_queue_stats(db_path:String) -> Result<Value,String> {
+    let conn=open_db(&db_path)?;
+    ensure_preview_columns(&conn)?;
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",[]).map_err(|e|e.to_string())?;
+    let one=|sql:&str|->Result<i64,String>{conn.query_row(sql,[],|r|r.get(0)).map_err(|e|e.to_string())};
+    let paused=conn.query_row("SELECT value FROM meta WHERE key='preview_paused'",[],|r|r.get::<_,String>(0)).ok().map(|v|v=="1").unwrap_or(false);
+    Ok(json!({
+        "ok":true,
+        "total":one("SELECT COUNT(*) FROM indicators")?,
+        "ready":one("SELECT COUNT(*) FROM indicators WHERE preview_status='ready'")?,
+        "pending":one("SELECT COUNT(*) FROM indicators WHERE preview_status='pending'")?,
+        "compiling":one("SELECT COUNT(*) FROM indicators WHERE preview_status='compiling'")?,
+        "compiled":one("SELECT COUNT(*) FROM indicators WHERE preview_status='compiled'")?,
+        "rendering":one("SELECT COUNT(*) FROM indicators WHERE preview_status='rendering'")?,
+        "failed":one("SELECT COUNT(*) FROM indicators WHERE preview_status='failed'")?,
+        "paused":paused
+    }))
+}
+
+#[tauri::command]
+fn write_preview_batch_sources(sources:Vec<String>) -> Result<Value,String> {
+    let path=std::env::temp_dir().join(format!("mql-preview-batch-{}-{}.json",std::process::id(),now_ms()));
+    let body=serde_json::to_string(&sources).map_err(|e|e.to_string())?;
+    fs::write(&path,body).map_err(|e|e.to_string())?;
+    Ok(json!({"path":path.to_string_lossy()}))
+}
+
 #[tauri::command]
 fn db_query(db_path:String, search:String, platform:String, category:String, review_only:bool, limit:i64, offset:i64, sort_by:Option<String>, sort_dir:Option<String>) -> Result<Value,String> {
     let conn=open_db(&db_path)?;
@@ -374,7 +836,7 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
     let mut total_stmt=conn.prepare(&total_sql).map_err(|e|e.to_string())?;
     let total:i64=total_stmt.query_row(rusqlite::params_from_iter(vals.iter()),|r|r.get(0)).map_err(|e|e.to_string())?;
     let order=sort_sql(sort_by.as_deref().unwrap_or("name"),sort_dir.as_deref().unwrap_or("asc"));
-    let sql=format!("SELECT id,path,filename,platform,source_structure,display_location,primary_category,secondary_categories,visual_category,behavior_tags,techniques,evidence,classification_status,review_reason,classifier_version,standard_indicators,custom_dependencies,confidence,warnings,duplicate_of,user_favorite,user_tags,human_verified,verified_primary,verified_secondary,family_fingerprint,analyzed_at,draw_types,line_plots,histogram_plots,arrow_plots,filling_plots,object_usage,declared_buffers,declared_plots,active_buffers,preview_status,preview_path,preview_hash FROM indicators{} ORDER BY {} LIMIT ? OFFSET ?",where_sql,order);
+    let sql=format!("SELECT id,path,filename,platform,source_structure,display_location,primary_category,secondary_categories,visual_category,behavior_tags,techniques,evidence,classification_status,review_reason,classifier_version,standard_indicators,custom_dependencies,confidence,warnings,duplicate_of,user_favorite,user_tags,human_verified,verified_primary,verified_secondary,family_fingerprint,analyzed_at,draw_types,line_plots,histogram_plots,arrow_plots,filling_plots,object_usage,declared_buffers,declared_plots,active_buffers,preview_status,preview_path,preview_hash,sha256,preview_error,preview_updated_at,preview_attempts FROM indicators{} ORDER BY {} LIMIT ? OFFSET ?",where_sql,order);
     let mut all=vals.clone(); all.push(limit.clamp(1,500).to_string()); all.push(offset.max(0).to_string());
     let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;
     let mapped=stmt.query_map(rusqlite::params_from_iter(all.iter()),|r| {
@@ -397,7 +859,9 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
           "draw_types":parse_json_text(r.get::<_,String>(27)?),"line_plots":r.get::<_,i64>(28)?,"histogram_plots":r.get::<_,i64>(29)?,
           "arrow_plots":r.get::<_,i64>(30)?,"filling_plots":r.get::<_,i64>(31)?,"object_usage":r.get::<_,i64>(32)?==1,
           "declared_buffers":r.get::<_,i64>(33)?,"declared_plots":r.get::<_,i64>(34)?,"active_buffers":r.get::<_,i64>(35)?,
-          "preview_status":r.get::<_,Option<String>>(36)?,"preview_path":r.get::<_,Option<String>>(37)?,"preview_hash":r.get::<_,Option<String>>(38)?
+          "preview_status":r.get::<_,Option<String>>(36)?,"preview_path":r.get::<_,Option<String>>(37)?,"preview_hash":r.get::<_,Option<String>>(38)?,
+          "sha256":r.get::<_,Option<String>>(39)?,"preview_error":r.get::<_,Option<String>>(40)?,"preview_updated_at":r.get::<_,Option<String>>(41)?,
+          "preview_attempts":r.get::<_,Option<i64>>(42)?.unwrap_or(0)
         }))
     }).map_err(|e|e.to_string())?;
     let mut rows_out=Vec::new();
@@ -588,7 +1052,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,app_log,export_diagnostics,start_backtest_batch,db_backtest_query])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,start_preview_library,preview_queue_update,preview_queue_stats,preview_worker_pause,write_preview_batch_sources,app_log,export_diagnostics,start_backtest_batch,db_backtest_query])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }
