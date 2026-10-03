@@ -1,0 +1,505 @@
+NNFX_RULESET_THE_TRUTH.txt -- CANONICAL NNFX RULESET FOR THE BACKTESTER
+Repo: evianllerena/MQL-Library-Scanner     Branch: nnfx-rulebook-sync
+Version: 2.0 (Phase A, 2026-10-03)  STATUS: DRAFT -- AWAITING USER APPROVAL
+==============================================================================
+
+This file is the single source of truth for WHICH trading rules the NNFX
+indicator-ranking backtester implements, how sure we are of each rule, and
+whether the engine implements it yet.
+
+Inputs adopted (supersede every earlier version of this file):
+  [RB]   "NNFX Multi-Timeframe EA -- Rulebook (Phase 0)", 2026-09-28
+         (NNFX_CANONICAL_RULEBOOK_source.txt) -- canonical RULE source.
+  [NEWS] RULEBOOK_ADDENDUM_NEWS.txt -- ForexFactory N1/X5 spec.
+  [MH]   MASTER_HANDOFF_NNFX.txt, 2026-10-01 -- scope (Section 0) and the
+         resolved rules (Section 1). Where [MH] and [NEWS] disagree, [MH]
+         wins (it is newer); every such case is marked below.
+
+Code this ruleset governs:
+  nnfx_engine.py         production source of truth (pure Python decisions)
+  NNFXHarness.mq5        MQL5 mirror, kept aligned where cheap
+  nnfx_backtest_batch.py extraction + scoring (feeds bars into nnfx_engine)
+  nnfx_selftest.py       Part C rule tests + bar-by-bar traces
+
+
+==============================================================================
+0. SCOPE -- WHAT THIS BACKTESTER IS, AND WHAT IT DELIBERATELY IS NOT
+==============================================================================
+[RB] was written for a multi-timeframe LIVE EA. This project is a DAILY,
+single-candidate, indicator-RANKING backtester: it extracts real indicator
+values from MT5 with CopyBuffer, then nnfx_engine.py replays the rules bar by
+bar. It is NOT the Strategy Tester and NOT a live EA.
+
+We port the TRADING RULES (anything that changes which trades fire or how they
+exit, and therefore changes a candidate's ranking). We do NOT port EA
+architecture.
+
+IN SCOPE
+  Entries E0-E6, exits X1-X4, trade management T1-T4, money management
+  M1-M5 (as they affect pips/equity), signal semantics (zero_reference, no
+  OB/OS), volume filter, bridge-too-far, R1 drawdown (metric + circuit
+  breaker).
+
+IN SCOPE, DORMANT (built, OFF until data exists)
+  N1 / X5 news rules -- off until a ForexFactory high-impact calendar file
+  is loaded (Section 8).
+
+OUT OF SCOPE -- NOT MISSING WORK (do not build; see Section 11)
+  Multi-timeframe (30M/1H/4H); rollover entry window (M9, Decision 10);
+  shared currency exposure (M6/M7); dead-market filter (D1/D2, T6) --
+  real NNFX rules, user may opt in later; three-EA architecture; broker lot
+  rounding; hedging vs netting; position recovery after restart; runner cap
+  (T7, Decision 11 unticked); pair universe (P1/P2) -- set by the batch's
+  --bed-symbols, not by the engine; N2 elections; N3 is satisfied by N1/X5
+  once the calendar exists.
+
+
+==============================================================================
+1. CONFIDENCE LABELS (carried from [RB] on every rule)
+==============================================================================
+  A  VP's own written words (nononsenseforex.com / the_trading_truth.docx).
+     Build as stated.
+  B  Secondary: community write-ups of VP's videos (flow charts, lesson
+     sites, testing tools). Build as a SETTING with the stated default.
+  C  No reliable source / sources disagree. User decision, recorded here.
+  U  User-confirmed (a ticked [RB] Decision or a [NEWS]/[MH] confirmation).
+     Shown alongside the A/B/C label, e.g. "B+U".
+
+ENGINE STATUS column, per rule:
+  CURRENT   already implemented as described (Phase B keeps it)
+  FIX n     changed/added by Phase B fix n (Section 13)
+  DORMANT   built by a fix but OFF by default
+  OUT       out of scope (Section 0 / 11)
+
+
+==============================================================================
+2. ALGORITHM SLOTS
+==============================================================================
+Slot            Role                                            Label     Source
+1 ATR           Sizing, stop, target (ATR(14))                  A         VP Volume post
+2 Baseline      Filters losses; a close across it can trigger   B         Flow charts; Algo Tester
+3 C1            "The one real vehicle for trade entry"          A         VP Volume post
+4 C2            Filters C1's losses                             A role/B  VP Volume post
+5 Volume/Vol.   Pass/fail filter ("the same family")            A         VP Volume post
+6 Exit          Closes the trade                                A         VP Volume post
+Continuation    Not a separate slot (C2 gives the re-entry      B         Lesson 11
+                signal in VP's version)
+
+Ranking method (unchanged): each candidate fills ONE slot; every other slot
+is a FIXED reference indicator (the "backdrop"), identical for all candidates,
+so differences in results come from the candidate alone.
+  Backdrop today (nnfx_backtest_batch.py CONTROLLER_SRC):
+    Baseline = Examples\Custom Moving Average (20, SMA)
+    C1       = Examples\MACD (main vs signal, two-line cross)
+    C2       = Examples\RVI buffer 0 (zero_reference 0.0)
+    ATR      = iATR(14)
+    Volume   = NONE (always passes)  -> FIX 3 adds a real reference
+    Exit     = NONE                  -> FIX 2 adds a real reference
+
+
+==============================================================================
+3. SIGNAL SEMANTICS
+==============================================================================
+S1 (A) No overbought/oversold anywhere. Signals are line crosses or
+   zero/centre-line crosses only.                    Src: Reversal Trading post
+S2 (A, project rule) Every zero/centre-line read (C2, Exit, any zero-cross
+   C1) uses that indicator's OWN zero_reference from backtest_results.
+   NEVER assume 0.                                   Status: CURRENT for C2;
+                                                     FIX 2 for Exit
+S3 (A) Test indicators on their default settings first.
+                                                     Src: Backtesting Ep.21
+                                                     Status: CURRENT (iCustom
+                                                     with no extra params)
+S4 (A) Avoid the "Dirty Dozen" (RSI, Stochastics, CCI, Bollinger Bands, MA
+   crossovers, ...) as signals. CLASSIFICATION note only -- the engine does
+   not filter them; the ranking will show it.        Src: Big Banks post
+S5 (B+U, Decision 8) Baseline cross = this close is on the other side of the
+   baseline from the previous close (a gap across the baseline still
+   counts).                                          Status: CURRENT
+                                                     (baseline_cross_closed)
+
+
+==============================================================================
+4. ENTRIES  (all decisions on the CLOSED Daily bar)
+==============================================================================
+E0 (A+U, Decision 3) Decide once per candle using the candle that just
+   closed; act at the start of the next candle. Engine fills at that bar's
+   close, which on Daily is the same price as the next open to within the
+   spread.                                           Src: Best Time Frame Ep.3;
+                                                     ATR post
+                                                     Status: CURRENT
+
+E1 (B) C1-TRIGGERED: C1 gives a fresh signal; price is ALREADY on that side
+   of the baseline; within 1xATR of the baseline; C2 agrees; volume passes.
+                                                     Src: flow charts
+                                                     Status: FIX 4 (engine
+                                                     today only enters on a
+                                                     baseline cross)
+
+E2 (B) BASELINE-TRIGGERED: price closes across the baseline; C1 agrees AND
+   its signal began fewer than 7 candles ago (see E5); within 1xATR; C2 and
+   volume agree.                                     Src: flow charts; Algo
+                                                     Tester modes
+                                                     Status: CURRENT
+
+E3 (B) PULLBACK / 1xATR: if the close is more than 1xATR from the baseline,
+   do not enter. If a LATER candle closes back within 1xATR and everything
+   still agrees, enter then.                         Src: flow charts;
+                                                     backtestd rules
+                                                     Status: FIX 4 (engine
+                                                     today skips for good)
+   Setting: min_beyond_atr = 1.0
+
+E4 (B, details unclear; +U Decision 4) ONE-CANDLE RULE: if exactly one input
+   lags, wait at most ONE candle for it to agree. Price must STILL be within
+   1xATR of the baseline on that second candle.      Src: flow charts;
+                                                     backtestd rules
+                                                     Status: FIX 4
+   Setting: enable_one_candle_rule = True
+   AMBIGUITY (recorded, not resolved): sources do not say which inputs may
+   lag (we allow any one of baseline-side, C1, C2, volume) and one lesson
+   site argues it conflicts with E5. Default ON; flip it to measure.
+
+E5 (B, counting unclear) BRIDGE TOO FAR: skip if C1's signal began 7 or
+   more candles before the baseline cross. TWO-LINE C1 ONLY (never applied
+   to a zero-cross indicator).                       Src: No Nonsense Trader
+                                                     -- Bridge Too Far; flow
+                                                     charts
+   Settings: enable_bridge_too_far = True, bridge_too_far_bars = 7,
+             bridge_count_from = 'before_cross'
+   >>> DECISION 5 IS STILL UNTICKED -- user to confirm count + convention.
+   >>> DISCREPANCY TO CONFIRM: [MH] says the default "counted back from
+       the candle BEFORE the cross" is "already implemented". It is not:
+       today's engine counts the unbroken C1 run INCLUDING the cross candle
+       (c1_direction_run_length(..., idx=cross bar)). That skips one candle
+       earlier than [MH]'s convention. FIX 4 adds bridge_count_from with
+       values 'before_cross' ([MH] default) and 'including_cross' (today's
+       behavior), so the change is visible in the numbers.
+
+E6 CONTINUATION -- see Section 6.
+
+
+==============================================================================
+5. EXITS AND TRADE MANAGEMENT
+==============================================================================
+Exit precedence: whichever fires first closes what is left. X2, X3 and X4 are
+each a setting, all ON by default (Decision 2, +U).
+Engine order per bar: SL -> TP1 (half 1) -> trail update -> X3/X2/X4 on the
+remaining position, evaluated on the bar's close.
+
+X1 (A) Stop loss 1.5xATR from entry; TP1 at 1.0xATR closes half 1; then the
+   runner's stop moves to breakeven; then it trails (T4).
+                                                     Src: Scaling Out; Risk
+                                                     Management guide
+                                                     Status: CURRENT (trail
+                                                     timing changes in FIX 6)
+
+X2 (A slot / B mechanics) EXIT INDICATOR signals against the trade -> close
+   what is left. Direction is read against the exit indicator's OWN
+   zero_reference -- never "> 0 / < 0".              Src: VP Volume post;
+                                                     flow charts
+                                                     Status: FIX 2
+   Setting: enable_exit_indicator = True (with no exit indicator supplied,
+   behaviour is identical to today).
+   T5 (A): the exit indicator "competes with" the trailing stop -- both run;
+   whichever closes the runner first wins.           Src: Backtesting Ep.21
+
+X3 (A implied) C1 gives an opposite signal -> close what is left.
+   "If your own Confirmation Indicator is giving you a short signal before
+   your Exit Indicator tells you to abort ... Why are you still in the
+   trade?"                                           Src: Scaling In Ep.25
+                                                     Status: CURRENT
+   Setting: enable_c1_flip_exit = True
+
+X4 (B) Price CLOSES on the wrong side of the baseline -> close what is left.
+                                                     Src: flow charts; Algo
+                                                     Tester (optional there)
+                                                     Status: FIX 1 (today a
+                                                     wrong-side close only
+                                                     resets continuation; it
+                                                     does not exit)
+   Setting: enable_baseline_exit = True
+
+X5 news exit -- see Section 8.
+
+T1 (A) Two equal halves, same 1.5xATR stop; half 1 has TP at 1.0xATR.
+                                                     Src: Scaling Out
+                                                     Status: CURRENT
+T2 (A) When half 1 hits TP1, the runner's stop moves to breakeven (entry).
+                                                     Src: Scaling Out
+                                                     Status: CURRENT
+T3 (A) Runner has no fixed target ("let that baby run").
+                                                     Src: Scaling Out
+                                                     Status: CURRENT
+T4 (B+U, Decision 1) TRAILING STOP on the runner: 1.5xATR behind price,
+   switched ON only once price has CLOSED 2xATR beyond entry, moved once per
+   candle close, never backwards.                    Src: No Nonsense Trader
+                                                     -- Trailing Stop
+                                                     Status: FIX 6 (today it
+                                                     trails from the bar TP1
+                                                     is hit, i.e. as soon as
+                                                     a close is 1.5xATR past
+                                                     entry)
+   Settings: trail_activate_atr = 2.0, trail_distance_atr = 1.5,
+             trail_step = 'per_candle'
+   Recorded conflict: the Rui Silva flow chart moves the trail in 0.5xATR
+   steps; the lesson site moves it daily at 1.5xATR. Default = lesson site.
+
+
+==============================================================================
+6. CONTINUATION (E6)  -- CORRECTION TO THE CURRENT ENGINE
+==============================================================================
+After an exit, re-enter in the SAME direction as the original trade.
+
+Common conditions, both versions (B+U, Decision 7):
+  - price has NOT closed across the baseline since the ORIGINAL entry;
+  - IGNORE the volume filter and the 1xATR rule;
+  - money management unchanged (same SL/TP1/halves/trail).
+
+Version (a) VP (B+U, Decision 6; per the user, from VP's videos) -- DEFAULT:
+  C2 flips back in the trade's direction AND C1 has never flipped against
+  the trade since the original entry.
+Version (b) Lesson 11 (B; the lesson author's own design, not VP's):
+  the EXIT indicator flips back in the trade's direction and doubles as the
+  continuation signal.
+  Setting: continuation_mode = 'vp_c2' (default) | 'lesson11_exit'
+  Both are backtested; the user picks the permanent default from results.
+
+Current engine (to be corrected in FIX 5): continuation fires on a fresh C1
+signal in the trade's direction (with C2 required to agree). That is neither
+version above.
+
+KEEP (already correct, regression-tested): the whipsaw reset -- once price
+closes on the opposite side of the baseline, continuation eligibility is lost
+and only a genuine standard entry can re-arm it (a bare cross with no trade
+behind it never does).
+                                                     Src: flow charts;
+                                                     Lesson 11
+                                                     Status: FIX 5
+
+
+==============================================================================
+7. VOLUME FILTER (slot 5)
+==============================================================================
+V1 (A) Volume/volatility is a pass/fail filter for standard entries
+   (ignored by continuation).                        Src: VP Volume post
+V2 (design choice, not a VP rule) Pass rule held identical for every
+   candidate so the ranking is fair: today's reading >= its own 20-bar
+   average x volume_threshold_mult (1.0). Today's value and its average MUST
+   come from the SAME configured indicator line.
+   Status: FIX 3. Today:
+     - G9: for every candidate that is not itself a VOLUME candidate, the
+       backdrop has no volume indicator and the filter always passes
+       (volume_value=1.0, volume_avg=0.5 hardcoded in score_candidate).
+     - G10: NNFXHarness.mq5 VolumePasses() averages buffer 0 even when
+       today's value comes from a different buffer, so it can compare two
+       different lines. (The Python VOLUME path already averages the same
+       line.)
+   FIX 3 adds a real reference volume indicator to the backdrop and makes
+   the harness read value and average from the same buffer.
+
+
+==============================================================================
+8. NEWS (N1 / X5)  -- WIRED-BUT-DORMANT
+==============================================================================
+N1 (A + U) NEWS ENTRY BLOCK: do not open a new trade on a pair if EITHER of
+   its currencies has a ForexFactory HIGH-impact ("red folder") event in
+   (decision_bar_time, decision_bar_time + 24h].
+   Both legs count (EUR/USD is blocked by EUR or USD news).
+                                                     Src: Forex News Trading
+                                                     (VP); user-confirmed;
+                                                     ForexFactory high-impact
+                                                     Status: DORMANT (FIX 7)
+X5 (A + U) CLOSE BEFORE NEWS: if in an open trade on a pair with such an
+   event within 24h, EXIT if the trade is losing OR is in profit by LESS
+   than 1xATR; otherwise hold (stop is at breakeven or trailing).
+                                                     Src: Forex News Trading
+                                                     (VP); user-confirmed
+                                                     Status: DORMANT (FIX 7)
+   >>> CHANGE vs [NEWS]: [NEWS] stubbed the cutoff as "close if TP1 not yet
+       hit, STUB-TO-CONFIRM". [MH] supersedes it with VP's sourced cutoff
+       (label A): exit if losing or profit < 1xATR. [NEWS]'s stub is
+       retired. Profit is measured on the decision bar's close vs entry,
+       in ATR-at-entry units.
+
+   Settings: enable_news_filter = False, news_calendar_path = None,
+             news_window_hours = 24, x5_min_profit_atr = 1.0
+   Dormant guarantee: with the filter off or no calendar file, results are
+   byte-identical to the pre-change run (regression test in FIX 7).
+
+   Calendar file contract (for the later ForexFactory data pull):
+     CSV, header row, one row per event:
+       currency       ISO code: EUR USD GBP JPY CHF CAD AUD NZD
+       timestamp_utc  ISO-8601 UTC, e.g. 2024-03-20T18:00:00Z
+       impact         High | Medium | Low   (only High is used)
+     Bar timestamps are converted to UTC before the 24h comparison.
+
+   VP's major events per currency ([RB]; roles instead of names and SNB
+   instead of CHF Libor per Decision 15, +U) -- informational: the
+   ForexFactory High flag, not this list, is what the engine uses.
+     USD rates, NFP, CPI, FOMC/Fed chair  EUR rates, ECB president
+     GBP rates (incl. MPC votes), GDP     CAD rates, employment, CPI, retail
+     AUD rates, employment                NZD rate, GDP, GDT, employment
+     JPY rate                             CHF SNB rate decision
+
+   DEFERRED (separate task): building the 2019-2026 ForexFactory high-impact
+   calendar in the shape above.
+
+
+==============================================================================
+9. MONEY MANAGEMENT
+==============================================================================
+M1 (A) ATR period 14, default.                       Src: ATR post
+                                                     Status: CURRENT
+M2 (A+U, Decision 14) Risk 2% of capital per trade.  Src: Risk Management
+                                                     guide; Don't Split Your
+                                                     Risk
+                                                     Status: FIX 7 (harness
+                                                     RiskPct 1.0 -> 2.0;
+                                                     Python gets risk_pct for
+                                                     the R1 equity model)
+M3 (A) SL = 1.5xATR from entry.                      Src: Risk Management
+                                                     guide; Backtesting Ep.21
+                                                     Status: CURRENT
+M4 (A) Size = risk money / stop distance, so every pair carries the same
+   risk. In the Python engine this means every trade's result is expressed
+   in R (1R = the 1.5xATR stop); pips remain the leaderboard's display unit.
+                                                     Src: Risk Management
+                                                     guide; ATR post
+                                                     Status: FIX 7b (equity
+                                                     model)
+M5 (A) The risk is split into two equal halves.      Src: Scaling Out
+                                                     Status: CURRENT
+M8 (A) Read ATR ~30 min before the close. On closed Daily bars the closed
+   bar's ATR is that value.                          Src: ATR post
+                                                     Status: CURRENT
+R2 (A) Never add to a winning trade (no scaling in). Src: Scaling In Ep.25
+                                                     Status: CURRENT (single
+                                                     position only)
+
+
+==============================================================================
+10. DRAWDOWN (R1, Decision 12)
+==============================================================================
+R1 (A+U) Aim for no more than 10% maximum drawdown; 15% is "a lot"; 20% is
+   "Armageddon".                                     Src: Forex Drawdown
+                                                     Ep.52
+
+(a) METRIC: max_drawdown per candidate stays a leaderboard column.
+    >>> FINDING TO FIX (7b-a): today's max_drawdown is in PIPS, and it is
+        computed over the trades of every symbol CONCATENATED one symbol
+        after another (EURUSD's trades, then GBPUSD's, ...), not in date
+        order, and not as a % of equity. That cannot be compared with R1's
+        10%. FIX 7b keeps the pips column for continuity and adds
+        max_drawdown_pct: the peak-to-trough % of an equity curve built
+        chronologically across the basket at risk_pct per trade (M2/M4).
+
+(b) CIRCUIT BREAKER: during the simulation, track the candidate's running
+    equity. Once equity is >= dd_breaker_pct below its peak, STOP opening
+    new trades (standard and continuation). Open trades keep their stops
+    and exits. Resume opening trades when drawdown is back under the
+    threshold.
+    Settings: enable_dd_breaker = True, dd_breaker_pct = 10.0,
+              dd_resume_rule = 'below_threshold'
+    >>> USER-CONFIRM ITEM: the RESUME condition. Default "drawdown back
+        under the threshold" is a placeholder; [RB] only says when to stop.
+        The breaker counts skipped entries (skip:dd_breaker) so the effect
+        is visible.
+                                                     Status: FIX 7b
+
+
+==============================================================================
+11. DEFERRED / EA-ONLY -- RECORDED SO NOBODY MISTAKES THEM FOR MISSING WORK
+==============================================================================
+Item                          Rule ref        Why not here
+Multi-timeframe 30M/1H/4H     [RB] TF section Daily-only ranking backtester
+Rollover entry window         M9, Dec. 10     Intraday only; N/A on Daily
+Shared currency exposure      M6, M7          Portfolio-level; no effect on
+                                              single-candidate ranking
+Dead-market filter            D1, D2, T6      Real NNFX rule, not requested;
+                                              user may opt in later
+Runner TP cap                 T7, Dec. 11     Unticked; off = pure NNFX
+Elections/referendums         N2              Needs an event source; not in
+                                              the ForexFactory High feed
+Pair universe 5 -> 28         P1, P2, Dec. 13 Batch --bed-symbols, not engine
+Three-EA architecture         [RB]            EA-only
+Broker lot rounding           [RB] bug list   EA-only; Python sizes in R
+Hedging vs netting            [RB] bug list   Engine is single-position,
+                                              in-memory
+Position recovery on restart  [RB] bug list   EA-only
+
+
+==============================================================================
+12. CONFIRMED TRADE FLOW (user, via [NEWS]) -- for the record
+==============================================================================
+baseline close -> C1 + C2 + volume all independently agree -> 1xATR pullback
+zone -> bridge-too-far skip (two-line C1 only) -> [N1 news block, dormant] ->
+[R1 breaker] -> ATR sizing, SL 1.5x, TP1 1x on half, runner to breakeven,
+trail (T4) -> exits: exit indicator against OR C1 flip OR wrong-side baseline
+close (whichever first) [X5 news, dormant] -> continuation re-entries (E6).
+C2 and Exit read against their own zero_reference, never 0.
+
+
+==============================================================================
+13. GAPS: CURRENT ENGINE vs THIS RULESET, IN PLAIN LANGUAGE (Phase B plan)
+==============================================================================
+Each fix: own commit, changes nnfx_engine.py (and NNFXHarness.mq5 where
+cheap), a Part C test in nnfx_selftest.py, and a bar-by-bar trace showing the
+rule firing AND not firing. With every new setting at its "off" value, the
+engine must reproduce the previous fix's results exactly.
+
+FIX 1  X4. Today a close on the wrong side of the baseline only blocks
+       continuation; the trade stays open until SL, TP1+trail or a C1 flip.
+       After: it closes what is left on that close.
+FIX 2  X2. Today there is no exit indicator in the Python engine; the MQL
+       harness reads one as "> 0 long / < 0 short". After: an exit
+       indicator (reference in the backdrop) closes the trade when it turns
+       against it, read against its own zero_reference.
+FIX 3  Volume. Today the filter always passes for non-volume candidates
+       (G9) and the harness can average the wrong line (G10). After: a real
+       reference volume indicator; value and average from the same line.
+FIX 4  Entries. Today: only baseline-cross entries (E2). After: also E1
+       (C1 trigger), E3 (pullback re-entry), E4 (one-candle wait); E5
+       exposed as settings including the counting convention.
+FIX 5  Continuation. Today: fresh C1 signal. After: VP's C2-flip version by
+       default, Lesson-11 exit-indicator version as a setting; whipsaw reset
+       kept.
+FIX 6  Trailing. Today: trails from TP1 at 1.5xATR. After: starts only once
+       a close is 2xATR beyond entry; three settings.
+FIX 7  News hook (dormant) with the sourced X5 cutoff; risk 2% (M2).
+FIX 7b Drawdown: chronological %-of-equity max_drawdown_pct alongside the
+       pips column; 10% equity-peak circuit breaker.
+FIX 8  Doc sync: this file's STATUS columns -> CURRENT, README + CODE_MAP.md,
+       Section 11 re-confirmed.
+
+
+==============================================================================
+14. OPEN USER ITEMS (none block Phase B)
+==============================================================================
+1. Decision 5 -- bridge-too-far: number (default 7) and counting convention
+   (default: from the candle before the cross). Note the discrepancy in E5:
+   today's engine counts including the cross candle.
+2. R1 resume condition -- default "drawdown back under 10%".
+3. E4 ambiguity -- which inputs may lag (default: any one).
+4. T4 step -- per-candle (lesson site) vs 0.5xATR steps (Rui Silva).
+5. Dead-market filter D1/D2 -- out unless requested.
+6. ForexFactory 2019-2026 high-impact calendar -- needed only to switch
+   N1/X5 on.
+
+
+==============================================================================
+15. SOURCES
+==============================================================================
+VP's own writing (A): the_trading_truth.docx (12 posts: ATR; Currency Pairs
+Ep.4; Reversal or Trend Trading; Best Time Frame Ep.3; Big Banks; Volume
+Indicator; Backtesting Step by Step Ep.21; Dead Markets; Back Testing Ep.47;
+Drawdown Ep.52; Automated Trading; Technical Analysis). Forex Risk Management
+-- The Definitive Guide. Scaling Out Is A Must. Don't Split Your Risk Ep.72.
+Scaling In Ep.25. Forex News Trading. Other Time Frames Ep.30.
+Secondary (B): No Nonsense FOREX Flow Charts (Rui Silva); No Nonsense Trader
+-- Trailing Stop, Bridge Too Far, Lesson 9, Lesson 11; NNFX Algo Tester --
+Operation Modes; backtestd -- Algorithm Rules.
+User confirmations (U): [RB] Decisions 1-4, 6-10, 12-15 ticked; 5 and 11
+unticked. [NEWS] N1/X5 + ForexFactory source. [MH] Sections 0-2.
+VP's YouTube videos are the primary source for every B rule; transcripts
+would upgrade those rules to A.
