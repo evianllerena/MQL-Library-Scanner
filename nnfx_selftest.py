@@ -20,12 +20,14 @@ raw price-unit distance. Golden cases use realistic EUR/USD- and AUD/NZD-scale
 numbers instead, for reviewer readability against VP's transcripts.
 """
 from __future__ import annotations
-import argparse, csv, sys
+import argparse, csv, sys, tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from nnfx_engine import (
     NNFXEngine, NNFXParams,
-    c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction,
+    c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction, bar_close_utc,
+    EquityTracker, run_lockstep,
 )
 
 
@@ -239,7 +241,10 @@ def unit_tests() -> Check:
            'afterward', rW6['action'] == 'enter' and rW6['reason'] == 'enter:continuation', detail=str(rW6))
 
     # --- exits: SL=1.5xATR, TP1=1.0xATR/half, breakeven+trail, hard-exit-on-flip --
-    eng3 = NNFXEngine(P(sl_mult=1.5, tp1_mult=1.0))
+    # NOTE (FIX 6): pinned to trail_activate_atr=0 (trail right after TP1). The trail bar below
+    # closes only 1.9xATR beyond entry, which under the T4 default (2xATR activation) correctly
+    # stays at breakeven -- the T4 gate itself is tested in the FIX 6 block further down.
+    eng3 = NNFXEngine(P(sl_mult=1.5, tp1_mult=1.0, trail_activate_atr=0.0))
     entry = eng3.process_bar(_bar('2024-05-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))
     c.that('exits: standard entry recorded so SL/TP1 can be checked against it', entry['action'] == 'enter', detail=str(entry))
     pos_entry_price = eng3.position.entry_price if eng3.position else None
@@ -567,7 +572,197 @@ def unit_tests() -> Check:
     c.that('E6 edge: that wrong-side C1-flip exit resets the sequence -> the next C2-flip-back does NOT continuation-enter',
            r_edge3['reason'] != 'enter:continuation', detail=str(r_edge3))
 
+    # --- FIX 6 / T4 trailing activation at 2xATR beyond entry (trail 1.5xATR, per candle) ---
+    # Long: entry 100.6 (ATR 1.0 -> SL 99.1, TP1 101.6). C1 long, price above the baseline and no
+    # exit indicator throughout, so only the stop management is under test.
+    def sl_path(params, bars):
+        e = NNFXEngine(params)
+        out = []
+        for b in bars:
+            e.process_bar(b)
+            out.append(round(e.position.sl, 4) if e.position else None)
+        return out
+    t4_long = t4_long_bars()
+    sl_l = sl_path(P(), t4_long)
+    c.that('T4 not-fire: after TP1, a close only 1.8xATR beyond entry leaves the runner at BREAKEVEN (no trail yet)',
+           sl_l[1] == 100.6 and sl_l[2] == 100.6, detail=str(sl_l))
+    c.that('T4 fires: the first close >= 2xATR beyond entry (102.7) starts the trail 1.5xATR behind it (101.2)',
+           sl_l[3] == 101.2, detail=str(sl_l))
+    c.that('T4 never backward: a pullback close (102.5, now under 2xATR again) does not loosen the stop -- it stays 101.2',
+           sl_l[4] == 101.2, detail=str(sl_l))
+    c.that('T4 per candle: the next higher close (103.5) ratchets the stop up to 102.0', sl_l[5] == 102.0, detail=str(sl_l))
+    sl_s = sl_path(P(), t4_short_bars())
+    c.that('T4 mirrors for shorts: breakeven 99.4 holds at 1.8xATR, trail starts at 98.8 on the 2.1xATR close, '
+           'never loosens on the pullback', sl_s[1:5] == [99.4, 99.4, 98.8, 98.8], detail=str(sl_s))
+    sl_old = sl_path(P(trail_activate_atr=0.0), t4_long)
+    c.that('T4 regression knob: trail_activate_atr=0 trails right after TP1 (pre-FIX-6) -- the 1.8xATR close already '
+           'moves the stop to 100.9', sl_old[2] == 100.9, detail=str(sl_old))
+    wide_atr = [dict(b) for b in t4_long]
+    wide_atr[3]['atr'] = 2.0  # the activation bar's own (live) ATR doubles
+    c.that('T4 reference ATR: the default measures 2xATR / 1.5xATR with atr_at_entry, so a jump in the live ATR on the '
+           'activation bar changes nothing (stop 101.2)', sl_path(P(), wide_atr)[3] == 101.2)
+    c.that('T4 reference ATR: trail_atr_ref=\'live\' uses the bar\'s own ATR -- 2.1 beyond entry is under 2x2.0, so no trail yet',
+           sl_path(P(trail_atr_ref='live'), wide_atr)[3] == 100.6)
+
+    # --- FIX 7 / N1 news entry block + X5 close-before-news (dormant hook) ---------------
+    cal_dir = Path(tempfile.mkdtemp(prefix='nnfx_news_'))
+
+    def news_params(name, events, **kw):
+        path = write_news_calendar(cal_dir / f'{name}.csv', events)
+        return P(enable_news_filter=True, news_calendar=str(path), **kw)
+
+    T0 = datetime(2025, 4, 1, 22, 0, tzinfo=timezone.utc)  # decision moment of the setup bar
+
+    def news_entry(params):
+        b = _bar('n1', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)   # otherwise-valid standard long
+        b.update(symbol='EURUSD', time_utc=T0)
+        return NNFXEngine(params).process_bar(b)
+    h = lambda hours: (T0 + timedelta(hours=hours)).isoformat()
+    r = news_entry(news_params('eur6', [('EUR', h(6), 'High')]))
+    c.that('N1 fires: a High EUR event 6h ahead BLOCKS an otherwise-valid EURUSD entry (skip:news)',
+           r['reason'] == 'skip:news', detail=str(r))
+    r = news_entry(news_params('eur30', [('EUR', h(30), 'High')]))
+    c.that('N1 not-fire: the same High EUR event 30h out (beyond 24h) -> the setup ENTERS', r['reason'] == 'enter:standard', detail=str(r))
+    r = news_entry(news_params('eurmed', [('EUR', h(6), 'Medium'), ('EUR', h(7), 'Low')]))
+    c.that('N1 not-fire: only Medium/Low EUR events in the window -> the setup ENTERS (red folder = High only)',
+           r['reason'] == 'enter:standard', detail=str(r))
+    r = news_entry(news_params('usd6', [('USD', h(6), 'High')]))
+    c.that('N1 both legs: a High USD event 6h ahead blocks EUR/USD too', r['reason'] == 'skip:news', detail=str(r))
+    r = news_entry(news_params('gbp6', [('GBP', h(6), 'High')]))
+    c.that('N1 not-fire: a High event for a currency outside the pair (GBP) does not block EUR/USD',
+           r['reason'] == 'enter:standard', detail=str(r))
+    r = news_entry(news_params('edge', [('EUR', h(0), 'High'), ('USD', h(24), 'High')]))
+    c.that('N1 window is (t, t+24h]: an event exactly at t does not count, one exactly at t+24h does -> blocked',
+           r['reason'] == 'skip:news', detail=str(r))
+    r = news_entry(P(enable_news_filter=False, news_calendar=str(write_news_calendar(cal_dir / 'off.csv', [('EUR', h(6), 'High')]))))
+    c.that('News dormant: enable_news_filter=False ignores even a blocking calendar -> the setup ENTERS',
+           r['reason'] == 'enter:standard', detail=str(r))
+    regress = x4_bars() + x2_bars() + t4_long_bars()
+    c.that('News dormant: enable_news_filter=True with NO calendar file gives results identical to the default '
+           '(bars carry no symbol/time at all -- the gate never reads them)',
+           actions(P(enable_news_filter=True), regress) == actions(P(), regress))
+
+    # X5: long entry at T0 (no event ahead of it), then the next bar has a High EUR event 6h ahead.
+    T1 = T0 + timedelta(days=1)
+    x5_cal = [('EUR', (T1 + timedelta(hours=6)).isoformat(), 'High')]   # 30h after T0: entry is not blocked
+
+    def x5_run(second, **kw):
+        e = NNFXEngine(news_params('x5_' + '_'.join(f'{k}{v}' for k, v in kw.items()), x5_cal, **kw))
+        first = _bar('x5a', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)
+        first.update(symbol='EURUSD', time_utc=T0)
+        second.update(symbol='EURUSD', time_utc=T1)
+        r1 = e.process_bar(first)
+        return r1, e.process_bar(second), e
+    r1, r2, _ = x5_run(_bar('x5b', 100.8, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.9, low=100.7))
+    c.that('X5 setup: the entry bar itself is not blocked (event is 30h ahead of it)', r1['reason'] == 'enter:standard', detail=str(r1))
+    c.that('X5 fires: an open not-yet-TP1 trade only 0.2xATR in profit is CLOSED before the event (exit:news)',
+           r2['reason'] == 'exit:news' and r2['pips'] == 0.2, detail=str(r2))
+    _, r2, _ = x5_run(_bar('x5b', 100.3, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.7, low=100.25))
+    c.that('X5 fires: a LOSING trade is closed before the event', r2['reason'] == 'exit:news' and r2['pips'] == -0.3, detail=str(r2))
+    _, r2, e = x5_run(_bar('x5b', 101.7, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=101.75, low=100.7))
+    c.that('X5 not-fire (handoff default): past TP1 and >= 1xATR in profit at the close -> runner HOLDS through the news',
+           r2['reason'] == 'exit:tp1_half' and e.position is not None, detail=str(r2))
+    small_past_tp1 = lambda: _bar('x5b', 101.0, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=101.65, low=100.7)
+    _, r2, _ = x5_run(small_past_tp1())
+    c.that('X5 handoff default: past TP1 but back under 1xATR profit (0.4) at the close -> CLOSED (exit:news)',
+           r2['reason'] == 'exit:news', detail=str(r2))
+    _, r2, e = x5_run(small_past_tp1(), x5_cutoff='not_past_tp1')
+    c.that('X5 not_past_tp1 (addendum alternative): the same past-TP1 trade is NOT force-closed',
+           r2['reason'] == 'exit:tp1_half' and e.position is not None, detail=str(r2))
+
+    c.that('M2: risk_pct defaults to 2.0', NNFXParams().risk_pct == 2.0)
+
+    # --- FIX 7b / R1 drawdown: % metric + 10%-from-peak circuit breaker --------------------
+    t = EquityTracker()
+    for r_mult in (1.0, -1.0, -1.0, 2.0):  # at 2% risk: 102 -> 99.96 -> 97.9608 -> 101.879
+        t.realize(r_mult, 2.0, 'd')
+    c.that('R1 metric: max_drawdown_pct matches the hand-computed value on a small curve (peak 102, two -2% steps to '
+           '97.9608 -> 1 - 0.98^2 = 3.96%)', abs(t.max_dd_pct - 3.96) < 1e-9, detail=str(t.max_dd_pct))
+
+    recs, acct, engs = dd_scenario(P(risk_pct=6.0))
+    a, b = recs['EURUSD'], recs['GBPUSD']
+    c.that('R1 metric (chronological, both symbols on one account): two EURUSD stop-outs at 6% risk take the account '
+           'to 88.36 -> max_drawdown_pct 11.64', round(acct.max_dd_pct, 2) == 11.64, detail=str(acct.curve))
+    c.that('R1 breaker fires: with the account 11.64% below its peak, the next valid EURUSD setup is SKIPPED '
+           '(skip:dd_breaker)', a[4]['reason'] == 'skip:dd_breaker', detail=str(a[4]))
+    c.that('R1 open trades keep their stops: the GBPUSD trade opened before the breach stays open through it and '
+           'exits normally on its own C1 flip', [r['action'] for r in b[1:5]] == ['hold'] * 4 and b[5]['reason'] == 'exit:c1_flip',
+           detail=str([r['reason'] for r in b]))
+    c.that('R1 breaker resumes (below_threshold): GBPUSD\'s profitable close lifts the account back to a 4.47% drawdown '
+           '-> the next EURUSD setup ENTERS', a[6]['reason'] == 'enter:standard' and round(acct.drawdown_pct(), 2) == 4.47,
+           detail=f"{a[6]} dd={acct.drawdown_pct()}")
+    recs_off, _, _ = dd_scenario(P(risk_pct=6.0, enable_dd_breaker=False))
+    c.that('R1 off (enable_dd_breaker=False): the same EURUSD setup during the drawdown ENTERS (pre-FIX-7b behavior)',
+           recs_off['EURUSD'][4]['reason'] == 'enter:standard', detail=str(recs_off['EURUSD'][4]))
+    solo = {sym: actions(P(risk_pct=6.0, enable_dd_breaker=False), bars) for sym, bars in dd_scenario_bars().items()}
+    c.that('R1 lockstep: driving symbols together in date order gives each symbol exactly the records it gets alone '
+           '(only a shared tracker + the breaker couple them)',
+           all([(r['action'], r['reason'], r['pips']) for r in recs_off[sym]] == solo[sym] for sym in solo))
+
     return c
+
+
+def dd_scenario_bars():
+    """FIX 7b fixture: EURUSD is stopped out twice (05-02, 05-04), then sets up again on 05-05
+    and 05-07; GBPUSD holds one long from 05-01 and exits +3.0 on its C1 flip on 05-06."""
+    lose = dict(high=100.65, low=99.0)  # SL 99.1 hit
+    eur = [
+        _bar('2025-05-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),             # enter
+        _bar('2025-05-02', 99.05, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, **lose),     # SL: -1R
+        _bar('2025-05-03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.05),             # enter again
+        _bar('2025-05-04', 99.05, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, **lose),     # SL: -1R -> 11.64% DD
+        _bar('2025-05-05', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.05),             # valid setup: BREAKER
+        _bar('2025-05-06', 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.65, low=99.45),  # back below
+        _bar('2025-05-07', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),              # valid setup: resumed
+    ]
+    hold = lambda d: _bar(d, 100.8, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.8, high=100.9, low=100.7)
+    gbp = [
+        _bar('2025-05-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),             # enter
+        hold('2025-05-02'), hold('2025-05-03'), hold('2025-05-04'), hold('2025-05-05'),
+        _bar('2025-05-06', 103.6, 100.0, 0.9, 1.0, 5.0, 10.0, close_prev=100.8, high=103.7, low=100.8),  # TP1 + C1 flip: +1.33R
+    ]
+    return {'EURUSD': eur, 'GBPUSD': gbp}
+
+
+def dd_scenario(params):
+    """Both symbols' engines share ONE EquityTracker and run in date order (run_lockstep)."""
+    acct = EquityTracker()
+    bars = dd_scenario_bars()
+    engs = {sym: NNFXEngine(params, equity=acct) for sym in bars}
+    return run_lockstep(engs, bars), acct, engs
+
+
+def write_news_calendar(path: Path, events) -> Path:
+    """Test calendar in the documented file shape: currency, timestamp_utc, impact."""
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['currency', 'timestamp_utc', 'impact'])
+        w.writerows(events)
+    return path
+
+
+def t4_long_bars():
+    """FIX 6 fixture: long entry 100.6 (ATR 1.0), TP1 hit, a close between TP1 and 2xATR, the
+    activating close, a pullback close, a further higher close. Shared by the tests and trace 17."""
+    return [
+        _bar('2025-03-03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                          # standard long entry
+        _bar('2025-03-04', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=101.65, low=100.9),  # TP1 101.6 hit -> BE 100.6
+        _bar('2025-03-05', 102.4, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=101.5, high=102.5, low=101.4),   # 1.8xATR beyond: stays BE
+        _bar('2025-03-06', 102.7, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=102.4, high=102.8, low=102.3),   # 2.1xATR: trail -> 101.2
+        _bar('2025-03-07', 102.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=102.7, high=102.7, low=102.2),   # pullback: stays 101.2
+        _bar('2025-03-10', 103.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=102.5, high=103.6, low=102.5),   # higher close: -> 102.0
+    ]
+
+
+def t4_short_bars():
+    """FIX 6 fixture, short mirror: entry 99.4 (SL 100.9, TP1 98.4)."""
+    return [
+        _bar('2025-03-03', 99.4, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5),                       # standard short entry
+        _bar('2025-03-04', 98.5, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=99.4, high=99.1, low=98.35),   # TP1 98.4 hit -> BE 99.4
+        _bar('2025-03-05', 97.6, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=98.5, high=98.6, low=97.5),    # 1.8xATR: stays BE
+        _bar('2025-03-06', 97.3, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=97.6, high=97.7, low=97.2),    # 2.1xATR: trail -> 98.8
+        _bar('2025-03-07', 97.5, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=97.3, high=97.8, low=97.3),    # pullback: stays 98.8
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +953,46 @@ def build_traces(out_dir: Path) -> list[Path]:
         {**_bar('2025-02-03', 105.0, 100.0, 1.0, 0.9, 5.0, 0.1, close_prev=100.5, high=105.1, low=100.5), 'exit_value': 105.0, 'exit_zero_reference': 100.0},  # exit-ind flips back long -> continuation
     ]
     paths.append(write_trace(out_dir, 'trace_16_lesson11_continuation.csv', bars, P(continuation_mode='lesson11')))
+
+    # Trace 17 (FIX 6, T4): long entry -> TP1 hit (runner to breakeven 100.6) -> a close 1.8xATR
+    # beyond entry (still breakeven, no trail) -> a close 2.1xATR beyond (trail starts at 101.2) ->
+    # a pullback close (stop stays 101.2, never backward) -> a higher close (stop ratchets to 102.0).
+    # Read the sl_after column.
+    paths.append(write_trace(out_dir, 'trace_17_t4_trail_activation.csv', t4_long_bars(), P()))
+
+    # Trace 18 (FIX 7, N1): calendar = trace_18_news_calendar.csv. 04-01's valid long cross decides
+    # at 04-02 00:00 UTC with a High EUR event at 12:30 that day -> skip:news. Price drops back
+    # below on 04-02. 04-03's identical cross decides at 04-04 00:00 UTC; the next High event
+    # (USD, 04-05 06:00) is 30h out -> enter:standard. (Server time = UTC here: offset 0.)
+    cal = write_news_calendar(out_dir / 'trace_18_news_calendar.csv',
+                              [('EUR', '2025-04-02T12:30:00Z', 'High'), ('USD', '2025-04-05T06:00:00Z', 'High')])
+    bars = [
+        _bar('2025.04.01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                            # valid cross: BLOCKED
+        _bar('2025.04.02', 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.6, low=99.4),      # back below
+        _bar('2025.04.03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                            # same setup: ENTERS
+    ]
+    for b in bars:
+        b.update(symbol='EURUSD', time_utc=bar_close_utc(b['date'], 0.0))
+    paths.append(write_trace(out_dir, 'trace_18_n1_news_block_then_enter.csv', bars,
+                             P(enable_news_filter=True, news_calendar=str(cal))))
+
+    # Trace 19 (FIX 7b, R1): EURUSD and GBPUSD share one account (6% risk so two stops breach 10%),
+    # run in date order. Two EURUSD stop-outs take equity to 88.36 (-11.64% from peak) -> the
+    # 05-05 EURUSD setup is skipped (skip:dd_breaker) while GBPUSD's open trade keeps running;
+    # GBPUSD's +1.33R close on 05-06 lifts the drawdown to 4.47% -> the 05-07 EURUSD setup enters.
+    acct = EquityTracker()
+    scen = dd_scenario_bars()
+    engs = {sym: NNFXEngine(P(risk_pct=6.0), equity=acct) for sym in scen}
+    path = out_dir / 'trace_19_r1_dd_breaker.csv'
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['date', 'symbol', 'close', 'action', 'reason', 'pips', 'equity_pct', 'drawdown_pct'])
+        order = sorted((b['date'], k, i, sym) for k, sym in enumerate(scen) for i, b in enumerate(scen[sym]))
+        for date, _k, i, sym in order:  # the same date order run_lockstep uses
+            rec = engs[sym].process_bar(scen[sym][i])
+            w.writerow([date, sym, scen[sym][i]['close'], rec['action'], rec['reason'], rec['pips'],
+                        round(acct.equity, 2), round(acct.drawdown_pct(), 2)])
+    paths.append(path)
 
     return paths
 

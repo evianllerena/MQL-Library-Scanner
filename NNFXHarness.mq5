@@ -75,8 +75,15 @@ input double VolumeThresholdMult = 1.0;
 // --- money management (ATR is FIXED -- never the thing under test) --
 input int    ATRPeriod          = 14;
 input double SLmult             = 1.5;
+// --- T4 trailing (FIX 6; mirrors NNFXParams trail_*): after TP1 the runner sits at breakeven
+//     until a candle CLOSES TrailActivateATR x ATR beyond entry; then it trails TrailDistanceATR x
+//     ATR behind each close, once per candle, never backward. TrailActivateATR=0 = pre-FIX-6.
+input double TrailActivateATR   = 2.0;
+input double TrailDistanceATR   = 1.5;
+input string TrailStep          = "per_candle"; // the only step: trailing runs once per closed bar
+input string TrailATRRef        = "entry";      // "entry" = ATR at entry (default) | "live" = closed bar's ATR
 input double TP1mult            = 1.0;
-input double RiskPct            = 1.0;
+input double RiskPct            = 2.0;     // M2 (label A): 2% per trade
 input double MinBeyondATR       = 1.0;
 input ulong  MagicNumber        = 20260001;
 input string RunTag             = "";      // unique per batch run -- keeps each run's trade log from colliding
@@ -116,6 +123,27 @@ input bool   RequireC2ForContinuation = true;
 input bool   EnableBaselineExit = true;  // false = pre-FIX-1 behavior
 // --- X2 exit indicator (SS5): read vs its OWN zero_reference, never 0 ------
 input bool   EnableExitIndicator = true; // no-op unless an exit indicator is active
+
+// --- FIX 7 news hook (RULEBOOK_ADDENDUM_NEWS.txt; WIRED-BUT-DORMANT; mirrors NNFXParams) --------
+// Calendar = CSV in MQL5\Files with a header row and columns currency,timestamp_utc,impact
+// (ForexFactory shape; timestamp like 2025-04-02T12:30:00Z, UTC). Only High rows are kept.
+// N1: no new trade if either currency of the pair has a High event in (t, t+NewsWindowHours],
+//     t = the closed bar's close in UTC. X5: close an open trade with such an event ahead per
+//     X5Cutoff: "handoff" (default) = losing or < X5ProfitATR x ATR-at-entry in profit;
+//     "not_past_tp1" = TP1 not hit yet. Sources disagree -> flagged for the user.
+input bool   EnableNewsFilter     = false;
+input string NewsCalendarFile     = "";
+input double NewsWindowHours      = 24.0;
+input string X5Cutoff             = "handoff"; // "handoff" | "not_past_tp1"
+input double X5ProfitATR          = 1.0;
+input double ServerUTCOffsetHours = 0.0;       // broker server time - UTC (e.g. 2 or 3)
+
+// --- FIX 7b R1 drawdown circuit breaker (mirrors NNFXParams enable_dd_breaker/dd_*) ------------
+// Once REALIZED balance is >= DDBreakerPct below its peak, open no new trades (any entry type);
+// open trades keep their stops. "below_threshold" (default, flagged) = resume once back under.
+input bool   EnableDDBreaker      = true;
+input double DDBreakerPct         = 10.0;
+input string DDResumeRule         = "below_threshold";
 
 // --- chart layout: each role in its OWN subwindow, never shared -----
 #define WIN_MAIN   0
@@ -181,6 +209,13 @@ int  g_posDir = 0; // +1 long, -1 short, 0 flat
 // blended per-lot pip result of the whole trade is the simple average of each half's own
 // pip result -- reported once, when BOTH halves are finally flat.
 double g_entryPriceForLog = 0.0;
+string   g_newsCur[];         // FIX 7: High-impact events (currency, UTC time), loaded in OnInit
+datetime g_newsTime[];
+long     g_summaryNewsSkips=0;
+double   g_peakBalance=0.0;   // FIX 7b: realized-balance peak
+long     g_summaryDDSkips=0;
+double g_atrAtEntry = 0.0;   // FIX 6: T4 reference ATR (TrailATRRef="entry")
+bool   g_trailActive = false; // FIX 6: sticky once a close reached TrailActivateATR beyond entry
 bool   g_half1PipsSet = false, g_half2PipsSet = false;
 double g_half1Pips = 0.0, g_half2Pips = 0.0;
 bool   g_tradeIsContinuation = false;
@@ -280,6 +315,14 @@ int OnInit()
       g_exitBuf = RefExitBuf;
       g_exitZeroRef = RefExitZeroReference;
       g_exitWanted = true;
+   }
+
+   // News calendar (FIX 7): dormant unless switched on AND a file is named; a named file that
+   // can't be read is fatal, never a silent "no news".
+   if(EnableNewsFilter && NewsCalendarFile!="" && !LoadNewsCalendar())
+   {
+      Print("NNFXHarness: cannot read news calendar ", NewsCalendarFile);
+      return(INIT_FAILED);
    }
 
    if(h_baseline==INVALID_HANDLE || h_c1==INVALID_HANDLE || h_c2==INVALID_HANDLE ||
@@ -420,6 +463,54 @@ bool BridgeTooFar(int shift,int dir)
    return(C1DirectionRunLength(from,dir)>=BridgeTooFarBars);
 }
 
+// FIX 7: read the calendar's High-impact rows. ISO-8601 "2025-04-02T12:30:00Z" -> StringToTime's
+// "2025.04.02 12:30:00" (the trailing Z / UTC is the file's contract). Mirrors load_news_calendar().
+bool LoadNewsCalendar()
+{
+   int h=FileOpen(NewsCalendarFile,FILE_READ|FILE_CSV|FILE_ANSI,',');
+   if(h==INVALID_HANDLE) return(false);
+   for(int i=0;i<3 && !FileIsEnding(h);i++) FileReadString(h); // header row
+   while(!FileIsEnding(h))
+   {
+      string cur=FileReadString(h), ts=FileReadString(h), impact=FileReadString(h);
+      StringToLower(impact); StringToUpper(cur);
+      StringTrimLeft(impact); StringTrimRight(impact); StringTrimLeft(cur); StringTrimRight(cur);
+      if(impact!="high") continue;
+      StringReplace(ts,"-","."); StringReplace(ts,"T"," "); StringReplace(ts,"Z","");
+      int n=ArraySize(g_newsCur);
+      ArrayResize(g_newsCur,n+1); ArrayResize(g_newsTime,n+1);
+      g_newsCur[n]=cur; g_newsTime[n]=StringToTime(ts);
+   }
+   FileClose(h);
+   return(true);
+}
+
+// N1/X5: a High event for EITHER currency of the pair in (t, t+NewsWindowHours], t = the close of
+// the bar at `shift` in UTC. Always false while dormant. Mirrors NNFXEngine._news_ahead().
+bool NewsAhead(int shift)
+{
+   if(!EnableNewsFilter || ArraySize(g_newsCur)==0) return(false);
+   datetime t = iTime(_Symbol,PERIOD_D1,shift) + 86400 - (datetime)(ServerUTCOffsetHours*3600);
+   datetime until = t + (datetime)(NewsWindowHours*3600);
+   string base=StringSubstr(_Symbol,0,3), quote=StringSubstr(_Symbol,3,3);
+   for(int i=0;i<ArraySize(g_newsCur);i++)
+      if((g_newsCur[i]==base || g_newsCur[i]==quote) && g_newsTime[i]>t && g_newsTime[i]<=until)
+         return(true);
+   return(false);
+}
+
+// Rules that veto ANY new trade (every entry type, continuation included). Logs the skip.
+bool EntryBlocked(int dir,double atrVal)
+{
+   if(EnableDDBreaker && g_peakBalance>0)
+   {
+      double dd=(g_peakBalance-AccountInfoDouble(ACCOUNT_BALANCE))/g_peakBalance*100.0;
+      if(dd>=DDBreakerPct) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:dd_breaker"); g_summaryDDSkips++; return(true); }
+   }
+   if(NewsAhead(1)) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:news"); g_summaryNewsSkips++; return(true); }
+   return(false);
+}
+
 //====================================================================
 // TRADE LOG (auditable trade log per NNFX_BACKTESTER_BUILD_SPEC.txt Part A)
 //====================================================================
@@ -546,6 +637,7 @@ void OpenPosition(int dir,double atrVal,bool isContinuation,string reason="")
    if(ok1){ g_half1.ticket=trade.ResultOrder(); g_half1.open=true; g_half1.tp1Hit=false; }
    if(ok2){ g_half2.ticket=trade.ResultOrder(); g_half2.open=true; g_half2.tp1Hit=false; }
    g_posDir=dir;
+   g_atrAtEntry=atrVal; g_trailActive=false;
    g_entryPriceForLog=price; g_half1PipsSet=false; g_half2PipsSet=false; g_half1Pips=0; g_half2Pips=0;
    g_tradeIsContinuation=isContinuation;
 
@@ -556,6 +648,7 @@ void OpenPosition(int dir,double atrVal,bool isContinuation,string reason="")
 // E1/E2/E3/E4 -- all of them establish an "original entry" SS7 tracks from. Mirrors _open().
 void OpenFresh(int dir,double atrVal,string reason)
 {
+   if(EntryBlocked(dir,atrVal)) return; // vetoed: opens nothing, arms nothing
    g_trendDir=dir; g_continuationOK=true;
    OpenPosition(dir, atrVal, false, reason);
 }
@@ -566,11 +659,12 @@ double NormalizeLots(double lots)
    return(MathFloor(lots/step)*step);
 }
 
-// Half #1 TP1 hit -> move half #2's stop to breakeven, then trail. Called every tick so the
-// trail keeps up; the ENTRY decision itself only runs once per closed daily bar. Also detects
-// EITHER half closing on its own (broker-side TP/SL fill, not a call from this EA) so g_posDir
-// never gets stuck non-zero after a natural stop-out.
-void ManageOpenPosition(double atrVal)
+// Half #1 TP1 hit -> move half #2's stop to breakeven. Called every tick so breakeven and
+// broker-side fills are picked up promptly; the T4 trail itself only moves on a newly closed
+// daily bar (newBar), read off that bar's close, like the engine. Also detects EITHER half
+// closing on its own (broker-side TP/SL fill, not a call from this EA) so g_posDir never gets
+// stuck non-zero after a natural stop-out.
+void ManageOpenPosition(double atrVal,bool newBar)
 {
    if(g_posDir==0) return;
    int dir=g_posDir;
@@ -588,12 +682,19 @@ void ManageOpenPosition(double atrVal)
       if(entryPrice>0)
          trade.PositionModify(g_half2.ticket, entryPrice, posInfo.TakeProfit());
    }
-   if(g_half2.open && posInfo.SelectByTicket(g_half2.ticket) && g_half1.tp1Hit)
+   if(newBar && g_half2.open && posInfo.SelectByTicket(g_half2.ticket) && g_half1.tp1Hit)
    {
-      double newSL = g_posDir>0 ? SymbolInfoDouble(_Symbol,SYMBOL_BID)-SLmult*atrVal
-                                 : SymbolInfoDouble(_Symbol,SYMBOL_ASK)+SLmult*atrVal;
-      bool improves = g_posDir>0 ? newSL>posInfo.StopLoss() : newSL<posInfo.StopLoss();
-      if(improves) trade.PositionModify(g_half2.ticket, newSL, posInfo.TakeProfit());
+      // T4: activation is sticky once a close reaches TrailActivateATR beyond entry.
+      double refATR = (TrailATRRef=="entry") ? g_atrAtEntry : atrVal;
+      double closeNow = iClose(_Symbol,PERIOD_D1,1);
+      if(!g_trailActive)
+         g_trailActive = TrailActivateATR<=0 || (closeNow-g_entryPriceForLog)*g_posDir >= TrailActivateATR*refATR;
+      if(g_trailActive)
+      {
+         double newSL = g_posDir>0 ? closeNow-TrailDistanceATR*refATR : closeNow+TrailDistanceATR*refATR;
+         bool improves = g_posDir>0 ? newSL>posInfo.StopLoss() : newSL<posInfo.StopLoss();
+         if(improves) trade.PositionModify(g_half2.ticket, newSL, posInfo.TakeProfit());
+      }
    }
    if(g_half2.open && !posInfo.SelectByTicket(g_half2.ticket))
    {
@@ -667,6 +768,19 @@ void OnNewDailyBar()
       CloseAllHalves("exit:baseline_cross");
    }
 
+   // --- X5 (FIX 7, dormant): a High event for either currency is within the window -> close
+   //     what is left at this close, per X5Cutoff. ---------------------------------------------
+   if(g_posDir!=0 && NewsAhead(shift))
+   {
+      bool smallOrLosing = (X5Cutoff=="not_past_tp1") ? !g_half1.tp1Hit
+                         : (iClose(_Symbol,PERIOD_D1,shift)-g_entryPriceForLog)*g_posDir < X5ProfitATR*g_atrAtEntry;
+      if(smallOrLosing)
+      {
+         g_lastExitDir=g_posDir;
+         CloseAllHalves("exit:news");
+      }
+   }
+
    // --- continuation bookkeeping: the sequence resets the moment a candle closes on the
    //     OPPOSITE side of the baseline from the tracked direction. This is a STICKY reset --
    //     once broken, only a genuine standard entry (not just any bare cross) may re-arm a
@@ -703,6 +817,7 @@ void OnNewDailyBar()
       }
       if(trigger)
       {
+         if(EntryBlocked(d,atrVal)) return; // vetoed: nothing opens; the sequence stays as it was
          OpenPosition(d, atrVal, true);
          g_lastExitDir=0; // consumed
          return;
@@ -822,10 +937,12 @@ int ExitDirection(int shift)
 void OnTick()
 {
    double atrVal;
-   if(BufVal(h_atr,0,1,atrVal)) ManageOpenPosition(atrVal); // trail runs every tick
-
+   g_peakBalance = MathMax(g_peakBalance, AccountInfoDouble(ACCOUNT_BALANCE)); // R1: realized peak
    datetime t0 = iTime(_Symbol,PERIOD_D1,0);
-   if(t0==g_lastBarTime) return; // only act once, on the bar that just closed
+   bool newBar = (t0!=g_lastBarTime);
+   if(BufVal(h_atr,0,1,atrVal)) ManageOpenPosition(atrVal,newBar); // fills every tick; T4 trail on newBar only
+
+   if(!newBar) return; // only act once, on the bar that just closed
    g_lastBarTime=t0;
 
    OnNewDailyBar();
@@ -851,7 +968,10 @@ double OnTester()
                 DoubleToString(TesterStatistics(STAT_EQUITY_DDREL_PERCENT),2));
       FileWrite(h, TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS), "summary_rule_audit", "-",
                 DoubleToString((double)g_summaryBridgeSkips,0), "", "", "",
-                "bridge_skips", DoubleToString((double)g_summaryContinuationTrades,0), "continuation_trades");
+                "bridge_skips", DoubleToString((double)g_summaryContinuationTrades,0), "continuation_trades",
+                DoubleToString((double)g_summaryNewsSkips,0), "news_skips",
+                DoubleToString((double)g_summaryDDSkips,0), "dd_breaker_skips",
+                DoubleToString(TesterStatistics(STAT_BALANCE_DDREL_PERCENT),2), "max_drawdown_pct_balance");
       FileClose(h);
    }
    return(g_summaryPipsSum);

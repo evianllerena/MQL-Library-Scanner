@@ -24,7 +24,10 @@ Function <-> EA cross-reference (NNFXHarness.mq5):
   NNFXEngine.process_bar  <-> OnNewDailyBar() + ManageOpenPosition()
 """
 from __future__ import annotations
+import bisect, csv, heapq
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Optional
 
 
@@ -98,6 +101,38 @@ def beyond_pullback_zone(close: float, baseline: float, atr: float, min_beyond_a
 
 
 # ---------------------------------------------------------------------------
+# News calendar (RULEBOOK_ADDENDUM_NEWS.txt N1/X5 -- WIRED-BUT-DORMANT)
+# ---------------------------------------------------------------------------
+
+def _parse_utc(text: str) -> datetime:
+    """ISO-8601 -> aware UTC datetime. A timestamp without an offset is taken as UTC (the
+    calendar file's documented contract)."""
+    t = datetime.fromisoformat(text.strip())
+    return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
+
+
+@lru_cache(maxsize=8)
+def load_news_calendar(path: str) -> dict:
+    """Read a ForexFactory-shaped calendar CSV (columns: currency, timestamp_utc, impact) and
+    keep HIGH-impact ("red folder") rows only. Returns {currency: sorted [UTC datetimes]}."""
+    events: dict = {}
+    with open(path, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            if row['impact'].strip().lower() != 'high':
+                continue
+            events.setdefault(row['currency'].strip().upper(), []).append(_parse_utc(row['timestamp_utc']))
+    return {cur: sorted(ts) for cur, ts in events.items()}
+
+
+def bar_close_utc(date: str, server_utc_offset_hours: float) -> datetime:
+    """The decision moment of a closed DAILY bar, in UTC. `date` is the bar's own (open) date in
+    broker server time ('YYYY.MM.DD' as MT5 extracts it, or 'YYYY-MM-DD'); the bar closes one day
+    later, and server time minus the server's UTC offset is UTC."""
+    opened = datetime.strptime(date[:10].replace('-', '.'), '%Y.%m.%d')
+    return (opened + timedelta(days=1) - timedelta(hours=server_utc_offset_hours)).replace(tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
 # Position / engine state
 # ---------------------------------------------------------------------------
 
@@ -112,12 +147,44 @@ class Position:
     half2_open: bool = True
     tp1_hit: bool = False
     is_continuation: bool = False
+    trail_active: bool = False  # FIX 6: sticky once a close has reached trail_activate_atr beyond entry
+
+
+@dataclass
+class EquityTracker:
+    """R1 (FIX 7b): REALIZED equity as % of the starting account, compounded per realized result
+    at risk_pct per trade. A result of R (pips / the 1.5xATR stop distance) moves equity by
+    R x risk_pct %. One tracker can be SHARED by several engines (one per symbol) driven in
+    chronological order (run_lockstep), which makes it the candidate's whole-account curve."""
+    equity: float = 100.0
+    peak: float = 100.0
+    max_dd_pct: float = 0.0
+    curve: list = field(default_factory=list)  # (date, equity) after each realized result
+
+    def drawdown_pct(self) -> float:
+        return (self.peak - self.equity) / self.peak * 100.0
+
+    def realize(self, r_multiple: float, risk_pct: float, date: str) -> None:
+        self.equity *= 1.0 + r_multiple * risk_pct / 100.0
+        self.peak = max(self.peak, self.equity)
+        self.max_dd_pct = max(self.max_dd_pct, self.drawdown_pct())
+        self.curve.append((date, self.equity))
 
 
 @dataclass
 class NNFXParams:
     sl_mult: float = 1.5
     tp1_mult: float = 1.0
+    # T4 TRAILING (MASTER_HANDOFF T4, label B, USER-ACCEPTED Decision #1). After TP1 the runner
+    # (half 2) sits at breakeven; trailing switches ON only once a candle has CLOSED at least
+    # trail_activate_atr x ATR beyond entry, then follows trail_distance_atr x ATR behind each
+    # close, once per candle, never backward. trail_activate_atr=0 reproduces the pre-FIX-6
+    # "trail right after TP1". trail_atr_ref picks the ATR both distances use: 'entry' (default,
+    # atr_at_entry -- flagged for user confirm) or 'live' (the bar's own ATR, pre-FIX-6 behavior).
+    trail_activate_atr: float = 2.0
+    trail_distance_atr: float = 1.5
+    trail_step: str = 'per_candle'  # the only step: the engine decides once per closed bar
+    trail_atr_ref: str = 'entry'
     min_beyond_atr: float = 1.0
     enable_bridge_too_far: bool = True
     bridge_too_far_bars: int = 7
@@ -176,6 +243,34 @@ class NNFXParams:
     # trade closes what is left. Only active on bars that carry exit_value; a bar
     # without one (no exit indicator supplied) behaves exactly as before FIX 2.
     enable_exit_indicator: bool = True
+    # --- FIX 7 news hook (RULEBOOK_ADDENDUM_NEWS.txt, user-confirmed, ForexFactory HIGH impact).
+    #     WIRED-BUT-DORMANT: off by default, and with no calendar file the gate stays off, so
+    #     results are byte-identical to pre-FIX-7. When on, each bar must carry 'symbol' (e.g.
+    #     'EURUSD') and 'time_utc' (its decision moment, see bar_close_utc).
+    # N1: no NEW trade if either currency of the pair has a High event in (time_utc, time_utc+24h].
+    # X5: an open trade with such an event ahead is closed at the close, per x5_cutoff:
+    #   'handoff' (DEFAULT, MASTER_HANDOFF label A): close if losing OR in profit by less than
+    #             x5_profit_atr x atr_at_entry; otherwise hold.
+    #   'not_past_tp1' (RULEBOOK_ADDENDUM stub): close only if TP1 has not been hit yet.
+    #   The two source docs disagree -> FLAGGED for the user to confirm VP's actual cutoff.
+    enable_news_filter: bool = False
+    news_calendar: Optional[str] = None
+    news_window_hours: float = 24.0
+    x5_cutoff: str = 'handoff'
+    x5_profit_atr: float = 1.0
+    server_utc_offset_hours: float = 0.0  # broker server time -> UTC, used by bar_close_utc callers
+    # M2 (label A): risk 2% per trade. The engine works in pips, so this never changes which
+    # trades fire by itself; it sets how far each result moves the % equity curve (R1 below).
+    risk_pct: float = 2.0
+    # --- FIX 7b R1 drawdown circuit breaker (MASTER_HANDOFF Section 0 / Decision #12) -------
+    # Once REALIZED equity is >= dd_breaker_pct below its peak, open NO new trades (every entry
+    # type, continuation included); open trades keep their stops and exits. dd_resume_rule:
+    # 'below_threshold' (DEFAULT, FLAGGED for user confirm) = resume as soon as the drawdown is
+    # back under dd_breaker_pct. NB: realized equity only moves when a trade closes, so once every
+    # position is flat while tripped, nothing can lift the drawdown back under the threshold.
+    enable_dd_breaker: bool = True
+    dd_breaker_pct: float = 10.0
+    dd_resume_rule: str = 'below_threshold'
     volume_threshold_mult: float = 1.0
     pip_size: float = 0.0001
 
@@ -203,13 +298,23 @@ class NNFXEngine:
     pending_pullback_dir: int = 0
     pending_onecandle_dir: int = 0
     pending_onecandle_bar: int = -1
+    # R1 (FIX 7b): realized % equity. Pass ONE shared tracker to several engines (run_lockstep)
+    # for a whole-account curve across symbols; by default each engine has its own.
+    equity: EquityTracker = field(default_factory=EquityTracker)
+    _date: str = ''  # date of the bar being processed (stamps realized results)
 
     def _pips(self, entry: float, exitp: float, direction: int) -> float:
         return ((exitp - entry) if direction > 0 else (entry - exitp)) / self.params.pip_size
 
+    def _realize(self, pos: Position, exit_price: float, fraction: float) -> None:
+        """Book `fraction` of the position (0.5 = one half) closed at exit_price, in R."""
+        r = (exit_price - pos.entry_price) * pos.direction / (self.params.sl_mult * pos.atr_at_entry)
+        self.equity.realize(fraction * r, self.params.risk_pct, self._date)
+
     def _close_all(self, exit_price: float, reason: str) -> dict:
         pos = self.position
         pips = self._pips(pos.entry_price, exit_price, pos.direction)
+        self._realize(pos, exit_price, 0.5 if pos.tp1_hit else 1.0)  # after TP1 only the runner is left
         self.last_exit_dir = pos.direction
         self.realized_pips += pips
         self.position = None
@@ -233,10 +338,42 @@ class NNFXEngine:
         run = c1_direction_run_length(self.c1_history, end, direction, p.bridge_lookback)
         return run >= p.bridge_too_far_bars
 
+    def _news_ahead(self, bar: dict) -> bool:
+        """N1/X5 test: a High-impact event for EITHER currency of the pair falls in
+        (time_utc, time_utc + news_window_hours]. Always False while the hook is dormant."""
+        p = self.params
+        if not p.enable_news_filter or not p.news_calendar:
+            return False
+        if 'symbol' not in bar or 'time_utc' not in bar:
+            raise ValueError("enable_news_filter needs 'symbol' and 'time_utc' on every bar")
+        events = load_news_calendar(p.news_calendar)
+        t = bar['time_utc']
+        until = t + timedelta(hours=p.news_window_hours)
+        for cur in (bar['symbol'][:3].upper(), bar['symbol'][3:6].upper()):
+            ts = events.get(cur, [])
+            i = bisect.bisect_right(ts, t)  # first event strictly after t
+            if i < len(ts) and ts[i] <= until:
+                return True
+        return False
+
+    def _entry_block_reason(self, bar: dict) -> Optional[str]:
+        """Rules that veto ANY new trade (every entry type, continuation included)."""
+        p = self.params
+        if p.enable_dd_breaker and self.equity.drawdown_pct() >= p.dd_breaker_pct:
+            return 'skip:dd_breaker'  # R1; resumes once back under the threshold ('below_threshold')
+        if self._news_ahead(bar):
+            return 'skip:news'
+        return None
+
     def _open(self, direction: int, bar: dict, reason: str, record: dict) -> dict:
         """Open a fresh (non-continuation) position and arm the continuation tracker.
-        Shared by E1/E2/E3/E4 -- all of them establish an 'original entry' SS7 tracks from."""
+        Shared by E1/E2/E3/E4 -- all of them establish an 'original entry' SS7 tracks from.
+        A vetoed entry (news) opens nothing and arms nothing."""
         p = self.params
+        blocked = self._entry_block_reason(bar)
+        if blocked:
+            record.update({'action': 'skip', 'reason': blocked})
+            return record
         entry = bar['close']
         sl = entry - p.sl_mult * bar['atr'] if direction > 0 else entry + p.sl_mult * bar['atr']
         tp1 = entry + p.tp1_mult * bar['atr'] if direction > 0 else entry - p.tp1_mult * bar['atr']
@@ -251,6 +388,7 @@ class NNFXEngine:
         c2_value, c2_zero_reference, volume_value, volume_avg, atr.
         Optional: exit_value + exit_zero_reference (X2 exit indicator)."""
         p = self.params
+        self._date = bar['date']
         self.c1_history.append((bar['c1_fast'], bar['c1_slow']))
         idx = len(self.c1_history) - 1
 
@@ -303,15 +441,23 @@ class NNFXEngine:
                     pos.half1_open = False
                     # remaining half's stop -> breakeven immediately (NNFX_RULESET_THE_TRUTH.txt SS5)
                     pos.sl = pos.entry_price
+                    self._realize(pos, pos.tp1, 0.5)
                     half_pips = self._pips(pos.entry_price, pos.tp1, pos.direction)
                     record.update({'action': 'exit_half', 'reason': 'exit:tp1_half', 'pips': round(half_pips, 1)})
 
-            # breakeven+trail on the remaining half once TP1 has been hit
+            # T4: after TP1 the runner sits at breakeven until a close reaches trail_activate_atr
+            # beyond entry; from then on (sticky) it trails trail_distance_atr behind each close,
+            # never backward.
             if pos.tp1_hit and pos.half2_open:
-                trail = bar['close'] - p.sl_mult * bar['atr'] if pos.direction > 0 else bar['close'] + p.sl_mult * bar['atr']
-                improves = trail > pos.sl if pos.direction > 0 else trail < pos.sl
-                if improves:
-                    pos.sl = trail
+                ref_atr = pos.atr_at_entry if p.trail_atr_ref == 'entry' else bar['atr']
+                if not pos.trail_active:
+                    beyond = (bar['close'] - pos.entry_price) * pos.direction
+                    pos.trail_active = p.trail_activate_atr <= 0 or beyond >= p.trail_activate_atr * ref_atr
+                if pos.trail_active:
+                    trail = bar['close'] - p.trail_distance_atr * ref_atr if pos.direction > 0 else bar['close'] + p.trail_distance_atr * ref_atr
+                    improves = trail > pos.sl if pos.direction > 0 else trail < pos.sl
+                    if improves:
+                        pos.sl = trail
 
             # hard exit: whole remaining position closes immediately on a C1 flip
             if pos.half2_open and c1dir != 0 and c1dir != pos.direction:
@@ -339,6 +485,15 @@ class NNFXEngine:
                 on_close_exit = 'exit:exit_indicator'
             elif p.enable_baseline_exit and pos.half2_open and side != 0 and side != pos.direction:
                 on_close_exit = 'exit:baseline_cross'
+            # X5 (FIX 7, dormant): a High-impact event for either currency is within the window ->
+            # close at the close, per x5_cutoff. Runs after X2/X4, so those keep their own reason.
+            if not on_close_exit and pos.half2_open and self._news_ahead(bar):
+                if p.x5_cutoff == 'not_past_tp1':
+                    small_or_losing = not pos.tp1_hit
+                else:  # 'handoff': losing, or in profit by less than x5_profit_atr x ATR
+                    small_or_losing = (bar['close'] - pos.entry_price) * pos.direction < p.x5_profit_atr * pos.atr_at_entry
+                if small_or_losing:
+                    on_close_exit = 'exit:news'
             if on_close_exit:
                 rec = self._close_all(bar['close'], on_close_exit)
                 if record['action'] == 'exit_half':
@@ -383,6 +538,10 @@ class NNFXEngine:
                 c2_ok = (not p.require_c2_for_continuation) or (c2dir == d)
                 trigger = fresh_c1_signal and c2_ok
             if trigger:
+                blocked = self._entry_block_reason(bar)
+                if blocked:  # vetoed: nothing opens; the sequence stays as it was
+                    record.update({'action': 'skip', 'reason': blocked})
+                    return record
                 entry = bar['close']
                 sl = entry - p.sl_mult * bar['atr'] if d > 0 else entry + p.sl_mult * bar['atr']
                 tp1 = entry + p.tp1_mult * bar['atr'] if d > 0 else entry - p.tp1_mult * bar['atr']
@@ -464,3 +623,16 @@ class NNFXEngine:
                     record.update({'action': 'skip', 'reason': 'skip:beyond_1xATR'}); return record
                 return self._open(d, bar, 'enter:c1_trigger', record)
         return record
+
+
+def run_lockstep(engines: dict, bars: dict) -> dict:
+    """Drive several symbols' engines together in CHRONOLOGICAL order: every symbol's bar for a
+    date is processed before any later date (ties in `bars` key order). Engines that share one
+    EquityTracker then see the candidate's whole-account equity as it stood on each date (R1).
+    bars = {symbol: [bar, ...] oldest-first}; returns {symbol: [record, ...]}. Engines that do
+    NOT share a tracker give the same records as driving each symbol on its own."""
+    streams = [[(b['date'], k, i, sym) for i, b in enumerate(bars[sym])] for k, sym in enumerate(bars)]
+    records = {sym: [] for sym in bars}
+    for _date, _k, i, sym in heapq.merge(*streams):
+        records[sym].append(engines[sym].process_bar(bars[sym][i]))
+    return records

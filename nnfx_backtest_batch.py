@@ -31,7 +31,7 @@ from pathlib import Path
 import preview_bridge as pb  # discovery, clone_runtime, compile_file, stage, mql_dir_name, ...
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from nnfx_engine import NNFXEngine, NNFXParams
+from nnfx_engine import NNFXEngine, NNFXParams, EquityTracker, bar_close_utc, run_lockstep
 
 # ---- output (identical protocol to preview_batch.py) ------------------------
 
@@ -75,6 +75,10 @@ def ensure_backtest_table(conn):
     CREATE INDEX IF NOT EXISTS ix_bt_slot ON backtest_results(slot);
     CREATE INDEX IF NOT EXISTS ix_bt_sha ON backtest_results(sha256);
     ''')
+    # FIX 7b: % drawdown from peak on the chronological all-symbols equity curve (additive column).
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(backtest_results)')}
+    if 'max_drawdown_pct' not in cols:
+        conn.execute('ALTER TABLE backtest_results ADD COLUMN max_drawdown_pct REAL')
     conn.commit()
 
 TESTABLE_SLOTS = ('CONFIRMATION_1', 'CONFIRMATION_2', 'BASELINE', 'VOLUME')
@@ -357,8 +361,12 @@ VOLUME_AVG_PERIOD = 20           # SS7 V2: pass = today's reading >= its own 20-
 def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
     per_symbol = {}
     pooled_trades = []
-    bridge_skips = continuation_trades = volume_skips = 0
+    bridge_skips = continuation_trades = volume_skips = dd_breaker_skips = news_skips = 0
     fingerprints = {}
+    # R1 (FIX 7b): ONE equity tracker shared by every symbol's engine, driven in date order
+    # (run_lockstep), so the drawdown breaker and max_drawdown_pct see the candidate's whole account.
+    account = EquityTracker()
+    engines, prepared = {}, {}
     for sym in symbols:
         d = symbol_data[sym]
         rows = d['rows']
@@ -372,8 +380,8 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
         ref_vol = [fnum(r['vol']) for r in rows] if has_ref_vol else None
         ref_vol_avg = rolling_avg(ref_vol, VOLUME_AVG_PERIOD) if has_ref_vol else None
 
-        eng = NNFXEngine(NNFXParams(pip_size=0.01 if 'JPY' in sym else 0.0001))
-        records = []
+        eng = engines[sym] = NNFXEngine(NNFXParams(pip_size=0.01 if 'JPY' in sym else 0.0001), equity=account)
+        bars = prepared[sym] = []
         prev_close = prev_baseline = None
         for i, r in enumerate(rows):
             atrv = fnum(r['atr'])
@@ -412,15 +420,20 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
                        # X2 reference exit: Examples\Momentum(14), centre line 100 (not 0). Missing
                        # column (pre-FIX-2 extract) or warm-up EMPTY -> no exit indicator that bar.
                        exit_value=fnum(r.get('mom')), exit_zero_reference=REF_EXIT_ZERO_REFERENCE)
-            rec = eng.process_bar(bar)
-            rec['date'] = r['date']
-            records.append(rec)
+            if eng.params.enable_news_filter:  # N1/X5 (FIX 7): dormant unless switched on
+                bar.update(symbol=sym, time_utc=bar_close_utc(r['date'], eng.params.server_utc_offset_hours))
+            bars.append(bar)
             prev_close = fnum(r['close']); prev_baseline = base
 
+    all_records = run_lockstep(engines, prepared)
+    for sym in symbols:
+        records = all_records[sym]
         window = [r for r in records if r['date'][:4] >= '2019']
         bridge_skips += sum(1 for r in window if r['reason'] == 'skip:bridge_too_far')
         continuation_trades += sum(1 for r in window if r['reason'] == 'enter:continuation')
         volume_skips += sum(1 for r in window if r['reason'] == 'skip:volume_filter')
+        dd_breaker_skips += sum(1 for r in window if r['reason'] == 'skip:dd_breaker')
+        news_skips += sum(1 for r in window if r['reason'] == 'skip:news')
         trades = []
         pending_half1 = None
         for r in window:
@@ -447,6 +460,7 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
     return dict(trades=n, wins=wins, losses=losses, win_rate=win_rate, expectancy_pips=expectancy,
                 profit_factor=profit_factor, max_drawdown=round(maxdd, 1), bridge_skips=bridge_skips,
                 continuation_trades=continuation_trades, volume_skips=volume_skips,
+                max_drawdown_pct=round(account.max_dd_pct, 2), dd_breaker_skips=dd_breaker_skips, news_skips=news_skips,
                 per_symbol=per_symbol, fingerprints=fingerprints)
 
 # ---- run ----------------------------------------------------------------------
@@ -701,15 +715,15 @@ def write_status_row(conn, it, bed, status, reason):
 def write_score_row(conn, it, bed, r):
     conn.execute("""
         INSERT INTO backtest_results(sha256, slot, signal_type, bed, stage, trades, wins, losses,
-            win_rate, expectancy_pips, profit_factor, max_drawdown, bridge_skips, continuation_trades,
+            win_rate, expectancy_pips, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
             mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b)
-        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
+        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
         ON CONFLICT(sha256, slot, bed) DO UPDATE SET trades=excluded.trades, wins=excluded.wins,
             losses=excluded.losses, win_rate=excluded.win_rate, expectancy_pips=excluded.expectancy_pips,
-            profit_factor=excluded.profit_factor, max_drawdown=excluded.max_drawdown,
+            profit_factor=excluded.profit_factor, max_drawdown=excluded.max_drawdown, max_drawdown_pct=excluded.max_drawdown_pct,
             bridge_skips=excluded.bridge_skips, continuation_trades=excluded.continuation_trades, tested_at=excluded.tested_at
     """, (it['sha256'], it['slot'], it['signal_type'], bed, r['trades'], r['wins'], r['losses'], r['win_rate'],
-          r['expectancy_pips'], r['profit_factor'], r['max_drawdown'], r['bridge_skips'], r['continuation_trades'],
+          r['expectancy_pips'], r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
           f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b']))
     conn.commit()
 
