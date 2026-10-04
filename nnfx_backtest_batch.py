@@ -26,6 +26,7 @@ Commands (JSONL on stdout, like the other sidecars):
 """
 from __future__ import annotations
 import argparse, json, os, shutil, sqlite3, sys, time, hashlib, threading, tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import preview_bridge as pb  # discovery, clone_runtime, compile_file, stage, mql_dir_name, ...
@@ -54,6 +55,36 @@ DEFAULT_NNFX_BASKET = ('EURUSD,GBPUSD,AUDUSD,NZDUSD,USDCAD,USDCHF,USDJPY,'
                        'EURGBP,EURAUD,EURNZD,EURCAD,EURCHF,EURJPY,'
                        'GBPAUD,GBPNZD,GBPCAD,GBPCHF,GBPJPY,'
                        'AUDNZD,AUDCAD,AUDCHF,AUDJPY,NZDCAD,NZDCHF,NZDJPY,CADCHF,CADJPY,CHFJPY')
+
+# Data-history lever 2: the controller REQUESTS D1 history from the server back to the scoring
+# start minus a warm-up margin (it used to read only what the terminal happened to have cached),
+# and trades are scored from the scoring start on. Override with --history-from.
+DEFAULT_HISTORY_FROM = '2015.01.01'
+HISTORY_WARMUP_DAYS = 183  # ~6 months of extra bars so indicators/ATR/volume average are settled
+
+
+def fetch_from(history_from: str) -> str:
+    """The date the controller requests history from: the scoring start minus the warm-up."""
+    d = datetime.strptime(history_from, '%Y.%m.%d') - timedelta(days=HISTORY_WARMUP_DAYS)
+    return d.strftime('%Y.%m.%d')
+
+
+def usable_symbols(statuses: dict, symbols, history_from: str):
+    """Split the basket into symbols to score and symbols to leave out, from the controller's
+    per-symbol status lines. A symbol is scored only if its history synchronized AND reaches the
+    scoring start; anything else is reported, never silently scored on a few weeks of bars."""
+    keep, dropped = [], {}
+    for sym in symbols:
+        st = statuses.get(sym)
+        if not st or st.get('status') != 'done':
+            dropped[sym] = (st or {}).get('status', 'no_status')
+        elif not st.get('synced'):
+            dropped[sym] = 'history_not_synced'
+        elif st.get('first', '9999') > history_from:
+            dropped[sym] = f"history_starts_{st.get('first')}"
+        else:
+            keep.append(sym)
+    return keep, dropped
 
 # ---- DB ----------------------------------------------------------------------
 
@@ -158,6 +189,24 @@ int JInt(string obj,string key,int dflt=-1){
 }
 #define EV(x) ((x)==EMPTY_VALUE ? "EMPTY" : DoubleToString((x),8))
 
+// Ask the server for D1 history back to `from` and wait until the series is synchronized and
+// reaches it (or the server has nothing older). Without this the script only sees whatever was
+// already cached locally -- ~15 bars for a pair the terminal never charted.
+bool SyncHistory(string sym,datetime from,uint timeout_ms){
+  uint t0=GetTickCount();
+  while(GetTickCount()-t0<timeout_ms){
+    datetime t[];
+    int got=CopyTime(sym,PERIOD_D1,from,TimeCurrent(),t);
+    if(got>0 && SeriesInfoInteger(sym,PERIOD_D1,SERIES_SYNCHRONIZED)){
+      datetime first=(datetime)SeriesInfoInteger(sym,PERIOD_D1,SERIES_FIRSTDATE);
+      datetime sfirst=(datetime)SeriesInfoInteger(sym,PERIOD_D1,SERIES_SERVER_FIRSTDATE);
+      if(first<=from+7*86400 || (sfirst>0 && first<=sfirst+7*86400)) return(true);
+    }
+    Sleep(250);
+  }
+  return(false);
+}
+
 void OnStart(){
   string body=ReadFileText("nnfx_batch.json");
   if(StringLen(body)==0){ AppendResult("{\"fatal\":\"no job file\"}"); return; }
@@ -182,12 +231,17 @@ void OnStart(){
     int q1=StringFind(sarr,"\"",pos); if(q1<0) break; int q2=StringFind(sarr,"\"",q1+1); if(q2<0) break;
     ArrayResize(syms,nsyms+1); syms[nsyms]=StringSubstr(sarr,q1+1,q2-q1-1); nsyms++; pos=q2+1;
   }
-  AppendResult("{\"info\":\"loaded\",\"jobs\":"+IntegerToString(njobs)+",\"symbols\":"+IntegerToString(nsyms)+"}");
+  datetime from=StringToTime(JStr(body,"history_from"));
+  AppendResult("{\"info\":\"loaded\",\"jobs\":"+IntegerToString(njobs)+",\"symbols\":"+IntegerToString(nsyms)+",\"history_from\":\""+TimeToString(from,TIME_DATE)+"\"}");
+  uint c0=GetTickCount();  // the session may still be logging in when the script starts
+  while(!TerminalInfoInteger(TERMINAL_CONNECTED) && GetTickCount()-c0<60000) Sleep(250);
 
   for(int s=0;s<nsyms;s++){
     string sym=syms[s];
     if(!SymbolSelect(sym,true)){ AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"symbol_select_failed\"}"); continue; }
-    int total=iBars(sym,PERIOD_D1);
+    bool synced=SyncHistory(sym,from,120000);
+    int total=Bars(sym,PERIOD_D1,from,TimeCurrent());  // only bars from `from` on (warm-up included)
+    if(total<=0){ AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"no_history\",\"synced\":"+(synced?"true":"false")+"}"); continue; }
 
     int h_ma=iCustom(sym,PERIOD_D1,"Examples\\Custom Moving Average",20,0,MODE_SMA);
     int h_macd=iCustom(sym,PERIOD_D1,"Examples\\MACD");
@@ -199,12 +253,14 @@ void OnStart(){
     int handles[]; ArrayResize(handles,njobs);
     for(int k=0;k<njobs;k++) handles[k]=iCustom(sym,PERIOD_D1,rels[k]);
 
-    int waited=0;
-    while(waited<20){
-      bool ready=(BarsCalculated(h_ma)>0 && BarsCalculated(h_macd)>0 && BarsCalculated(h_rvi)>0 && BarsCalculated(h_mom)>0 && BarsCalculated(h_vol)>0 && BarsCalculated(h_atr)>0);
-      for(int k=0;k<njobs;k++) if(BarsCalculated(handles[k])<=0) ready=false;
+    // every indicator must have calculated EVERY bar (not just one) before its buffers are read
+    int need=Bars(sym,PERIOD_D1);
+    uint w0=GetTickCount();
+    while(GetTickCount()-w0<60000){
+      bool ready=(BarsCalculated(h_ma)>=need && BarsCalculated(h_macd)>=need && BarsCalculated(h_rvi)>=need && BarsCalculated(h_mom)>=need && BarsCalculated(h_vol)>=need && BarsCalculated(h_atr)>=need);
+      for(int k=0;k<njobs;k++) if(handles[k]!=INVALID_HANDLE && BarsCalculated(handles[k])<need) ready=false;
       if(ready) break;
-      Sleep(100); waited++;
+      Sleep(100);
     }
 
     double ma[],macdM[],macdS[],rvi[],mom[],vol[],atr[];
@@ -245,7 +301,9 @@ void OnStart(){
     FileClose(fh);
     for(int k=0;k<njobs;k++) IndicatorRelease(handles[k]);
     IndicatorRelease(h_ma); IndicatorRelease(h_macd); IndicatorRelease(h_rvi); IndicatorRelease(h_mom); IndicatorRelease(h_vol); IndicatorRelease(h_atr);
-    AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"done\",\"rows\":"+IntegerToString(total)+"}");
+    AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"done\",\"rows\":"+IntegerToString(total)+
+                 ",\"first\":\""+TimeToString(iTime(sym,PERIOD_D1,total-1),TIME_DATE)+"\",\"synced\":"+(synced?"true":"false")+
+                 ",\"server_first\":\""+TimeToString((datetime)SeriesInfoInteger(sym,PERIOD_D1,SERIES_SERVER_FIRSTDATE),TIME_DATE)+"\"}");
   }
   int f=FileOpen("nnfx_batch_done.flag",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
   if(f!=INVALID_HANDLE){ FileWriteString(f,"done"); FileClose(f); }
@@ -256,10 +314,15 @@ void OnStart(){
 def copy_history_for_symbols(live, rt, symbols):
     """pb.copy_mt5_history() only seeds ONE symbol's cached history into a
     fresh clone (whichever was most recently active). A multi-pair basket
-    needs all of them, so this copies each basket symbol's history folder
+    needs all of them, so this seeds each basket symbol's history folder
     directly -- same mechanism, just not limited to a single symbol. Lives
     here rather than in preview_bridge.py since preview never needed more
-    than one symbol; this doesn't touch preview_bridge.py at all."""
+    than one symbol; this doesn't touch preview_bridge.py at all.
+
+    MERGE, never replace: the runtime keeps the deeper history the controller
+    downloaded on earlier runs (years the live terminal never loaded), so a
+    file is copied only when the runtime lacks it or the live copy is newer.
+    (It used to rmtree each symbol first, wiping that history every run.)"""
     copied = []
     bases_dir = Path(live) / 'bases'
     if not bases_dir.exists():
@@ -273,14 +336,25 @@ def copy_history_for_symbols(live, rt, symbols):
             if not src.is_dir():
                 continue
             dst = Path(rt) / src.relative_to(live)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.rmtree(dst, ignore_errors=True)
             try:
-                shutil.copytree(src, dst)
+                merge_tree_newer(src, dst)
                 copied.append(sym)
             except Exception:
                 pass
     return copied
+
+
+def merge_tree_newer(src: Path, dst: Path) -> None:
+    """Copy every file under src into dst when dst lacks it or src's copy is newer. Nothing in
+    dst is ever deleted."""
+    for f in src.rglob('*'):
+        if not f.is_file():
+            continue
+        target = dst / f.relative_to(src)
+        if target.exists() and target.stat().st_mtime >= f.stat().st_mtime:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
 
 def restore_account_login(live, rt):
     """pb.prime_mt5_runtime() runs pb._prepare_offline_runtime(), which deletes
@@ -432,7 +506,7 @@ def _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref):
     return prepared
 
 
-def _score_run(symbols, prepared, enable_dd_breaker):
+def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_FROM):
     """One scoring pass over prepared bars at a given breaker setting. Fresh engines + a fresh
     shared account each call, so the two runs (off/on) are independent."""
     per_symbol = {}
@@ -447,7 +521,8 @@ def _score_run(symbols, prepared, enable_dd_breaker):
                for sym in symbols}
     all_records = run_lockstep(engines, prepared)
     for sym in symbols:
-        window = [r for r in all_records[sym] if r['date'][:4] >= '2019']
+        # trades from the scoring start on; earlier bars are indicator warm-up only
+        window = [r for r in all_records[sym] if r['date'][:10].replace('-', '.') >= score_from]
         bridge_skips += sum(1 for r in window if r['reason'] == 'skip:bridge_too_far')
         continuation_trades += sum(1 for r in window if r['reason'] == 'enter:continuation')
         volume_skips += sum(1 for r in window if r['reason'] == 'skip:volume_filter')
@@ -483,21 +558,21 @@ def _score_run(symbols, prepared, enable_dd_breaker):
                 per_symbol=per_symbol, fingerprints=fingerprints)
 
 
-def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
+def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_from=DEFAULT_HISTORY_FROM):
     """FIX 8: rank on the breaker-OFF run (full trade history, apples-to-apples) and report the
     breaker-ON expectancy alongside, so the drawdown breaker never distorts the comparison. The
     risk column max_drawdown_pct comes from the breaker-OFF run (the TRUE unprotected drawdown);
     dd_breaker_skips comes from the breaker-ON run (how many entries the breaker WOULD stop)."""
     prepared = _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref)
-    off = _score_run(symbols, prepared, enable_dd_breaker=False)  # ranking metric + true risk
-    on = _score_run(symbols, prepared, enable_dd_breaker=True)    # reference + real breaker skips
+    off = _score_run(symbols, prepared, enable_dd_breaker=False, score_from=score_from)  # ranking metric + true risk
+    on = _score_run(symbols, prepared, enable_dd_breaker=True, score_from=score_from)    # reference + real breaker skips
     off['expectancy_pips_breaker'] = on['expectancy_pips']
     off['dd_breaker_skips'] = on['dd_breaker_skips']
     return off
 
 # ---- run ----------------------------------------------------------------------
 
-def run(db, out, symbols, limit=None, min_trades=30, force=False):
+def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=DEFAULT_HISTORY_FROM):
     conn = connect(db)
     ensure_backtest_table(conn)
     items = candidacy_rows(conn, limit)
@@ -634,7 +709,7 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
     # 4) write job list + controller, compile controller, launch ONE session
     job_json = {'jobs': [{'key': j['key'], 'rel': j['rel'], 'role': j['role'],
                            'buf_a': j['buf_a'], 'buf_b': j['buf_b'] if j['buf_b'] is not None else -1} for j in jobs],
-                'symbols': symbols}
+                'symbols': symbols, 'history_from': fetch_from(history_from)}
     # compact separators (no space after ':' or ','): the controller's hand-rolled
     # JInt() parser doesn't skip whitespace before a digit, so json.dumps's default
     # "key": 1 style silently made every int field parse back as its -1 default
@@ -656,7 +731,8 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
     proc = pb.subprocess.Popen([str(terminal_exe), '/portable', f'/config:{cfg}'],
                                 cwd=str(rt), creationflags=pb.CREATE_NO_WINDOW, startupinfo=pb.startupinfo())
     try:
-        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(jobs) * len(symbols)))
+        # + up to 2.5 min per symbol for the controller's history download/sync
+        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(jobs) * len(symbols) + 150 * len(symbols)))
     finally:
         pb.terminate_tree(proc)
     if not finished:
@@ -678,7 +754,23 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
         except Exception:
             pass
 
-    # 5) load per-symbol CSVs, classify, score, write results
+    # 5) history depth per symbol: score only the symbols whose history synchronized and reaches
+    #    the scoring start; report the rest (and every symbol's bars + oldest date) explicitly.
+    statuses = {r['symbol']: r for r in _read_jsonl(files_dir / 'nnfx_batch_results.jsonl')
+                if 'symbol' in r and 'status' in r}
+    stage_event('history_depth', history_from=history_from, fetch_from=fetch_from(history_from),
+                symbols={s: {k: statuses.get(s, {}).get(k) for k in ('status', 'rows', 'first', 'synced', 'server_first')}
+                         for s in symbols})
+    symbols, dropped = usable_symbols(statuses, symbols, history_from)
+    if dropped:
+        stage_event('symbols_excluded', excluded=dropped)
+    if not symbols:
+        emit({'type': 'fatal', 'error': 'no symbol has usable history', 'excluded': dropped})
+        conn.close()
+        return
+    bed = '+'.join(symbols) + '|D1|LIVE'
+
+    # 6) load per-symbol CSVs, classify, score, write results
     symbol_data = {}
     for sym in symbols:
         p = files_dir / f'nnfx_batch_extract_{sym}.csv'
@@ -711,7 +803,8 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
             if bad:
                 write_status_row(conn, it, bed, 'EXTRACT_GARBAGE', bad_reason)
                 continue
-            result = score_candidate(symbol_data, symbols, it['slot'], col_a, col_b, it['zero_reference'])
+            result = score_candidate(symbol_data, symbols, it['slot'], col_a, col_b, it['zero_reference'],
+                                     score_from=history_from)
             write_score_row(conn, it, bed, result)
             scored += 1
             emit({'type': 'item_scored', 'filename': it['filename'], 'slot': it['slot'],
@@ -769,12 +862,14 @@ def main():
     p.add_argument('--bed-symbols', default=DEFAULT_NNFX_BASKET)
     p.add_argument('--limit', type=int); p.add_argument('--min-trades', type=int, default=30)
     p.add_argument('--force', action='store_true')
+    p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM,
+                   help='score trades from this date (YYYY.MM.DD); history is fetched ~6 months earlier for warm-up')
     args = ap.parse_args()
     if args.cmd == 'plan':
         plan(args.db, args.limit)
     elif args.cmd == 'run':
         run(args.db, args.out, [s.strip() for s in args.bed_symbols.split(',') if s.strip()],
-            args.limit, args.min_trades, args.force)
+            args.limit, args.min_trades, args.force, args.history_from)
 
 if __name__ == '__main__':
     try:

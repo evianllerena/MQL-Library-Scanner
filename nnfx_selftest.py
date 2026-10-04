@@ -20,7 +20,7 @@ raw price-unit distance. Golden cases use realistic EUR/USD- and AUD/NZD-scale
 numbers instead, for reviewer readability against VP's transcripts.
 """
 from __future__ import annotations
-import argparse, csv, sys, tempfile
+import argparse, csv, os, sys, tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -430,6 +430,38 @@ def unit_tests() -> Check:
     avg = nb.rolling_avg([float(r['vol']) for r in batch_rows(50.0)], nb.VOLUME_AVG_PERIOD)[-1]
     c.that('G10: today\'s value and its average come from the same line -- the cross-bar average (97.5) is the '
            '20-bar mean of the vol column itself', abs(avg - 97.5) < 1e-9, detail=str(avg))
+
+    # --- Data-history lever 2: requested history depth, merge-only history seeding, scoring window ---
+    c.that('History: the controller fetches ~6 months of warm-up before the scoring start (2015.01.01 -> 2014.07.02)',
+           nb.fetch_from('2015.01.01') == '2014.07.02', detail=nb.fetch_from('2015.01.01'))
+    hist = Path(tempfile.mkdtemp(prefix='nnfx_hist_'))
+    live_dir, rt_dir = hist / 'live' / 'EURUSD', hist / 'rt' / 'EURUSD'
+    live_dir.mkdir(parents=True); rt_dir.mkdir(parents=True)
+    for d, name, text, mtime in ((live_dir, '2024.hcc', 'live-old', 1000), (live_dir, '2026.hcc', 'live-new', 3000),
+                                 (rt_dir, '2015.hcc', 'rt-deep', 2000), (rt_dir, '2024.hcc', 'rt-newer', 2000),
+                                 (rt_dir, '2026.hcc', 'rt-stale', 2000)):
+        (d / name).write_text(text)
+        os.utime(d / name, (mtime, mtime))
+    nb.merge_tree_newer(live_dir, rt_dir)
+    merged = {f.name: f.read_text() for f in rt_dir.iterdir()}
+    c.that('History seeding MERGES: the runtime keeps a year the live terminal never loaded (2015) and its own newer '
+           '2024, and takes only the live copy that is newer (2026) -- nothing is wiped',
+           merged == {'2015.hcc': 'rt-deep', '2024.hcc': 'rt-newer', '2026.hcc': 'live-new'}, detail=str(merged))
+    statuses = {'EURUSD': {'status': 'done', 'synced': True, 'first': '2014.07.02'},
+                'AUDUSD': {'status': 'done', 'synced': True, 'first': '2026.09.14'},     # 15 bars, the old failure
+                'NZDUSD': {'status': 'done', 'synced': False, 'first': '2014.07.02'},
+                'CADCHF': {'status': 'symbol_select_failed'}}
+    keep, dropped = nb.usable_symbols(statuses, ['EURUSD', 'AUDUSD', 'NZDUSD', 'CADCHF', 'GBPCHF'], '2015.01.01')
+    c.that('History: only a synced symbol whose history reaches the scoring start is scored; short, unsynced, '
+           'unselectable and missing symbols are reported, never scored',
+           keep == ['EURUSD'] and set(dropped) == {'AUDUSD', 'NZDUSD', 'CADCHF', 'GBPCHF'}, detail=f'{keep} {dropped}')
+    late_rows = batch_rows(200.0)  # dated 2024.03.xx, the valid entry is on the last bar
+    in_win = nb.score_candidate({'EURUSD': {'rows': late_rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None,
+                                score_from='2024.03.01')['fingerprints']['EURUSD']
+    out_win = nb.score_candidate({'EURUSD': {'rows': late_rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None,
+                                 score_from='2024.04.01')['fingerprints']['EURUSD']
+    c.that('History: the scoring window starts at score_from -- bars before it are warm-up only (no records counted)',
+           in_win[-1][1:] == ('enter', 'enter:standard') and out_win == (), detail=f'{in_win[-1:]} {out_win}')
 
     # --- FIX 8: ranking runs the breaker OFF; the breaker-ON expectancy is reported alongside so the
     #     drawdown breaker never distorts the comparison. A candidate that never trips it has identical
