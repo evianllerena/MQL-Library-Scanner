@@ -87,6 +87,35 @@ def usable_symbols(statuses: dict, symbols, history_from: str):
             keep.append(sym)
     return keep, dropped
 
+JOB_TIMEOUT_SECONDS = 30  # per candidate per pair; a candidate that misses it on 2 pairs is skipped
+
+
+def job_failures(results):
+    """{candidate key: {symbol: job_status}} for every candidate the controller could not extract
+    on some symbol (too_slow / never_calculated / load_failed / skipped_slow)."""
+    out = {}
+    for r in results:
+        st = r.get('job_status')
+        if st and st != 'ok':
+            out.setdefault(r['key'], {})[r['symbol']] = st
+    return out
+
+
+def failure_reason(fails: dict) -> str:
+    """One readable line for a candidate's extraction failures, e.g.
+    'too_slow on EURUSD,GBPUSD; skipped_slow on 26 more'."""
+    by = {}
+    for sym, st in fails.items():
+        by.setdefault(st, []).append(sym)
+    parts = []
+    for st in ('load_failed', 'never_calculated', 'too_slow'):
+        if st in by:
+            parts.append(f"{st} on {','.join(by[st])}")
+    if 'skipped_slow' in by:
+        parts.append(f"skipped_slow on {len(by['skipped_slow'])} more")
+    return '; '.join(parts)
+
+
 MIN_TRADES = 30  # below this a result is an insufficient sample (same default as the app's board)
 
 
@@ -258,6 +287,11 @@ void OnStart(){
     ArrayResize(syms,nsyms+1); syms[nsyms]=StringSubstr(sarr,q1+1,q2-q1-1); nsyms++; pos=q2+1;
   }
   datetime from=StringToTime(JStr(body,"history_from"));
+  uint jobTimeout=(uint)JInt(body,"job_timeout_ms",30000);
+  // strikes[k]: pairs on which candidate k timed out / never calculated / failed to load. After
+  // MAX_STRIKES it is skipped on the remaining pairs, so a broken indicator costs ~2 time limits.
+  #define MAX_STRIKES 2
+  int strikes[]; ArrayResize(strikes,njobs); ArrayInitialize(strikes,0);
   AppendResult("{\"info\":\"loaded\",\"jobs\":"+IntegerToString(njobs)+",\"symbols\":"+IntegerToString(nsyms)+",\"history_from\":\""+TimeToString(from,TIME_DATE)+"\"}");
   uint c0=GetTickCount();  // the session may still be logging in when the script starts
   while(!TerminalInfoInteger(TERMINAL_CONNECTED) && GetTickCount()-c0<60000) Sleep(250);
@@ -276,16 +310,12 @@ void OnStart(){
     int h_vol=iCustom(sym,PERIOD_D1,"Examples\\Volumes");
     int h_atr=iATR(sym,PERIOD_D1,14);
 
-    int handles[]; ArrayResize(handles,njobs);
-    for(int k=0;k<njobs;k++) handles[k]=iCustom(sym,PERIOD_D1,rels[k]);
-
-    // every indicator must have calculated EVERY bar (not just one) before its buffers are read
+    // the fixed backdrop must have calculated EVERY bar (not just one) before it is read
     int need=Bars(sym,PERIOD_D1);
     uint w0=GetTickCount();
     while(GetTickCount()-w0<60000){
-      bool ready=(BarsCalculated(h_ma)>=need && BarsCalculated(h_macd)>=need && BarsCalculated(h_rvi)>=need && BarsCalculated(h_mom)>=need && BarsCalculated(h_vol)>=need && BarsCalculated(h_atr)>=need);
-      for(int k=0;k<njobs;k++) if(handles[k]!=INVALID_HANDLE && BarsCalculated(handles[k])<need) ready=false;
-      if(ready) break;
+      if(BarsCalculated(h_ma)>=need && BarsCalculated(h_macd)>=need && BarsCalculated(h_rvi)>=need &&
+         BarsCalculated(h_mom)>=need && BarsCalculated(h_vol)>=need && BarsCalculated(h_atr)>=need) break;
       Sleep(100);
     }
 
@@ -296,18 +326,39 @@ void OnStart(){
     int gotMom=CopyBuffer(h_mom,0,0,total,mom);
     int gotVol=CopyBuffer(h_vol,0,0,total,vol);
 
-    double allA[]; ArrayResize(allA,njobs*total);
-    double allB[]; ArrayResize(allB,njobs*total);
+    // candidates ONE AT A TIME, each with its own time limit: MT5 calculates every indicator on a
+    // symbol in one queue, so loading them all together let one slow conversion (O(n^2) recalcs,
+    // a missing dependency) stall every other candidate on that symbol.
+    double allA[]; ArrayResize(allA,njobs*total); ArrayInitialize(allA,EMPTY_VALUE);
+    double allB[]; ArrayResize(allB,njobs*total); ArrayInitialize(allB,EMPTY_VALUE);
     for(int k=0;k<njobs;k++){
-      double a[]; ArraySetAsSeries(a,true);
-      int gotA = (handles[k]!=INVALID_HANDLE) ? CopyBuffer(handles[k],bufA[k],0,total,a) : -1;
-      for(int i=0;i<total;i++) allA[k*total+i]=(i<gotA)?a[i]:EMPTY_VALUE;
-      if(bufB[k]>=0){
-        double b[]; ArraySetAsSeries(b,true);
-        int gotB=(handles[k]!=INVALID_HANDLE) ? CopyBuffer(handles[k],bufB[k],0,total,b) : -1;
-        for(int i=0;i<total;i++) allB[k*total+i]=(i<gotB)?b[i]:EMPTY_VALUE;
+      string st="ok"; int calc=-1; uint j0=GetTickCount();
+      if(strikes[k]>=MAX_STRIKES) st="skipped_slow";
+      else{
+        int h=iCustom(sym,PERIOD_D1,rels[k]);
+        if(h==INVALID_HANDLE){ st="load_failed"; strikes[k]++; }
+        else{
+          while(true){
+            calc=BarsCalculated(h);
+            if(calc>=need || GetTickCount()-j0>=jobTimeout) break;
+            Sleep(50);
+          }
+          if(calc<need){ st=(calc<=0)?"never_calculated":"too_slow"; strikes[k]++; }
+          else{
+            double a[]; ArraySetAsSeries(a,true);
+            int gotA=CopyBuffer(h,bufA[k],0,total,a);
+            for(int i=0;i<total;i++) allA[k*total+i]=(i<gotA)?a[i]:EMPTY_VALUE;
+            if(bufB[k]>=0){
+              double b[]; ArraySetAsSeries(b,true);
+              int gotB=CopyBuffer(h,bufB[k],0,total,b);
+              for(int i=0;i<total;i++) allB[k*total+i]=(i<gotB)?b[i]:EMPTY_VALUE;
+            }
+          }
+          IndicatorRelease(h);
+        }
       }
-      AppendResult("{\"symbol\":\""+sym+"\",\"key\":\""+keys[k]+"\",\"handle\":"+(handles[k]==INVALID_HANDLE?"\"invalid\"":"\"ok\"")+"}");
+      AppendResult("{\"symbol\":\""+sym+"\",\"key\":\""+keys[k]+"\",\"job_status\":\""+st+"\",\"calculated\":"+
+                   IntegerToString(calc)+",\"ms\":"+IntegerToString(GetTickCount()-j0)+"}");
     }
 
     string outfile="nnfx_batch_extract_"+sym+".csv";
@@ -325,7 +376,6 @@ void OnStart(){
       FileWriteString(fh,line+"\r\n");
     }
     FileClose(fh);
-    for(int k=0;k<njobs;k++) IndicatorRelease(handles[k]);
     IndicatorRelease(h_ma); IndicatorRelease(h_macd); IndicatorRelease(h_rvi); IndicatorRelease(h_mom); IndicatorRelease(h_vol); IndicatorRelease(h_atr);
     AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"done\",\"rows\":"+IntegerToString(total)+
                  ",\"first\":\""+TimeToString(iTime(sym,PERIOD_D1,total-1),TIME_DATE)+"\",\"synced\":"+(synced?"true":"false")+
@@ -603,7 +653,8 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_fr
 
 # ---- run ----------------------------------------------------------------------
 
-def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=DEFAULT_HISTORY_FROM):
+def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=DEFAULT_HISTORY_FROM,
+        job_timeout=JOB_TIMEOUT_SECONDS):
     conn = connect(db)
     ensure_backtest_table(conn)
     items = candidacy_rows(conn, limit)
@@ -740,7 +791,8 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     # 4) write job list + controller, compile controller, launch ONE session
     job_json = {'jobs': [{'key': j['key'], 'rel': j['rel'], 'role': j['role'],
                            'buf_a': j['buf_a'], 'buf_b': j['buf_b'] if j['buf_b'] is not None else -1} for j in jobs],
-                'symbols': symbols, 'history_from': fetch_from(history_from)}
+                'symbols': symbols, 'history_from': fetch_from(history_from),
+                'job_timeout_ms': int(job_timeout * 1000)}
     # compact separators (no space after ':' or ','): the controller's hand-rolled
     # JInt() parser doesn't skip whitespace before a digit, so json.dumps's default
     # "key": 1 style silently made every int field parse back as its -1 default
@@ -762,8 +814,10 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     proc = pb.subprocess.Popen([str(terminal_exe), '/portable', f'/config:{cfg}'],
                                 cwd=str(rt), creationflags=pb.CREATE_NO_WINDOW, startupinfo=pb.startupinfo())
     try:
-        # + up to 2.5 min per symbol for the controller's history download/sync
-        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(jobs) * len(symbols) + 150 * len(symbols)))
+        # ceiling: ~20 s per candidate per pair, + 2 time limits per candidate (strikes), + up to
+        # 2.5 min per symbol for the controller's history download/sync
+        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(jobs) * len(symbols)
+                                                            + 2 * job_timeout * len(jobs) + 150 * len(symbols)))
     finally:
         pb.terminate_tree(proc)
     if not finished:
@@ -787,8 +841,9 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
 
     # 5) history depth per symbol: score only the symbols whose history synchronized and reaches
     #    the scoring start; report the rest (and every symbol's bars + oldest date) explicitly.
-    statuses = {r['symbol']: r for r in _read_jsonl(files_dir / 'nnfx_batch_results.jsonl')
-                if 'symbol' in r and 'status' in r}
+    results = _read_jsonl(files_dir / 'nnfx_batch_results.jsonl')
+    statuses = {r['symbol']: r for r in results if 'symbol' in r and 'status' in r}
+    failures = job_failures(results)
     stage_event('history_depth', history_from=history_from, fetch_from=fetch_from(history_from),
                 symbols={s: {k: statuses.get(s, {}).get(k) for k in ('status', 'rows', 'first', 'synced', 'server_first')}
                          for s in symbols})
@@ -817,6 +872,11 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
         try:
             col_a = j['key'] + '_a'
             col_b = j['key'] + '_b' if j['buf_b'] is not None else None
+            fails = {sym: st for sym, st in failures.get(j['key'], {}).items() if sym in symbols}
+            if fails:  # timed out / never calculated / failed to load on some pair: say so, don't score
+                write_status_row(conn, it, bed, 'EXTRACT_FAILED', failure_reason(fails))
+                emit({'type': 'item_error', 'filename': it['filename'], 'error': failure_reason(fails)})
+                continue
             bad = False
             bad_reason = ''
             for sym in symbols:
@@ -886,7 +946,7 @@ def write_score_row(conn, it, bed, r):
     conn.commit()
 
 LEADERBOARD_COLUMNS = (
-    'indicator', 'slot', 'trades', 'sufficient_sample', 'expectancy_r', 'expectancy_r_ci95', 'expectancy_r_low',
+    'indicator', 'slot', 'status', 'trades', 'sufficient_sample', 'expectancy_r', 'expectancy_r_ci95', 'expectancy_r_low',
     'expectancy_r_high', 'expectancy_pips', 'expectancy_pips_breaker', 'win_rate', 'profit_factor',
     'max_drawdown_pips', 'max_drawdown_pct', 'dd_breaker_skips', 'bridge_skips', 'continuation_trades',
     'volume_skips', 'news_skips', 'symbols_traded')
@@ -899,7 +959,9 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
     import csv as _csv
     out = Path(out)
     job_json = json.loads((out / 'nnfx_batch.json').read_text(encoding='utf-8'))
-    statuses = {r['symbol']: r for r in _read_jsonl(out / 'nnfx_batch_results.jsonl') if 'symbol' in r and 'status' in r}
+    results = _read_jsonl(out / 'nnfx_batch_results.jsonl')
+    statuses = {r['symbol']: r for r in results if 'symbol' in r and 'status' in r}
+    failures = job_failures(results)
     symbols = [s for s in job_json['symbols'] if (out / f'nnfx_batch_extract_{s}.csv').exists()]
     if statuses:
         symbols, dropped = usable_symbols(statuses, symbols, history_from)
@@ -912,10 +974,15 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
     conn.close()
     rows = []
     for j in job_json['jobs']:
+        fails = {sym: st for sym, st in failures.get(j['key'], {}).items() if sym in symbols}
+        if fails:  # listed with the reason, never scored on empty columns
+            rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'],
+                             status=failure_reason(fails), trades=0, sufficient_sample=False, expectancy_r=0.0))
+            continue
         col_b = j['key'] + '_b' if j['buf_b'] >= 0 else None
         r = score_candidate(symbol_data, symbols, j['role'], j['key'] + '_a', col_b, None, score_from=history_from)
         ci = r['expectancy_r_ci95']
-        rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], trades=r['trades'],
+        rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status='scored', trades=r['trades'],
                          sufficient_sample=r['trades'] >= min_trades, expectancy_r=r['expectancy_r'],
                          expectancy_r_ci95=ci,
                          expectancy_r_low=round(r['expectancy_r'] - ci, 4) if ci is not None else None,
@@ -928,7 +995,7 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
                          symbols_traded=sum(1 for n in r['per_symbol'].values() if n)))
     rows = leaderboard_order(rows, min_trades)
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        w = _csv.DictWriter(f, fieldnames=LEADERBOARD_COLUMNS)
+        w = _csv.DictWriter(f, fieldnames=LEADERBOARD_COLUMNS, restval='')
         w.writeheader()
         w.writerows(rows)
     emit({'type': 'rescore_complete', 'csv': str(csv_path), 'symbols': len(symbols), 'candidates': len(rows)})
@@ -945,6 +1012,8 @@ def main():
     p.add_argument('--force', action='store_true')
     p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM,
                    help='score trades from this date (YYYY.MM.DD); history is fetched ~6 months earlier for warm-up')
+    p.add_argument('--job-timeout', type=float, default=JOB_TIMEOUT_SECONDS,
+                   help='seconds a candidate may take to calculate on one pair before it is marked too_slow')
     p = sub.add_parser('rescore', help='re-score a saved extraction (no MT5) and write the leaderboard CSV')
     p.add_argument('--db', required=True); p.add_argument('--out', required=True); p.add_argument('--csv', required=True)
     p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM); p.add_argument('--min-trades', type=int, default=MIN_TRADES)
@@ -953,7 +1022,7 @@ def main():
         plan(args.db, args.limit)
     elif args.cmd == 'run':
         run(args.db, args.out, [s.strip() for s in args.bed_symbols.split(',') if s.strip()],
-            args.limit, args.min_trades, args.force, args.history_from)
+            args.limit, args.min_trades, args.force, args.history_from, args.job_timeout)
     elif args.cmd == 'rescore':
         rescore(args.db, args.out, args.csv, args.history_from, args.min_trades)
 

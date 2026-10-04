@@ -460,6 +460,16 @@ def unit_tests() -> Check:
                                 score_from='2024.03.01')['fingerprints']['EURUSD']
     out_win = nb.score_candidate({'EURUSD': {'rows': late_rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None,
                                  score_from='2024.04.01')['fingerprints']['EURUSD']
+    fails = nb.job_failures([
+        {'symbol': 'EURUSD', 'key': 'slow', 'job_status': 'too_slow'},
+        {'symbol': 'GBPUSD', 'key': 'slow', 'job_status': 'too_slow'},
+        {'symbol': 'USDJPY', 'key': 'slow', 'job_status': 'skipped_slow'},
+        {'symbol': 'AUDUSD', 'key': 'slow', 'job_status': 'skipped_slow'},
+        {'symbol': 'EURUSD', 'key': 'fine', 'job_status': 'ok'},
+        {'symbol': 'EURUSD', 'status': 'done', 'rows': 3182}])
+    c.that('Extraction failures: only candidates that failed somewhere are reported, with one readable reason',
+           set(fails) == {'slow'} and nb.failure_reason(fails['slow']) == 'too_slow on EURUSD,GBPUSD; skipped_slow on 2 more',
+           detail=str(fails))
     c.that('History: the scoring window starts at score_from -- bars before it are warm-up only (no records counted)',
            in_win[-1][1:] == ('enter', 'enter:standard') and out_win == (), detail=f'{in_win[-1:]} {out_win}')
 
