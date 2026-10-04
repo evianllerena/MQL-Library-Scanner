@@ -86,15 +86,30 @@ input double PipSize            = 0.0001;  // for the human-readable pips column
 input bool   EnableBridgeTooFar = true;
 input int    BridgeTooFarBars   = 7;     // >= this many bars with an unbroken C1 direction => SKIP
 input int    BridgeTooFarLookback = 60;  // hard cap on how far back to scan
+// E5 counting convention (user UNRESOLVED, so a SETTING): "before_cross" (default) counts C1's
+// unbroken run ENDING ON THE CANDLE BEFORE the baseline cross; "include_cross" counts through
+// the cross candle itself (pre-FIX-4 behavior). Mirrors NNFXParams.bridge_count_from.
+input string BridgeCountFrom    = "before_cross"; // or "include_cross"
+input bool   TwoLineC1          = true;  // bridge-too-far applies to a two-line C1 only
+
+// --- FIX 4 entry types (NNFX_RULESET_THE_TRUTH.txt SS4). Each a SETTING, default ON; turn one
+//     off to isolate it in the backtest. Mirrors nnfx_engine.py NNFXParams. ------------------
+input bool   EnableC1TriggerEntry = true; // E1: fresh C1 cross while already on-side (no bridge check)
+input bool   EnablePullbackEntry  = true; // E3: valid-but-beyond-1xATR setup enters on a pullback
+input bool   EnableOneCandleRule  = true; // E4: exactly one lagging confirmation gets ONE candle
 
 // --- continuation trades ---------------------------------------------
 input bool   EnableContinuation = true;
-// STUB (NNFX_RULESET_THE_TRUTH.txt SS12: "C2 ... full rules ... Implement these as
-// stubbed ... never guessed"): SS7 (continuation) names ONLY C1's fresh signal as the
-// trigger and explicitly lists exactly two ignored rules (1xATR-beyond-baseline, the
-// volume filter) -- it says nothing about C2 either way. Defaulting to true (require
-// C2) because NOT checking it would be inventing an unstated third exemption; set
-// false only once VP's exact wording on this is available, per SS12's own instruction.
+// E6 CONTINUATION trigger (Decision #6, user-confirmed 2026-10-04). Every mode ignores the
+// volume filter AND the 1xATR-beyond rule; money management is unchanged. Mirrors
+// NNFXParams.continuation_mode:
+//   "vp_c2"     (default): C2 flips back in the trade's direction AND C1 is currently on-side.
+//   "lesson11" : the exit indicator flips back to the trade's direction (needs an exit indicator).
+//   "c1_signal" (legacy, pre-FIX-5): a fresh C1 signal back in the direction, gated by
+//               RequireC2ForContinuation.
+input string ContinuationMode = "vp_c2"; // "vp_c2" | "lesson11" | "c1_signal"
+// Applies ONLY to ContinuationMode="c1_signal". SS12 stub: C2's role in the C1-signal
+// continuation was never defined; default requires C2 agreement.
 input bool   RequireC2ForContinuation = true;
 
 // --- X4 wrong-side-baseline exit (NNFX_RULESET_THE_TRUTH.txt SS5, label B) --
@@ -140,6 +155,17 @@ bool     g_continuationOK  = false; // true while the sequence is unbroken since
 int      g_lastExitDir     = 0;    // direction of the most recent exit (for continuation re-entry)
 int      g_lastC1DirSeen   = 0;    // updated UNCONDITIONALLY every closed bar (see OnNewDailyBar) so a
                                     // same-direction re-entry right after a flip-exit is still "fresh"
+int      g_lastC2DirSeen   = 0;    // FIX 5: previous C2 direction (fresh C2 flip back, vp_c2)
+int      g_lastExitIndDirSeen = 0; // FIX 5: previous exit-indicator direction (lesson11)
+
+// E3: a standard/E1 setup was valid but beyond 1xATR; remember its direction until price pulls
+// back in or agreement breaks. E4: exactly one confirmation lagged on the cross bar; remember the
+// direction + the bar counter so the grace is exactly ONE candle. g_barIndex is a monotonic
+// closed-bar counter (shift can't be used -- it is always 1 for the bar being decided).
+int      g_barIndex            = -1;
+int      g_pendingPullbackDir  = 0;
+int      g_pendingOneCandleDir = 0;
+int      g_pendingOneCandleBar = -1;
 
 // Position halves (hedging account required -- two independent tickets per symbol/direction)
 struct Half
@@ -384,6 +410,16 @@ int C1DirectionRunLength(int shift,int dir)
    return(count);
 }
 
+// E5. Two-line C1 ONLY (suppressed when TwoLineC1 is false). "before_cross" counts C1's unbroken
+// run ending on the candle BEFORE the cross (shift+1, one bar further back); a run >=
+// BridgeTooFarBars means C1 led the cross by too many candles -> skip. Mirrors _bridge_too_far().
+bool BridgeTooFar(int shift,int dir)
+{
+   if(!EnableBridgeTooFar || !TwoLineC1) return(false);
+   int from = (BridgeCountFrom=="before_cross") ? shift+1 : shift;
+   return(C1DirectionRunLength(from,dir)>=BridgeTooFarBars);
+}
+
 //====================================================================
 // TRADE LOG (auditable trade log per NNFX_BACKTESTER_BUILD_SPEC.txt Part A)
 //====================================================================
@@ -492,8 +528,9 @@ void CloseAllHalves(string reason)
    FinalizeTradeIfFlat(dir);
 }
 
-void OpenPosition(int dir,double atrVal,bool isContinuation)
+void OpenPosition(int dir,double atrVal,bool isContinuation,string reason="")
 {
+   if(reason=="") reason = isContinuation?"enter:continuation":"enter:standard";
    double price = dir>0 ? SymbolInfoDouble(_Symbol,SYMBOL_ASK) : SymbolInfoDouble(_Symbol,SYMBOL_BID);
    double slDist = SLmult*atrVal;
    double sl = dir>0 ? price-slDist : price+slDist;
@@ -512,8 +549,15 @@ void OpenPosition(int dir,double atrVal,bool isContinuation)
    g_entryPriceForLog=price; g_half1PipsSet=false; g_half2PipsSet=false; g_half1Pips=0; g_half2Pips=0;
    g_tradeIsContinuation=isContinuation;
 
-   LogTrade(isContinuation?"enter:continuation":"enter:standard",dir,totalLots,price,sl,tp1,atrVal,
-            isContinuation?"enter:continuation":"enter:standard");
+   LogTrade(reason,dir,totalLots,price,sl,tp1,atrVal,reason);
+}
+
+// Open a fresh (non-continuation) position and arm the continuation tracker. Shared by
+// E1/E2/E3/E4 -- all of them establish an "original entry" SS7 tracks from. Mirrors _open().
+void OpenFresh(int dir,double atrVal,string reason)
+{
+   g_trendDir=dir; g_continuationOK=true;
+   OpenPosition(dir, atrVal, false, reason);
 }
 
 double NormalizeLots(double lots)
@@ -571,6 +615,7 @@ void ManageOpenPosition(double atrVal)
 void OnNewDailyBar()
 {
    int shift=1; // last CLOSED bar; shift 0 is the still-forming bar, never read
+   g_barIndex++; // one per closed bar, like the engine's idx -- so E4's "next bar" is exactly +1
    double atrVal;
    if(!BufVal(h_atr,0,shift,atrVal) || atrVal<=0) return;
 
@@ -586,18 +631,27 @@ void OnNewDailyBar()
    int c2dir = C2Direction(shift);
    int crossDir = BaselineCrossClosed(shift);
    int side = BaselineSide(shift);
+   int exitdir = (h_exit!=INVALID_HANDLE) ? ExitDirection(shift) : 0;
+   // FIX 5: same capture-then-overwrite-every-bar discipline as g_lastC1DirSeen, so a fresh
+   // C2 / exit-indicator "flip back" is detected even on a bar an exit fires.
+   int prevC2 = g_lastC2DirSeen;
+   g_lastC2DirSeen = c2dir;
+   int prevExitInd = g_lastExitIndDirSeen;
+   g_lastExitIndDirSeen = exitdir;
 
    // --- X3 hard exit: whole position closes immediately on a C1 flip. ---------------
    if(g_posDir!=0 && c1dir!=0 && c1dir!=g_posDir)
    {
       g_lastExitDir=g_posDir;
       CloseAllHalves("exit:c1_flip");
+      // FIX 5 edge: a C1-flip exit bar that ALSO closed on the wrong side of the baseline
+      // resets the continuation sequence (mirrors the engine's reset on this exit path).
+      if(g_trendDir!=0 && side!=0 && side!=g_trendDir){ g_trendDir=0; g_continuationOK=false; }
    }
 
    // --- X2: exit indicator turned against the trade (vs its own zero_reference). -------
    if(g_posDir!=0 && EnableExitIndicator && h_exit!=INVALID_HANDLE)
    {
-      int exitdir = ExitDirection(shift);
       if(exitdir!=0 && exitdir!=g_posDir)
       {
          g_lastExitDir=g_posDir;
@@ -629,51 +683,125 @@ void OnNewDailyBar()
 
    if(g_posDir!=0) return; // already in a trade; nothing else to evaluate this bar
 
-   // --- CONTINUATION entry: fresh same-direction C1 signal, sequence unbroken since the
-   //     last exit. Ignores the 1xATR-beyond-baseline rule AND the volume filter. Money
-   //     management (ATR sizing, 1.5xATR SL, halves, trail) is UNCHANGED. -----------------
+   // --- CONTINUATION entry (E6): same direction as the last trade, sequence unbroken since
+   //     the original entry. EVERY mode ignores the 1xATR-beyond-baseline rule AND the volume
+   //     filter. Money management (ATR sizing, 1.5xATR SL, halves, trail) is UNCHANGED. The
+   //     trigger depends on ContinuationMode. ----------------------------------------------
    if(EnableContinuation && g_lastExitDir!=0 && g_continuationOK && g_trendDir==g_lastExitDir)
    {
-      bool freshC1Signal = (c1dir!=0 && c1dir!=prevC1DirSeen && c1dir==g_lastExitDir);
-      bool c2OkForContinuation = (!RequireC2ForContinuation) || (c2dir==g_lastExitDir);
-      if(freshC1Signal && c2OkForContinuation)
+      int d=g_lastExitDir;
+      bool trigger=false;
+      if(ContinuationMode=="vp_c2")
+         trigger = (c2dir==d && prevC2!=d && c1dir==d);
+      else if(ContinuationMode=="lesson11")
+         trigger = (exitdir==d && prevExitInd!=d);
+      else // "c1_signal" (legacy)
       {
-         OpenPosition(g_lastExitDir, atrVal, true);
+         bool freshC1Signal = (c1dir!=0 && c1dir!=prevC1DirSeen && c1dir==d);
+         bool c2OkForContinuation = (!RequireC2ForContinuation) || (c2dir==d);
+         trigger = freshC1Signal && c2OkForContinuation;
+      }
+      if(trigger)
+      {
+         OpenPosition(d, atrVal, true);
          g_lastExitDir=0; // consumed
          return;
       }
    }
 
-   // --- STANDARD baseline entry: ALL of baseline-cross, C1, C2, Volume must agree. --------
-   if(crossDir==0) return;
-   if(c1dir!=crossDir || c2dir!=crossDir) return;
-   if(!VolumePasses(shift,crossDir)) { LogTrade("skip",crossDir,0,0,0,0,atrVal,"skip:volume_filter"); return; }
-
-   // Pullback / 1xATR-beyond-baseline no-trade zone (standard entries only).
+   // --- shared entry conditions for this bar (1xATR-beyond-baseline zone; volume) ---------
    double baseNow; BufVal(h_baseline,g_baselineBuf,shift,baseNow);
    double closeNow = iClose(_Symbol,PERIOD_D1,shift);
-   if(MathAbs(closeNow-baseNow) > MinBeyondATR*atrVal)
+   bool withinATR = !(MathAbs(closeNow-baseNow) > MinBeyondATR*atrVal);
+
+   // --- E3 PULLBACK resolution: we already committed to waiting on a setup that was valid
+   //     but beyond 1xATR. Enter when price closes back WITHIN 1xATR with everything still
+   //     agreeing; drop it if agreement breaks; else keep waiting. -------------------------
+   if(g_pendingPullbackDir!=0)
    {
-      LogTrade("skip",crossDir,0,0,0,0,atrVal,"skip:beyond_1xATR");
-      return;
+      int d=g_pendingPullbackDir;
+      bool broke = (side==-d) || (c1dir!=0 && c1dir!=d) || (c2dir!=0 && c2dir!=d);
+      if(broke)
+         g_pendingPullbackDir=0;
+      else
+      {
+         if(withinATR && side==d && c1dir==d && c2dir==d && VolumePasses(shift,d) && !BridgeTooFar(shift,d))
+         {
+            g_pendingPullbackDir=0;
+            OpenFresh(d, atrVal, "enter:pullback");
+         }
+         return; // entered, or still on-side and agreeing but not yet back within 1xATR -> wait
+      }
    }
 
-   // Bridge-too-far: C1 ONLY, never C2 (C1 is two-line-cross by construction here).
-   if(EnableBridgeTooFar)
+   // --- E4 ONE-CANDLE resolution: exactly one input lagged on the PREVIOUS bar; the grace is
+   //     exactly one candle. Enter if the laggard has caught up AND price is still within
+   //     1xATR; otherwise the grace expires and this bar is evaluated fresh. ---------------
+   if(g_pendingOneCandleDir!=0)
    {
-      int run = C1DirectionRunLength(shift,crossDir);
-      if(run>=BridgeTooFarBars)
+      int d=g_pendingOneCandleDir;
+      bool isNextBar = (g_barIndex==g_pendingOneCandleBar+1);
+      g_pendingOneCandleDir=0; g_pendingOneCandleBar=-1;
+      if(isNextBar && withinATR && side==d && c1dir==d && c2dir==d && VolumePasses(shift,d) && !BridgeTooFar(shift,d))
       {
-         LogTrade("skip",crossDir,0,0,0,0,atrVal,"skip:bridge_too_far");
+         OpenFresh(d, atrVal, "enter:one_candle");
          return;
       }
    }
 
-   // THIS standard entry's own baseline cross is "the original entry" NNFX_RULESET_THE_TRUTH.txt SS7
-   // tracks from -- only a genuine standard entry may (re)arm a trackable sequence, never a bare
-   // cross with no trade behind it (see the reset comment above for why that distinction matters).
-   g_trendDir=crossDir; g_continuationOK=true;
-   OpenPosition(crossDir, atrVal, false);
+   // --- E2 STANDARD baseline entry (cross-triggered): baseline-cross + C1 + C2 + Volume +
+   //     within 1xATR + not bridge-too-far. A valid-but-too-far setup arms E3; a setup with
+   //     exactly ONE lagging confirmation arms E4. Only an actual entry (re)arms the
+   //     continuation sequence, never a bare cross (see the reset comment above). ---------
+   if(crossDir!=0)
+   {
+      bool c1ok = (c1dir==crossDir), c2ok = (c2dir==crossDir);
+      if(c1ok && c2ok)
+      {
+         if(!VolumePasses(shift,crossDir)) { LogTrade("skip",crossDir,0,0,0,0,atrVal,"skip:volume_filter"); return; }
+         if(!withinATR)
+         {
+            if(EnablePullbackEntry && !BridgeTooFar(shift,crossDir)) g_pendingPullbackDir=crossDir;
+            LogTrade("skip",crossDir,0,0,0,0,atrVal,"skip:beyond_1xATR");
+            return;
+         }
+         if(BridgeTooFar(shift,crossDir)) { LogTrade("skip",crossDir,0,0,0,0,atrVal,"skip:bridge_too_far"); return; }
+         OpenFresh(crossDir, atrVal, "enter:standard");
+         return;
+      }
+      // exactly one of C1/C2 lags on the cross bar -> one-candle grace (E4)
+      if(EnableOneCandleRule && withinATR && VolumePasses(shift,crossDir) && !BridgeTooFar(shift,crossDir))
+      {
+         int lagging = (c1ok?0:1) + (c2ok?0:1);
+         if(lagging==1)
+         {
+            g_pendingOneCandleDir=crossDir; g_pendingOneCandleBar=g_barIndex;
+            LogTrade("skip",crossDir,0,0,0,0,atrVal,"skip:one_candle_wait");
+         }
+      }
+      return;
+   }
+
+   // --- E1 C1-TRIGGERED entry (no fresh cross this bar): C1 FRESHLY crosses (it was on the
+   //     OPPOSITE side last bar) while price is ALREADY on the correct side, within 1xATR,
+   //     C2 + volume agree. Bridge-too-far is NOT applied to E1 (the cross already happened;
+   //     C1 is the trigger, so the "bridge" does not map). ---------------------------------
+   if(EnableC1TriggerEntry)
+   {
+      int d=c1dir;
+      bool freshC1 = (d!=0 && prevC1DirSeen==-d);
+      if(freshC1 && side==d && c2dir==d)
+      {
+         if(!VolumePasses(shift,d)) { LogTrade("skip",d,0,0,0,0,atrVal,"skip:volume_filter"); return; }
+         if(!withinATR)
+         {
+            if(EnablePullbackEntry) g_pendingPullbackDir=d;
+            LogTrade("skip",d,0,0,0,0,atrVal,"skip:beyond_1xATR");
+            return;
+         }
+         OpenFresh(d, atrVal, "enter:c1_trigger");
+      }
+   }
 }
 
 int ExitDirection(int shift)
