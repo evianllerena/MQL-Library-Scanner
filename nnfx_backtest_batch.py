@@ -177,6 +177,7 @@ void OnStart(){
     int h_macd=iCustom(sym,PERIOD_D1,"Examples\\MACD");
     int h_rvi=iCustom(sym,PERIOD_D1,"Examples\\RVI");
     int h_mom=iCustom(sym,PERIOD_D1,"Examples\\Momentum");
+    int h_vol=iCustom(sym,PERIOD_D1,"Examples\\Volumes");
     int h_atr=iATR(sym,PERIOD_D1,14);
 
     int handles[]; ArrayResize(handles,njobs);
@@ -184,17 +185,18 @@ void OnStart(){
 
     int waited=0;
     while(waited<20){
-      bool ready=(BarsCalculated(h_ma)>0 && BarsCalculated(h_macd)>0 && BarsCalculated(h_rvi)>0 && BarsCalculated(h_mom)>0 && BarsCalculated(h_atr)>0);
+      bool ready=(BarsCalculated(h_ma)>0 && BarsCalculated(h_macd)>0 && BarsCalculated(h_rvi)>0 && BarsCalculated(h_mom)>0 && BarsCalculated(h_vol)>0 && BarsCalculated(h_atr)>0);
       for(int k=0;k<njobs;k++) if(BarsCalculated(handles[k])<=0) ready=false;
       if(ready) break;
       Sleep(100); waited++;
     }
 
-    double ma[],macdM[],macdS[],rvi[],mom[],atr[];
-    ArraySetAsSeries(ma,true);ArraySetAsSeries(macdM,true);ArraySetAsSeries(macdS,true);ArraySetAsSeries(rvi,true);ArraySetAsSeries(mom,true);ArraySetAsSeries(atr,true);
+    double ma[],macdM[],macdS[],rvi[],mom[],vol[],atr[];
+    ArraySetAsSeries(ma,true);ArraySetAsSeries(macdM,true);ArraySetAsSeries(macdS,true);ArraySetAsSeries(rvi,true);ArraySetAsSeries(mom,true);ArraySetAsSeries(vol,true);ArraySetAsSeries(atr,true);
     CopyBuffer(h_ma,0,0,total,ma);CopyBuffer(h_macd,0,0,total,macdM);CopyBuffer(h_macd,1,0,total,macdS);
     CopyBuffer(h_rvi,0,0,total,rvi);CopyBuffer(h_atr,0,0,total,atr);
     int gotMom=CopyBuffer(h_mom,0,0,total,mom);
+    int gotVol=CopyBuffer(h_vol,0,0,total,vol);
 
     double allA[]; ArrayResize(allA,njobs*total);
     double allB[]; ArrayResize(allB,njobs*total);
@@ -213,20 +215,20 @@ void OnStart(){
     string outfile="nnfx_batch_extract_"+sym+".csv";
     int fh=FileOpen(outfile,FILE_WRITE|FILE_TXT|FILE_ANSI);
     if(fh==INVALID_HANDLE){ AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"cannot_open_output\"}"); continue; }
-    string header="date,close,high,low,ma,macd_m,macd_s,rvi,atr,mom";
+    string header="date,close,high,low,ma,macd_m,macd_s,rvi,atr,mom,vol";
     for(int k=0;k<njobs;k++){ header+=","+keys[k]+"_a"; if(bufB[k]>=0) header+=","+keys[k]+"_b"; }
     FileWriteString(fh,header+"\r\n");
     for(int i=total-1;i>=0;i--){
       datetime t=iTime(sym,PERIOD_D1,i);
       string line=TimeToString(t,TIME_DATE)+","+DoubleToString(iClose(sym,PERIOD_D1,i),8)+","+
                   DoubleToString(iHigh(sym,PERIOD_D1,i),8)+","+DoubleToString(iLow(sym,PERIOD_D1,i),8)+","+
-                  EV(ma[i])+","+EV(macdM[i])+","+EV(macdS[i])+","+EV(rvi[i])+","+EV(atr[i])+","+EV(i<gotMom?mom[i]:EMPTY_VALUE);
+                  EV(ma[i])+","+EV(macdM[i])+","+EV(macdS[i])+","+EV(rvi[i])+","+EV(atr[i])+","+EV(i<gotMom?mom[i]:EMPTY_VALUE)+","+EV(i<gotVol?vol[i]:EMPTY_VALUE);
       for(int k=0;k<njobs;k++){ line+=","+EV(allA[k*total+i]); if(bufB[k]>=0) line+=","+EV(allB[k*total+i]); }
       FileWriteString(fh,line+"\r\n");
     }
     FileClose(fh);
     for(int k=0;k<njobs;k++) IndicatorRelease(handles[k]);
-    IndicatorRelease(h_ma); IndicatorRelease(h_macd); IndicatorRelease(h_rvi); IndicatorRelease(h_mom); IndicatorRelease(h_atr);
+    IndicatorRelease(h_ma); IndicatorRelease(h_macd); IndicatorRelease(h_rvi); IndicatorRelease(h_mom); IndicatorRelease(h_vol); IndicatorRelease(h_atr);
     AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"done\",\"rows\":"+IntegerToString(total)+"}");
   }
   int f=FileOpen("nnfx_batch_done.flag",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
@@ -350,36 +352,49 @@ def rolling_avg(vals, window=20):
     return out
 
 REF_EXIT_ZERO_REFERENCE = 100.0  # Examples\Momentum = close/close[n]*100, so its centre line is 100
+VOLUME_AVG_PERIOD = 20           # SS7 V2: pass = today's reading >= its own 20-bar average (same line)
 
 def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
     per_symbol = {}
     pooled_trades = []
-    bridge_skips = continuation_trades = 0
+    bridge_skips = continuation_trades = volume_skips = 0
     fingerprints = {}
     for sym in symbols:
         d = symbol_data[sym]
         rows = d['rows']
         cand_a = [fnum(r[col_a]) for r in rows]
         cand_b = [fnum(r[col_b]) for r in rows] if col_b else None
-        vol_avg = rolling_avg(cand_a, 20) if role == 'VOLUME' else None
+        vol_avg = rolling_avg(cand_a, VOLUME_AVG_PERIOD) if role == 'VOLUME' else None
+        # G9: every non-VOLUME candidate is filtered by the SAME reference volume indicator
+        # (Examples\Volumes, tick volume, column "vol"), value and average from that one line.
+        # A pre-FIX-3 extract has no "vol" column: keep the old always-pass so it scores as before.
+        has_ref_vol = bool(rows) and 'vol' in rows[0]
+        ref_vol = [fnum(r['vol']) for r in rows] if has_ref_vol else None
+        ref_vol_avg = rolling_avg(ref_vol, VOLUME_AVG_PERIOD) if has_ref_vol else None
 
         eng = NNFXEngine(NNFXParams(pip_size=0.01 if 'JPY' in sym else 0.0001))
         records = []
         prev_close = prev_baseline = None
         for i, r in enumerate(rows):
             atrv = fnum(r['atr'])
+            if not has_ref_vol:
+                volv, volavg = 1.0, 0.5
+            elif ref_vol[i] is not None and ref_vol_avg[i] is not None:
+                volv, volavg = ref_vol[i], ref_vol_avg[i]
+            else:
+                # No 20-bar average yet (warm-up) or no reading: the filter cannot pass, but the
+                # bar still goes through the engine so C1 history/bridge-too-far stay intact.
+                # (Dropping the bar instead shortened C1's run and let a bridge-too-far trade in.)
+                volv, volavg = 0.0, 1.0
             if role == 'CONFIRMATION_1':
                 c1f, c1s = cand_a[i], (cand_b[i] if cand_b else None)
                 c2v = fnum(r['rvi']); base = fnum(r['ma']); c2z = 0.0
-                volv, volavg = 1.0, 0.5
             elif role == 'CONFIRMATION_2':
                 c1f, c1s = fnum(r['macd_m']), fnum(r['macd_s'])
                 c2v = cand_a[i]; base = fnum(r['ma']); c2z = zero_ref if zero_ref is not None else 0.0
-                volv, volavg = 1.0, 0.5
             elif role == 'BASELINE':
                 c1f, c1s = fnum(r['macd_m']), fnum(r['macd_s'])
                 c2v = fnum(r['rvi']); base = cand_a[i]; c2z = 0.0
-                volv, volavg = 1.0, 0.5
             else:  # VOLUME
                 c1f, c1s = fnum(r['macd_m']), fnum(r['macd_s'])
                 c2v = fnum(r['rvi']); base = fnum(r['ma']); c2z = 0.0
@@ -405,6 +420,7 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
         window = [r for r in records if r['date'][:4] >= '2019']
         bridge_skips += sum(1 for r in window if r['reason'] == 'skip:bridge_too_far')
         continuation_trades += sum(1 for r in window if r['reason'] == 'enter:continuation')
+        volume_skips += sum(1 for r in window if r['reason'] == 'skip:volume_filter')
         trades = []
         pending_half1 = None
         for r in window:
@@ -430,7 +446,8 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
         equity += t; peak = max(peak, equity); maxdd = min(maxdd, equity - peak)
     return dict(trades=n, wins=wins, losses=losses, win_rate=win_rate, expectancy_pips=expectancy,
                 profit_factor=profit_factor, max_drawdown=round(maxdd, 1), bridge_skips=bridge_skips,
-                continuation_trades=continuation_trades, per_symbol=per_symbol, fingerprints=fingerprints)
+                continuation_trades=continuation_trades, volume_skips=volume_skips,
+                per_symbol=per_symbol, fingerprints=fingerprints)
 
 # ---- run ----------------------------------------------------------------------
 

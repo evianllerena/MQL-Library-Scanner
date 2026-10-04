@@ -366,7 +366,8 @@ bool VolumePasses(int shift,int dir)
 {
    double v;
    if(!BufVal(h_volume,g_volumeBuf,shift,v)) return(false);
-   double avg=AvgBuffer(h_volume,0,shift,VolumeAvgPeriod);
+   // G10: the average must come from the SAME configured line as today's value (was buffer 0).
+   double avg=AvgBuffer(h_volume,g_volumeBuf,shift,VolumeAvgPeriod);
    return(v >= avg*VolumeThresholdMult);
 }
 

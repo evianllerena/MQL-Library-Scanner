@@ -371,6 +371,54 @@ def unit_tests() -> Check:
     c.that('X2 dormant: with no exit indicator on the bars, results equal the feature switched off',
            actions(P(), no_exit_bars) == actions(P(enable_exit_indicator=False), no_exit_bars))
 
+    # --- FIX 3 / G9: the batch scorer filters NON-volume candidates with the reference volume
+    #     indicator (column "vol"), value and 20-bar average from that same line. Uses the real
+    #     nnfx_backtest_batch.score_candidate on synthetic extract rows (Baseline candidate). ---
+    import nnfx_backtest_batch as nb
+
+    def batch_rows(vol_at_cross, with_vol=True):
+        rows = []
+        for i in range(22):
+            cross = i == 21
+            close = 100.6 if cross else 99.5
+            row = dict(date=f'2024.03.{i + 1:02d}', close=str(close), high=str(close + 0.05), low=str(close - 0.05),
+                       ma='100.0', macd_m='1.0' if i >= 19 else '0.9', macd_s='0.95',   # C1 long for 3 bars only
+                       rvi='0.2' if cross else '-0.1', atr='1.0', cand_a='100.0')       # C2 long on the cross bar
+            if with_vol:
+                row['vol'] = str(vol_at_cross if cross else 100.0)
+            rows.append(row)
+        return rows
+
+    def cross_bar_reason(rows):
+        res = nb.score_candidate({'EURUSD': {'rows': rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)
+        return res['fingerprints']['EURUSD'][-1], res
+
+    fp_fail, res_fail = cross_bar_reason(batch_rows(50.0))    # 50 < 20-bar avg 97.5
+    c.that('G9 wiring: a Baseline candidate\'s otherwise-valid entry (cross + C1 + C2, within 1xATR) is SKIPPED '
+           'when the reference volume is below its own 20-bar average',
+           fp_fail[1:] == ('skip', 'skip:volume_filter') and res_fail['volume_skips'] == 1, detail=str(fp_fail))
+    fp_pass, _ = cross_bar_reason(batch_rows(200.0))          # 200 >= 20-bar avg 105
+    c.that('G9 wiring: the same entry is TAKEN when the reference volume is at/above its 20-bar average',
+           fp_pass[1:] == ('enter', 'enter:standard'), detail=str(fp_pass))
+    fp_legacy, _ = cross_bar_reason(batch_rows(50.0, with_vol=False))
+    c.that('G9 wiring: a pre-FIX-3 extract (no "vol" column) keeps the old always-pass and enters',
+           fp_legacy[1:] == ('enter', 'enter:standard'), detail=str(fp_legacy))
+    # Warm-up: bars before the 20-bar volume average exists must still reach the engine (they
+    # fail the filter), so C1 history is unbroken. Here C1 is long for all 22 bars -> at the
+    # cross C1 has run 22 bars -> bridge-too-far must still skip. Dropping warm-up bars would
+    # leave only 3 bars of C1 history and wrongly let the trade through.
+    long_c1 = batch_rows(200.0)
+    for row in long_c1:
+        row['macd_m'] = '1.0'
+    fp_warm, _ = cross_bar_reason(long_c1)
+    c.that('G9 warm-up: bars without a volume average still feed C1 history -- a long C1 run is still '
+           'skipped as bridge-too-far, not let through by a truncated history',
+           fp_warm[1:] == ('skip', 'skip:bridge_too_far'), detail=str(fp_warm))
+
+    avg = nb.rolling_avg([float(r['vol']) for r in batch_rows(50.0)], nb.VOLUME_AVG_PERIOD)[-1]
+    c.that('G10: today\'s value and its average come from the same line -- the cross-bar average (97.5) is the '
+           '20-bar mean of the vol column itself', abs(avg - 97.5) < 1e-9, detail=str(avg))
+
     return c
 
 
@@ -491,6 +539,18 @@ def build_traces(out_dir: Path) -> list[Path]:
         return out
     paths.append(write_trace(out_dir, 'trace_8_x2_exit_indicator.csv', x2_trace_bars(True), P()))
     paths.append(write_trace(out_dir, 'trace_9_x2_no_exit_indicator_control.csv', x2_trace_bars(False), P()))
+
+    # Trace 10 (FIX 3, volume filter): two fresh long baseline crosses where baseline, C1 and
+    # C2 all agree and price is within 1xATR. On 09-03 the reference volume (80) is below its
+    # own 20-bar average (100) -> skip:volume_filter. Price drops back below, then on 09-05 the
+    # same setup crosses again with volume 130 >= average 101.5 -> enter:standard.
+    bars = [
+        _bar('2024-09-02', 99.5, 100.0, 0.9, 1.0, -1.0, 100.0, close_prev=99.6, volume_avg=100.0),             # below baseline, C1 short
+        _bar('2024-09-03', 100.6, 100.0, 1.0, 0.9, 5.0, 80.0, close_prev=99.5, volume_avg=100.0),              # cross+C1+C2 agree, VOLUME FAILS
+        _bar('2024-09-04', 99.6, 100.0, 1.0, 0.9, 5.0, 90.0, close_prev=100.6, high=100.7, low=99.5, volume_avg=99.5),  # back below: no entry
+        _bar('2024-09-05', 100.5, 100.0, 1.0, 0.9, 5.0, 130.0, close_prev=99.6, volume_avg=101.5),             # same setup, VOLUME PASSES
+    ]
+    paths.append(write_trace(out_dir, 'trace_10_volume_filter_skip_then_take.csv', bars, P()))
 
     return paths
 
