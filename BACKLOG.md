@@ -7,3 +7,8 @@
   position and then fall through to the entry logic. `nnfx_engine.py` returns on every exit bar,
   so it never does. The harness is reference-only, so this does not affect the leaderboard.
   Align during Fix 8.
+
+- **Drawdown breaker scope (MQL5 harness only).** In `nnfx_engine.py` the R1 breaker and
+  `max_drawdown_pct` use ONE account across every symbol, in date order (`run_lockstep`). The
+  harness runs one symbol per Strategy Tester pass, so its breaker only sees that symbol's
+  balance. Reference-only; does not affect the leaderboard.
