@@ -239,7 +239,10 @@ def unit_tests() -> Check:
            'afterward', rW6['action'] == 'enter' and rW6['reason'] == 'enter:continuation', detail=str(rW6))
 
     # --- exits: SL=1.5xATR, TP1=1.0xATR/half, breakeven+trail, hard-exit-on-flip --
-    eng3 = NNFXEngine(P(sl_mult=1.5, tp1_mult=1.0))
+    # NOTE (FIX 6): pinned to trail_activate_atr=0 (trail right after TP1). The trail bar below
+    # closes only 1.9xATR beyond entry, which under the T4 default (2xATR activation) correctly
+    # stays at breakeven -- the T4 gate itself is tested in the FIX 6 block further down.
+    eng3 = NNFXEngine(P(sl_mult=1.5, tp1_mult=1.0, trail_activate_atr=0.0))
     entry = eng3.process_bar(_bar('2024-05-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))
     c.that('exits: standard entry recorded so SL/TP1 can be checked against it', entry['action'] == 'enter', detail=str(entry))
     pos_entry_price = eng3.position.entry_price if eng3.position else None
@@ -567,7 +570,63 @@ def unit_tests() -> Check:
     c.that('E6 edge: that wrong-side C1-flip exit resets the sequence -> the next C2-flip-back does NOT continuation-enter',
            r_edge3['reason'] != 'enter:continuation', detail=str(r_edge3))
 
+    # --- FIX 6 / T4 trailing activation at 2xATR beyond entry (trail 1.5xATR, per candle) ---
+    # Long: entry 100.6 (ATR 1.0 -> SL 99.1, TP1 101.6). C1 long, price above the baseline and no
+    # exit indicator throughout, so only the stop management is under test.
+    def sl_path(params, bars):
+        e = NNFXEngine(params)
+        out = []
+        for b in bars:
+            e.process_bar(b)
+            out.append(round(e.position.sl, 4) if e.position else None)
+        return out
+    t4_long = t4_long_bars()
+    sl_l = sl_path(P(), t4_long)
+    c.that('T4 not-fire: after TP1, a close only 1.8xATR beyond entry leaves the runner at BREAKEVEN (no trail yet)',
+           sl_l[1] == 100.6 and sl_l[2] == 100.6, detail=str(sl_l))
+    c.that('T4 fires: the first close >= 2xATR beyond entry (102.7) starts the trail 1.5xATR behind it (101.2)',
+           sl_l[3] == 101.2, detail=str(sl_l))
+    c.that('T4 never backward: a pullback close (102.5, now under 2xATR again) does not loosen the stop -- it stays 101.2',
+           sl_l[4] == 101.2, detail=str(sl_l))
+    c.that('T4 per candle: the next higher close (103.5) ratchets the stop up to 102.0', sl_l[5] == 102.0, detail=str(sl_l))
+    sl_s = sl_path(P(), t4_short_bars())
+    c.that('T4 mirrors for shorts: breakeven 99.4 holds at 1.8xATR, trail starts at 98.8 on the 2.1xATR close, '
+           'never loosens on the pullback', sl_s[1:5] == [99.4, 99.4, 98.8, 98.8], detail=str(sl_s))
+    sl_old = sl_path(P(trail_activate_atr=0.0), t4_long)
+    c.that('T4 regression knob: trail_activate_atr=0 trails right after TP1 (pre-FIX-6) -- the 1.8xATR close already '
+           'moves the stop to 100.9', sl_old[2] == 100.9, detail=str(sl_old))
+    wide_atr = [dict(b) for b in t4_long]
+    wide_atr[3]['atr'] = 2.0  # the activation bar's own (live) ATR doubles
+    c.that('T4 reference ATR: the default measures 2xATR / 1.5xATR with atr_at_entry, so a jump in the live ATR on the '
+           'activation bar changes nothing (stop 101.2)', sl_path(P(), wide_atr)[3] == 101.2)
+    c.that('T4 reference ATR: trail_atr_ref=\'live\' uses the bar\'s own ATR -- 2.1 beyond entry is under 2x2.0, so no trail yet',
+           sl_path(P(trail_atr_ref='live'), wide_atr)[3] == 100.6)
+
     return c
+
+
+def t4_long_bars():
+    """FIX 6 fixture: long entry 100.6 (ATR 1.0), TP1 hit, a close between TP1 and 2xATR, the
+    activating close, a pullback close, a further higher close. Shared by the tests and trace 17."""
+    return [
+        _bar('2025-03-03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                          # standard long entry
+        _bar('2025-03-04', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=101.65, low=100.9),  # TP1 101.6 hit -> BE 100.6
+        _bar('2025-03-05', 102.4, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=101.5, high=102.5, low=101.4),   # 1.8xATR beyond: stays BE
+        _bar('2025-03-06', 102.7, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=102.4, high=102.8, low=102.3),   # 2.1xATR: trail -> 101.2
+        _bar('2025-03-07', 102.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=102.7, high=102.7, low=102.2),   # pullback: stays 101.2
+        _bar('2025-03-10', 103.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=102.5, high=103.6, low=102.5),   # higher close: -> 102.0
+    ]
+
+
+def t4_short_bars():
+    """FIX 6 fixture, short mirror: entry 99.4 (SL 100.9, TP1 98.4)."""
+    return [
+        _bar('2025-03-03', 99.4, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5),                       # standard short entry
+        _bar('2025-03-04', 98.5, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=99.4, high=99.1, low=98.35),   # TP1 98.4 hit -> BE 99.4
+        _bar('2025-03-05', 97.6, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=98.5, high=98.6, low=97.5),    # 1.8xATR: stays BE
+        _bar('2025-03-06', 97.3, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=97.6, high=97.7, low=97.2),    # 2.1xATR: trail -> 98.8
+        _bar('2025-03-07', 97.5, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=97.3, high=97.8, low=97.3),    # pullback: stays 98.8
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +817,12 @@ def build_traces(out_dir: Path) -> list[Path]:
         {**_bar('2025-02-03', 105.0, 100.0, 1.0, 0.9, 5.0, 0.1, close_prev=100.5, high=105.1, low=100.5), 'exit_value': 105.0, 'exit_zero_reference': 100.0},  # exit-ind flips back long -> continuation
     ]
     paths.append(write_trace(out_dir, 'trace_16_lesson11_continuation.csv', bars, P(continuation_mode='lesson11')))
+
+    # Trace 17 (FIX 6, T4): long entry -> TP1 hit (runner to breakeven 100.6) -> a close 1.8xATR
+    # beyond entry (still breakeven, no trail) -> a close 2.1xATR beyond (trail starts at 101.2) ->
+    # a pullback close (stop stays 101.2, never backward) -> a higher close (stop ratchets to 102.0).
+    # Read the sl_after column.
+    paths.append(write_trace(out_dir, 'trace_17_t4_trail_activation.csv', t4_long_bars(), P()))
 
     return paths
 

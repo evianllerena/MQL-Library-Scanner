@@ -75,6 +75,13 @@ input double VolumeThresholdMult = 1.0;
 // --- money management (ATR is FIXED -- never the thing under test) --
 input int    ATRPeriod          = 14;
 input double SLmult             = 1.5;
+// --- T4 trailing (FIX 6; mirrors NNFXParams trail_*): after TP1 the runner sits at breakeven
+//     until a candle CLOSES TrailActivateATR x ATR beyond entry; then it trails TrailDistanceATR x
+//     ATR behind each close, once per candle, never backward. TrailActivateATR=0 = pre-FIX-6.
+input double TrailActivateATR   = 2.0;
+input double TrailDistanceATR   = 1.5;
+input string TrailStep          = "per_candle"; // the only step: trailing runs once per closed bar
+input string TrailATRRef        = "entry";      // "entry" = ATR at entry (default) | "live" = closed bar's ATR
 input double TP1mult            = 1.0;
 input double RiskPct            = 1.0;
 input double MinBeyondATR       = 1.0;
@@ -181,6 +188,8 @@ int  g_posDir = 0; // +1 long, -1 short, 0 flat
 // blended per-lot pip result of the whole trade is the simple average of each half's own
 // pip result -- reported once, when BOTH halves are finally flat.
 double g_entryPriceForLog = 0.0;
+double g_atrAtEntry = 0.0;   // FIX 6: T4 reference ATR (TrailATRRef="entry")
+bool   g_trailActive = false; // FIX 6: sticky once a close reached TrailActivateATR beyond entry
 bool   g_half1PipsSet = false, g_half2PipsSet = false;
 double g_half1Pips = 0.0, g_half2Pips = 0.0;
 bool   g_tradeIsContinuation = false;
@@ -546,6 +555,7 @@ void OpenPosition(int dir,double atrVal,bool isContinuation,string reason="")
    if(ok1){ g_half1.ticket=trade.ResultOrder(); g_half1.open=true; g_half1.tp1Hit=false; }
    if(ok2){ g_half2.ticket=trade.ResultOrder(); g_half2.open=true; g_half2.tp1Hit=false; }
    g_posDir=dir;
+   g_atrAtEntry=atrVal; g_trailActive=false;
    g_entryPriceForLog=price; g_half1PipsSet=false; g_half2PipsSet=false; g_half1Pips=0; g_half2Pips=0;
    g_tradeIsContinuation=isContinuation;
 
@@ -566,11 +576,12 @@ double NormalizeLots(double lots)
    return(MathFloor(lots/step)*step);
 }
 
-// Half #1 TP1 hit -> move half #2's stop to breakeven, then trail. Called every tick so the
-// trail keeps up; the ENTRY decision itself only runs once per closed daily bar. Also detects
-// EITHER half closing on its own (broker-side TP/SL fill, not a call from this EA) so g_posDir
-// never gets stuck non-zero after a natural stop-out.
-void ManageOpenPosition(double atrVal)
+// Half #1 TP1 hit -> move half #2's stop to breakeven. Called every tick so breakeven and
+// broker-side fills are picked up promptly; the T4 trail itself only moves on a newly closed
+// daily bar (newBar), read off that bar's close, like the engine. Also detects EITHER half
+// closing on its own (broker-side TP/SL fill, not a call from this EA) so g_posDir never gets
+// stuck non-zero after a natural stop-out.
+void ManageOpenPosition(double atrVal,bool newBar)
 {
    if(g_posDir==0) return;
    int dir=g_posDir;
@@ -588,12 +599,19 @@ void ManageOpenPosition(double atrVal)
       if(entryPrice>0)
          trade.PositionModify(g_half2.ticket, entryPrice, posInfo.TakeProfit());
    }
-   if(g_half2.open && posInfo.SelectByTicket(g_half2.ticket) && g_half1.tp1Hit)
+   if(newBar && g_half2.open && posInfo.SelectByTicket(g_half2.ticket) && g_half1.tp1Hit)
    {
-      double newSL = g_posDir>0 ? SymbolInfoDouble(_Symbol,SYMBOL_BID)-SLmult*atrVal
-                                 : SymbolInfoDouble(_Symbol,SYMBOL_ASK)+SLmult*atrVal;
-      bool improves = g_posDir>0 ? newSL>posInfo.StopLoss() : newSL<posInfo.StopLoss();
-      if(improves) trade.PositionModify(g_half2.ticket, newSL, posInfo.TakeProfit());
+      // T4: activation is sticky once a close reaches TrailActivateATR beyond entry.
+      double refATR = (TrailATRRef=="entry") ? g_atrAtEntry : atrVal;
+      double closeNow = iClose(_Symbol,PERIOD_D1,1);
+      if(!g_trailActive)
+         g_trailActive = TrailActivateATR<=0 || (closeNow-g_entryPriceForLog)*g_posDir >= TrailActivateATR*refATR;
+      if(g_trailActive)
+      {
+         double newSL = g_posDir>0 ? closeNow-TrailDistanceATR*refATR : closeNow+TrailDistanceATR*refATR;
+         bool improves = g_posDir>0 ? newSL>posInfo.StopLoss() : newSL<posInfo.StopLoss();
+         if(improves) trade.PositionModify(g_half2.ticket, newSL, posInfo.TakeProfit());
+      }
    }
    if(g_half2.open && !posInfo.SelectByTicket(g_half2.ticket))
    {
@@ -822,10 +840,11 @@ int ExitDirection(int shift)
 void OnTick()
 {
    double atrVal;
-   if(BufVal(h_atr,0,1,atrVal)) ManageOpenPosition(atrVal); // trail runs every tick
-
    datetime t0 = iTime(_Symbol,PERIOD_D1,0);
-   if(t0==g_lastBarTime) return; // only act once, on the bar that just closed
+   bool newBar = (t0!=g_lastBarTime);
+   if(BufVal(h_atr,0,1,atrVal)) ManageOpenPosition(atrVal,newBar); // fills every tick; T4 trail on newBar only
+
+   if(!newBar) return; // only act once, on the bar that just closed
    g_lastBarTime=t0;
 
    OnNewDailyBar();

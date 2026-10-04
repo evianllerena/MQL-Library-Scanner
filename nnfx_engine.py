@@ -112,12 +112,23 @@ class Position:
     half2_open: bool = True
     tp1_hit: bool = False
     is_continuation: bool = False
+    trail_active: bool = False  # FIX 6: sticky once a close has reached trail_activate_atr beyond entry
 
 
 @dataclass
 class NNFXParams:
     sl_mult: float = 1.5
     tp1_mult: float = 1.0
+    # T4 TRAILING (MASTER_HANDOFF T4, label B, USER-ACCEPTED Decision #1). After TP1 the runner
+    # (half 2) sits at breakeven; trailing switches ON only once a candle has CLOSED at least
+    # trail_activate_atr x ATR beyond entry, then follows trail_distance_atr x ATR behind each
+    # close, once per candle, never backward. trail_activate_atr=0 reproduces the pre-FIX-6
+    # "trail right after TP1". trail_atr_ref picks the ATR both distances use: 'entry' (default,
+    # atr_at_entry -- flagged for user confirm) or 'live' (the bar's own ATR, pre-FIX-6 behavior).
+    trail_activate_atr: float = 2.0
+    trail_distance_atr: float = 1.5
+    trail_step: str = 'per_candle'  # the only step: the engine decides once per closed bar
+    trail_atr_ref: str = 'entry'
     min_beyond_atr: float = 1.0
     enable_bridge_too_far: bool = True
     bridge_too_far_bars: int = 7
@@ -306,12 +317,19 @@ class NNFXEngine:
                     half_pips = self._pips(pos.entry_price, pos.tp1, pos.direction)
                     record.update({'action': 'exit_half', 'reason': 'exit:tp1_half', 'pips': round(half_pips, 1)})
 
-            # breakeven+trail on the remaining half once TP1 has been hit
+            # T4: after TP1 the runner sits at breakeven until a close reaches trail_activate_atr
+            # beyond entry; from then on (sticky) it trails trail_distance_atr behind each close,
+            # never backward.
             if pos.tp1_hit and pos.half2_open:
-                trail = bar['close'] - p.sl_mult * bar['atr'] if pos.direction > 0 else bar['close'] + p.sl_mult * bar['atr']
-                improves = trail > pos.sl if pos.direction > 0 else trail < pos.sl
-                if improves:
-                    pos.sl = trail
+                ref_atr = pos.atr_at_entry if p.trail_atr_ref == 'entry' else bar['atr']
+                if not pos.trail_active:
+                    beyond = (bar['close'] - pos.entry_price) * pos.direction
+                    pos.trail_active = p.trail_activate_atr <= 0 or beyond >= p.trail_activate_atr * ref_atr
+                if pos.trail_active:
+                    trail = bar['close'] - p.trail_distance_atr * ref_atr if pos.direction > 0 else bar['close'] + p.trail_distance_atr * ref_atr
+                    improves = trail > pos.sl if pos.direction > 0 else trail < pos.sl
+                    if improves:
+                        pos.sl = trail
 
             # hard exit: whole remaining position closes immediately on a C1 flip
             if pos.half2_open and c1dir != 0 and c1dir != pos.direction:
