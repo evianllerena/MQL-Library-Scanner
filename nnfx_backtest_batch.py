@@ -46,6 +46,15 @@ def emit(o):
 def stage_event(name, **kw):
     emit({'type': 'stage', 'stage': name, **kw})
 
+# The NNFX basket: the 28 pairs from the 8 majors (USD/EUR/GBP/JPY/AUD/NZD/CAD/CHF). Widening the
+# bed from 3 to 28 pairs multiplies the trade sample ~9x with the history already on hand -- the
+# main lever for a trustworthy ranking. Symbols the broker doesn't offer are skipped automatically
+# (symbol_select_failed). Override with --bed-symbols for a quick subset.
+DEFAULT_NNFX_BASKET = ('EURUSD,GBPUSD,AUDUSD,NZDUSD,USDCAD,USDCHF,USDJPY,'
+                       'EURGBP,EURAUD,EURNZD,EURCAD,EURCHF,EURJPY,'
+                       'GBPAUD,GBPNZD,GBPCAD,GBPCHF,GBPJPY,'
+                       'AUDNZD,AUDCAD,AUDCHF,AUDJPY,NZDCAD,NZDCHF,NZDJPY,CADCHF,CADJPY,CHFJPY')
+
 # ---- DB ----------------------------------------------------------------------
 
 def connect(db):
@@ -757,7 +766,7 @@ def main():
     p = sub.add_parser('plan'); p.add_argument('--db', required=True); p.add_argument('--limit', type=int)
     p = sub.add_parser('run')
     p.add_argument('--db', required=True); p.add_argument('--out', required=True)
-    p.add_argument('--bed-symbols', default='EURUSD,GBPUSD,USDJPY')
+    p.add_argument('--bed-symbols', default=DEFAULT_NNFX_BASKET)
     p.add_argument('--limit', type=int); p.add_argument('--min-trades', type=int, default=30)
     p.add_argument('--force', action='store_true')
     args = ap.parse_args()
