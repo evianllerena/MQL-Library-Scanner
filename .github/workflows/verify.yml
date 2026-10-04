@@ -1,0 +1,29 @@
+name: Verify NNFX engine (Part C self-test)
+# Fast, Python-only gate. Runs on EVERY branch push and PR so the engine is auto-verified
+# without anyone starting CI by hand. Exit code is non-zero unless all Part C checks AND
+# both VP golden cases pass (nnfx_selftest.py returns 0 iff everything passed).
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'nnfx_engine.py'
+      - 'nnfx_selftest.py'
+      - 'nnfx_backtest_batch.py'
+  pull_request:
+    paths:
+      - 'nnfx_engine.py'
+      - 'nnfx_selftest.py'
+      - 'nnfx_backtest_batch.py'
+  workflow_dispatch:
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Byte-compile
+        run: python -m py_compile nnfx_engine.py nnfx_selftest.py nnfx_backtest_batch.py
+      - name: Part C self-test (fails unless ALL checks + both golden cases pass)
+        run: python nnfx_selftest.py
