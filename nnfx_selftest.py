@@ -134,7 +134,7 @@ def unit_tests() -> Check:
     # --- continuation: fresh same-direction C1 signal after an exit, sequence
     #     unbroken since -> ENTERS even beyond 1xATR and even with volume failing.
     #     A close on the opposite baseline side blocks it. -----------------------
-    eng = NNFXEngine(P(enable_continuation=True, min_beyond_atr=1.0))  # require_c2_for_continuation defaults True (see NNFXParams)
+    eng = NNFXEngine(P(enable_continuation=True, min_beyond_atr=1.0, continuation_mode='c1_signal'))  # legacy trigger; require_c2 defaults True
     r1 = eng.process_bar(_bar('2024-03-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))       # standard long entry
     r2 = eng.process_bar(_bar('2024-03-02', 100.5, 100.0, 0.9, 1.0, -1.0, 1.0, close_prev=100.6,
                                high=100.55, low=100.45))                                                 # C1 flip -> hard exit
@@ -146,9 +146,10 @@ def unit_tests() -> Check:
     c.that('continuation: fresh same-direction C1 signal (with C2 agreeing) ENTERS despite >1xATR-beyond-baseline '
            'and a failing volume reading', r3['action'] == 'enter' and r3['reason'] == 'enter:continuation', detail=str(r3))
 
-    # --- STUB behavior, explicit and testable both ways (NNFX_RULESET_THE_TRUTH.txt SS12:
-    #     C2's role in continuation is NOT YET DEFINED; default is to require it) ----------
-    eng_c2gate_default = NNFXEngine(P(enable_continuation=True))  # require_c2_for_continuation=True (default)
+    # --- LEGACY c1_signal mode: require_c2_for_continuation behavior, testable both ways. This
+    #     gating only applies to continuation_mode='c1_signal' (the pre-FIX-5 trigger); the FIX-5
+    #     default is 'vp_c2', tested separately below. --------------------------------------------
+    eng_c2gate_default = NNFXEngine(P(enable_continuation=True, continuation_mode='c1_signal'))  # require_c2 defaults True
     eng_c2gate_default.process_bar(_bar('2024-03-10', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))
     eng_c2gate_default.process_bar(_bar('2024-03-11', 100.5, 100.0, 0.9, 1.0, -1.0, 1.0, close_prev=100.6,
                                          high=100.55, low=100.45))
@@ -157,7 +158,7 @@ def unit_tests() -> Check:
     c.that('continuation STUB (default, require_c2_for_continuation=True): a fresh C1 signal is NOT enough on its '
            'own if C2 disagrees -- continuation is blocked', r_c2_blocks['action'] != 'enter', detail=str(r_c2_blocks))
 
-    eng_c2gate_off = NNFXEngine(P(enable_continuation=True, require_c2_for_continuation=False))
+    eng_c2gate_off = NNFXEngine(P(enable_continuation=True, continuation_mode='c1_signal', require_c2_for_continuation=False))
     eng_c2gate_off.process_bar(_bar('2024-03-20', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))
     eng_c2gate_off.process_bar(_bar('2024-03-21', 100.5, 100.0, 0.9, 1.0, -1.0, 1.0, close_prev=100.6,
                                      high=100.55, low=100.45))
@@ -512,6 +513,60 @@ def unit_tests() -> Check:
     c.that('E5 two-line-only: with two_line_c1=False a 10-bar C1 run does NOT bridge-skip (zero-cross C1 exempt)',
            bridge_run(10, two_line_c1=False)['reason'] == 'enter:standard')
 
+    # --- FIX 5 / E6 CONTINUATION modes (Decision #6, user-confirmed default = vp_c2) ------
+    def exitbar(*a, exval=None, exzero=100.0, **kw):
+        b = _bar(*a, **kw)
+        if exval is not None:
+            b['exit_value'] = exval; b['exit_zero_reference'] = exzero
+        return b
+
+    # vp_c2 (DEFAULT): enter long, exit via the exit indicator (C1 stays long, price stays above
+    # the baseline so the sequence is unbroken), C2 flips short on the exit bar, then C2 flips
+    # BACK to long with C1 on-side -> continuation, even though price is >1xATR away and volume fails.
+    def vp_seq(b3_c1f=1.0, b3_c1s=0.9, b3_c2=5.0, b3_close=105.0, extra_mid=None):
+        e = NNFXEngine(P())  # default continuation_mode='vp_c2'
+        e.process_bar(_bar('v1', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))                       # std long entry
+        e.process_bar(exitbar('v2', 100.5, 100.0, 1.0, 0.9, -5.0, 10.0, close_prev=100.6, high=100.6, low=100.4, exval=95.0))  # X2 exit; C2 -> short
+        if extra_mid is not None:
+            e.process_bar(extra_mid)
+        return e.process_bar(_bar('v3', b3_close, 100.0, b3_c1f, b3_c1s, b3_c2, 0.1, close_prev=100.5, high=b3_close + 0.1, low=min(100.5, b3_close)))
+    c.that('E6 vp_c2 fires: after an exit (sequence unbroken), C2 flips back to the trade direction with C1 '
+           'on-side -> enter:continuation, ignoring >1xATR and a failing volume reading',
+           vp_seq()['reason'] == 'enter:continuation', detail=str(vp_seq()))
+    c.that('E6 vp_c2 not-fire: C2 flips back but C1 is NOT on-side (c1 against) -> no continuation',
+           vp_seq(b3_c1f=0.9, b3_c1s=1.0)['reason'] != 'enter:continuation')
+    c.that('E6 vp_c2 not-fire: C1 on-side but C2 did NOT flip back (still short) -> no continuation',
+           vp_seq(b3_c2=-5.0)['action'] != 'enter')
+    # baseline crossed since entry (a mid bar closes below the baseline) -> continuation_ok reset -> no vp_c2
+    midreset = _bar('vmid', 99.4, 100.0, 1.0, 0.9, -5.0, 10.0, close_prev=100.5, high=100.5, low=99.3)
+    c.that('E6 vp_c2 not-fire: price closed on the wrong side of the baseline since entry -> sequence reset, no continuation',
+           vp_seq(extra_mid=midreset)['reason'] != 'enter:continuation')
+
+    # lesson11: the exit indicator doubles as the continuation signal. Enter long, exit-indicator
+    # flips short (X2 exit), then exit-indicator flips BACK long -> continuation. A C2 flip alone
+    # must NOT trigger it (that's vp_c2's job).
+    def l11_seq(b3_exval=105.0, b3_c2=5.0):
+        e = NNFXEngine(P(continuation_mode='lesson11'))
+        e.process_bar(exitbar('p1', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5, exval=105.0))       # entry; exit-ind long
+        e.process_bar(exitbar('p2', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.6, low=100.4, exval=95.0))  # exit-ind flips short -> X2 exit
+        return e.process_bar(exitbar('p3', 105.0, 100.0, 1.0, 0.9, b3_c2, 0.1, close_prev=100.5, high=105.1, low=100.5, exval=b3_exval))
+    c.that('E6 lesson11 fires: the exit indicator flips back to the trade direction -> enter:continuation',
+           l11_seq()['reason'] == 'enter:continuation', detail=str(l11_seq()))
+    c.that('E6 lesson11 not-fire: the exit indicator does NOT flip back (even with C2 flipping back) -> no continuation '
+           '(lesson11 keys off the exit indicator, not C2)', l11_seq(b3_exval=95.0, b3_c2=5.0)['reason'] != 'enter:continuation')
+
+    # Edge (FIX 5): a C1-flip exit on a bar that ALSO closes on the wrong side of the baseline must
+    # reset the continuation sequence (this exit path returns before the normal reset). Without the
+    # fix, the next bar's C2-flip-back would wrongly fire a continuation; with it, the sequence is
+    # dead and only a genuine fresh entry can open a position.
+    e_edge = NNFXEngine(P())
+    e_edge.process_bar(_bar('g1', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))                       # entry long
+    r_edge2 = e_edge.process_bar(_bar('g2', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.6, high=100.6, low=99.4))  # C1 flip AND close below baseline
+    r_edge3 = e_edge.process_bar(_bar('g3', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5, high=100.6, low=100.4))   # C2 back long, C1 on-side, above
+    c.that('E6 edge: a C1-flip exit that also closed on the wrong side exits on the flip', r_edge2['reason'] == 'exit:c1_flip')
+    c.that('E6 edge: that wrong-side C1-flip exit resets the sequence -> the next C2-flip-back does NOT continuation-enter',
+           r_edge3['reason'] != 'enter:continuation', detail=str(r_edge3))
+
     return c
 
 
@@ -562,9 +617,10 @@ def build_traces(out_dir: Path) -> list[Path]:
     bars.append(_bar('2024-08-07', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.0))
     paths.append(write_trace(out_dir, 'trace_3_bridge_ok_take.csv', bars, P()))
 
-    # Trace 4: standard entry -> C1-flip exit -> continuation re-entry (ignoring
-    # 1xATR + volume) -> a close on the opposite baseline side resets the
-    # sequence -> the same "fresh" long C1 signal no longer continuation-enters.
+    # Trace 4 (LEGACY c1_signal mode): standard entry -> C1-flip exit -> continuation re-entry on a
+    # fresh C1 signal (ignoring 1xATR + volume) -> a close on the opposite baseline side resets the
+    # sequence -> the same "fresh" long C1 signal no longer continuation-enters. Pinned to the legacy
+    # trigger; the FIX-5 default (vp_c2) is shown in trace_15.
     bars = [
         _bar('2024-09-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),
         _bar('2024-09-02', 100.5, 100.0, 0.9, 1.0, -1.0, 1.0, close_prev=100.6, high=100.55, low=100.45),
@@ -573,7 +629,7 @@ def build_traces(out_dir: Path) -> list[Path]:
         _bar('2024-09-05', 98.0, 100.0, 0.85, 0.9, 5.0, 1.0, close_prev=104.5, high=104.5, low=97.9),     # closes below baseline -> resets
         _bar('2024-09-06', 97.5, 100.0, 1.0, 0.9, 5.0, 1.0, close_prev=98.0, high=97.6, low=97.4),        # "fresh" long C1 -- BLOCKED now
     ]
-    paths.append(write_trace(out_dir, 'trace_4_continuation_then_reset.csv', bars, P()))
+    paths.append(write_trace(out_dir, 'trace_4_continuation_then_reset.csv', bars, P(continuation_mode='c1_signal')))
 
     # Trace 5: volume-filter skip, then a pullback (>1xATR) skip, then a valid entry once
     # price pulls back. Each bar's close_prev is set independently (not chained to the
@@ -681,6 +737,27 @@ def build_traces(out_dir: Path) -> list[Path]:
     bars = [_bar(f'2024-12-{i+1:02d}', 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5) for i in range(6)]
     bars.append(_bar('2024-12-07', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))   # the cross bar -> enter
     paths.append(write_trace(out_dir, 'trace_14_e5_before_cross_enters.csv', bars, P()))
+
+    # Trace 15 (FIX 5, DEFAULT vp_c2 continuation): long entry; the exit indicator flips against ->
+    # X2 exit (C1 stays long, price stays above the baseline, so the sequence is unbroken; C2 flips
+    # short on that bar); then C2 flips BACK to long with C1 on-side -> enter:continuation, even
+    # though price is >1xATR from the baseline and volume fails (both ignored for continuation).
+    bars = [
+        _bar('2025-01-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),
+        {**_bar('2025-01-02', 100.5, 100.0, 1.0, 0.9, -5.0, 10.0, close_prev=100.6, high=100.6, low=100.4),
+         'exit_value': 95.0, 'exit_zero_reference': 100.0},   # exit indicator against -> X2 exit; C2 -> short
+        _bar('2025-01-03', 105.0, 100.0, 1.0, 0.9, 5.0, 0.1, close_prev=100.5, high=105.1, low=100.5),  # C2 flips back, C1 on-side -> continuation
+    ]
+    paths.append(write_trace(out_dir, 'trace_15_vp_c2_continuation.csv', bars, P()))
+
+    # Trace 16 (FIX 5, lesson11 continuation): same shape, but the trigger is the exit indicator
+    # itself flipping back to the trade direction (it doubles as the continuation signal).
+    bars = [
+        {**_bar('2025-02-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5), 'exit_value': 105.0, 'exit_zero_reference': 100.0},
+        {**_bar('2025-02-02', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.6, low=100.4), 'exit_value': 95.0, 'exit_zero_reference': 100.0},  # exit-ind flips short -> X2 exit
+        {**_bar('2025-02-03', 105.0, 100.0, 1.0, 0.9, 5.0, 0.1, close_prev=100.5, high=105.1, low=100.5), 'exit_value': 105.0, 'exit_zero_reference': 100.0},  # exit-ind flips back long -> continuation
+    ]
+    paths.append(write_trace(out_dir, 'trace_16_lesson11_continuation.csv', bars, P(continuation_mode='lesson11')))
 
     return paths
 

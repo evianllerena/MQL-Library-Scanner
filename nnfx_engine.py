@@ -153,13 +153,21 @@ class NNFXParams:
     #   Default ON, FLAGGED for user confirm.
     enable_one_candle_rule: bool = True
     enable_continuation: bool = True
-    # STUB (NNFX_RULESET_THE_TRUTH.txt SS12: "C2 ... full rules ... Implement
-    # these as stubbed ... never guessed"): SS7 (continuation) names ONLY C1's
-    # fresh signal as the trigger and explicitly lists exactly two rules that
-    # are ignored (1xATR-beyond-baseline, the volume filter) -- it says nothing
-    # about C2 either way. Defaulting to True (require C2) because NOT checking
-    # it would be inventing an unstated third exemption; set False only once
-    # VP's exact wording on this is available, per SS12's own instruction.
+    # E6 CONTINUATION trigger (Decision #6, USER-CONFIRMED 2026-10-04). Re-enter the same
+    # direction after an exit, provided price has NOT closed on the wrong side of the baseline
+    # since the original entry (continuation_ok). ALL modes IGNORE the volume filter AND the
+    # 1xATR-beyond rule (Decision #7); money management is unchanged.
+    #   'vp_c2'     (DEFAULT, VP per videos; user-confirmed): C2 flips back in the trade's
+    #               direction AND C1 is currently on-side (c1dir == direction). This reproduces
+    #               VP's transcript-2 continuation (GOLDEN CASE 2), where C2 flips back to the
+    #               trade side and C1 is back on-side on the re-entry bar.
+    #   'lesson11': the exit indicator doubles as the continuation signal -- re-enter when it
+    #               flips back to the trade's direction (needs an exit indicator supplied).
+    #   'c1_signal' (LEGACY, pre-FIX-5): a FRESH C1 signal back in the direction, gated by
+    #               require_c2_for_continuation. Kept as a setting for comparison.
+    continuation_mode: str = 'vp_c2'
+    # Applies ONLY to continuation_mode='c1_signal' (the legacy trigger). SS12 stub: C2's role
+    # in the C1-signal continuation was never defined; default requires C2 agreement.
     require_c2_for_continuation: bool = True
     # X4 (NNFX_RULESET_THE_TRUTH.txt SS5, label B, Decision 2): a close on the
     # wrong side of the baseline closes what is left. False = pre-FIX-1 behavior.
@@ -185,6 +193,8 @@ class NNFXEngine:
     continuation_ok: bool = False
     last_exit_dir: int = 0
     last_c1_dir_seen: int = 0
+    last_c2_dir_seen: int = 0          # FIX 5: to detect a fresh C2 flip back (vp_c2 continuation)
+    last_exit_ind_dir_seen: int = 0    # FIX 5: to detect a fresh exit-indicator flip (lesson11)
     c1_history: list = field(default_factory=list)  # list of (fast, slow), grows every bar
     realized_pips: float = 0.0
     # E3: a standard setup was valid but beyond 1xATR; remember its direction until price
@@ -258,6 +268,13 @@ class NNFXEngine:
         side = baseline_side(bar['close'], bar['baseline'])
         exit_value = bar.get('exit_value')
         exitdir = exit_direction(exit_value, bar['exit_zero_reference']) if exit_value is not None else 0
+        # FIX 5: capture previous C2 / exit-indicator direction BEFORE overwriting (same
+        # unconditional-every-bar discipline as prev_c1_dir) so a fresh "flip back" is
+        # detected correctly even on the bar an exit above returns early.
+        prev_c2_dir = self.last_c2_dir_seen
+        self.last_c2_dir_seen = c2dir
+        prev_exit_ind_dir = self.last_exit_ind_dir_seen
+        self.last_exit_ind_dir_seen = exitdir
 
         record = {
             'date': bar['date'], 'baseline': bar['baseline'],
@@ -307,6 +324,10 @@ class NNFXEngine:
                 if record['action'] == 'exit_half':
                     rec['pips'] = round((record['pips'] + rec['pips']) / 2.0, 1)
                 record.update(rec)
+                # FIX 5 edge: if this C1-flip exit bar ALSO closed on the wrong side of the
+                # baseline, reset the continuation sequence here too (this path returns before the
+                # continuation bookkeeping below, which otherwise would have applied the reset).
+                self._reset_continuation_if_wrong_side(side)
                 return record
 
             # X2: exit indicator turned against the trade (read vs its own zero_reference).
@@ -345,17 +366,28 @@ class NNFXEngine:
         if self.position is not None:
             return record  # already in a trade; nothing else to evaluate this bar
 
-        # --- CONTINUATION entry: ignores the 1xATR-beyond rule AND the volume
-        #     filter; money management is unchanged (NNFX_RULESET_THE_TRUTH.txt SS7) --
+        # --- CONTINUATION entry (E6, Decision #6/#7): same direction as the last trade, with the
+        #     sequence unbroken since the original entry (continuation_ok). EVERY mode ignores the
+        #     1xATR-beyond rule AND the volume filter; money management is unchanged. The trigger
+        #     depends on continuation_mode (see NNFXParams). --------------------------------------
         if p.enable_continuation and self.last_exit_dir != 0 and self.continuation_ok and self.trend_dir == self.last_exit_dir:
-            fresh_c1_signal = (c1dir != 0 and c1dir != prev_c1_dir and c1dir == self.last_exit_dir)
-            c2_ok = (not p.require_c2_for_continuation) or (c2dir == self.last_exit_dir)
-            if fresh_c1_signal and c2_ok:
+            d = self.last_exit_dir
+            if p.continuation_mode == 'vp_c2':
+                # VP (default, user-confirmed): C2 flips back to d AND C1 is currently on-side.
+                trigger = (c2dir == d and prev_c2_dir != d and c1dir == d)
+            elif p.continuation_mode == 'lesson11':
+                # Lesson-11: the exit indicator doubles as the continuation signal (flips back to d).
+                trigger = (exitdir == d and prev_exit_ind_dir != d)
+            else:  # 'c1_signal' (legacy): a fresh C1 signal back in d, gated by require_c2.
+                fresh_c1_signal = (c1dir != 0 and c1dir != prev_c1_dir and c1dir == d)
+                c2_ok = (not p.require_c2_for_continuation) or (c2dir == d)
+                trigger = fresh_c1_signal and c2_ok
+            if trigger:
                 entry = bar['close']
-                sl = entry - p.sl_mult * bar['atr'] if self.last_exit_dir > 0 else entry + p.sl_mult * bar['atr']
-                tp1 = entry + p.tp1_mult * bar['atr'] if self.last_exit_dir > 0 else entry - p.tp1_mult * bar['atr']
-                self.position = Position(self.last_exit_dir, entry, sl, tp1, bar['atr'], is_continuation=True)
-                record.update({'action': 'enter', 'reason': 'enter:continuation', 'direction': self.last_exit_dir})
+                sl = entry - p.sl_mult * bar['atr'] if d > 0 else entry + p.sl_mult * bar['atr']
+                tp1 = entry + p.tp1_mult * bar['atr'] if d > 0 else entry - p.tp1_mult * bar['atr']
+                self.position = Position(d, entry, sl, tp1, bar['atr'], is_continuation=True)
+                record.update({'action': 'enter', 'reason': 'enter:continuation', 'direction': d})
                 self.last_exit_dir = 0
                 return record
 

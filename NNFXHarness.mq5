@@ -100,12 +100,16 @@ input bool   EnableOneCandleRule  = true; // E4: exactly one lagging confirmatio
 
 // --- continuation trades ---------------------------------------------
 input bool   EnableContinuation = true;
-// STUB (NNFX_RULESET_THE_TRUTH.txt SS12: "C2 ... full rules ... Implement these as
-// stubbed ... never guessed"): SS7 (continuation) names ONLY C1's fresh signal as the
-// trigger and explicitly lists exactly two ignored rules (1xATR-beyond-baseline, the
-// volume filter) -- it says nothing about C2 either way. Defaulting to true (require
-// C2) because NOT checking it would be inventing an unstated third exemption; set
-// false only once VP's exact wording on this is available, per SS12's own instruction.
+// E6 CONTINUATION trigger (Decision #6, user-confirmed 2026-10-04). Every mode ignores the
+// volume filter AND the 1xATR-beyond rule; money management is unchanged. Mirrors
+// NNFXParams.continuation_mode:
+//   "vp_c2"     (default): C2 flips back in the trade's direction AND C1 is currently on-side.
+//   "lesson11" : the exit indicator flips back to the trade's direction (needs an exit indicator).
+//   "c1_signal" (legacy, pre-FIX-5): a fresh C1 signal back in the direction, gated by
+//               RequireC2ForContinuation.
+input string ContinuationMode = "vp_c2"; // "vp_c2" | "lesson11" | "c1_signal"
+// Applies ONLY to ContinuationMode="c1_signal". SS12 stub: C2's role in the C1-signal
+// continuation was never defined; default requires C2 agreement.
 input bool   RequireC2ForContinuation = true;
 
 // --- X4 wrong-side-baseline exit (NNFX_RULESET_THE_TRUTH.txt SS5, label B) --
@@ -151,6 +155,8 @@ bool     g_continuationOK  = false; // true while the sequence is unbroken since
 int      g_lastExitDir     = 0;    // direction of the most recent exit (for continuation re-entry)
 int      g_lastC1DirSeen   = 0;    // updated UNCONDITIONALLY every closed bar (see OnNewDailyBar) so a
                                     // same-direction re-entry right after a flip-exit is still "fresh"
+int      g_lastC2DirSeen   = 0;    // FIX 5: previous C2 direction (fresh C2 flip back, vp_c2)
+int      g_lastExitIndDirSeen = 0; // FIX 5: previous exit-indicator direction (lesson11)
 
 // E3: a standard/E1 setup was valid but beyond 1xATR; remember its direction until price pulls
 // back in or agreement breaks. E4: exactly one confirmation lagged on the cross bar; remember the
@@ -625,18 +631,27 @@ void OnNewDailyBar()
    int c2dir = C2Direction(shift);
    int crossDir = BaselineCrossClosed(shift);
    int side = BaselineSide(shift);
+   int exitdir = (h_exit!=INVALID_HANDLE) ? ExitDirection(shift) : 0;
+   // FIX 5: same capture-then-overwrite-every-bar discipline as g_lastC1DirSeen, so a fresh
+   // C2 / exit-indicator "flip back" is detected even on a bar an exit fires.
+   int prevC2 = g_lastC2DirSeen;
+   g_lastC2DirSeen = c2dir;
+   int prevExitInd = g_lastExitIndDirSeen;
+   g_lastExitIndDirSeen = exitdir;
 
    // --- X3 hard exit: whole position closes immediately on a C1 flip. ---------------
    if(g_posDir!=0 && c1dir!=0 && c1dir!=g_posDir)
    {
       g_lastExitDir=g_posDir;
       CloseAllHalves("exit:c1_flip");
+      // FIX 5 edge: a C1-flip exit bar that ALSO closed on the wrong side of the baseline
+      // resets the continuation sequence (mirrors the engine's reset on this exit path).
+      if(g_trendDir!=0 && side!=0 && side!=g_trendDir){ g_trendDir=0; g_continuationOK=false; }
    }
 
    // --- X2: exit indicator turned against the trade (vs its own zero_reference). -------
    if(g_posDir!=0 && EnableExitIndicator && h_exit!=INVALID_HANDLE)
    {
-      int exitdir = ExitDirection(shift);
       if(exitdir!=0 && exitdir!=g_posDir)
       {
          g_lastExitDir=g_posDir;
@@ -668,16 +683,27 @@ void OnNewDailyBar()
 
    if(g_posDir!=0) return; // already in a trade; nothing else to evaluate this bar
 
-   // --- CONTINUATION entry: fresh same-direction C1 signal, sequence unbroken since the
-   //     last exit. Ignores the 1xATR-beyond-baseline rule AND the volume filter. Money
-   //     management (ATR sizing, 1.5xATR SL, halves, trail) is UNCHANGED. -----------------
+   // --- CONTINUATION entry (E6): same direction as the last trade, sequence unbroken since
+   //     the original entry. EVERY mode ignores the 1xATR-beyond-baseline rule AND the volume
+   //     filter. Money management (ATR sizing, 1.5xATR SL, halves, trail) is UNCHANGED. The
+   //     trigger depends on ContinuationMode. ----------------------------------------------
    if(EnableContinuation && g_lastExitDir!=0 && g_continuationOK && g_trendDir==g_lastExitDir)
    {
-      bool freshC1Signal = (c1dir!=0 && c1dir!=prevC1DirSeen && c1dir==g_lastExitDir);
-      bool c2OkForContinuation = (!RequireC2ForContinuation) || (c2dir==g_lastExitDir);
-      if(freshC1Signal && c2OkForContinuation)
+      int d=g_lastExitDir;
+      bool trigger=false;
+      if(ContinuationMode=="vp_c2")
+         trigger = (c2dir==d && prevC2!=d && c1dir==d);
+      else if(ContinuationMode=="lesson11")
+         trigger = (exitdir==d && prevExitInd!=d);
+      else // "c1_signal" (legacy)
       {
-         OpenPosition(g_lastExitDir, atrVal, true);
+         bool freshC1Signal = (c1dir!=0 && c1dir!=prevC1DirSeen && c1dir==d);
+         bool c2OkForContinuation = (!RequireC2ForContinuation) || (c2dir==d);
+         trigger = freshC1Signal && c2OkForContinuation;
+      }
+      if(trigger)
+      {
+         OpenPosition(d, atrVal, true);
          g_lastExitDir=0; // consumed
          return;
       }
