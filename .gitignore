@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.ex5
+nnfx_selftest_output/
