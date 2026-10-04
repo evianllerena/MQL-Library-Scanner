@@ -1,6 +1,19 @@
 NNFX_RULESET_THE_TRUTH.txt -- CANONICAL NNFX RULESET FOR THE BACKTESTER
 Repo: evianllerena/MQL-Library-Scanner     Branch: nnfx-rulebook-sync
-Version: 2.0 (Phase A, 2026-10-03)  STATUS: DRAFT -- AWAITING USER APPROVAL
+Version: 3.0 (2026-10-04)  STATUS: IMPLEMENTED -- Fixes 1-8 live on main
+==============================================================================
+
+IMPLEMENTATION STATUS (2026-10-04) -- live status is tracked in PROGRESS.md
+  All eight fixes are built, verified (Part C self-test + VP golden cases, run in CI on every
+  push via .github/workflows/verify.yml), and on main:
+    FIX 1 X4 wrong-side-baseline exit        FIX 5 continuation E6 (vp_c2 default)
+    FIX 2 X2 exit indicator (own zero_ref)   FIX 6 trailing T4 (2xATR activation)
+    FIX 3 volume filter (G9/G10)             FIX 7 news N1/X5 (dormant) + 2% risk
+    FIX 4 entries E1/E3/E4 + bridge          FIX 7b drawdown R1 (metric + breaker)
+  USER-CONFIRMED decisions (2026-10-04): bridge count = before_cross; continuation = vp_c2
+  (C2 flips back + C1 on-side); X5 cutoff = losing or profit < 1xATR; trailing ref = ATR-at-entry;
+  ranking runs the drawdown breaker OFF and reports both expectancies (max_drawdown_pct = risk column).
+  STILL STUB-TO-CONFIRM: E4 scope (implemented C1-or-C2 symmetric); dd_resume_rule (below_threshold).
 ==============================================================================
 
 This file is the single source of truth for WHICH trading rules the NNFX
@@ -167,12 +180,10 @@ E5 (B, counting unclear) BRIDGE TOO FAR: skip if C1's signal began 7 or
                                                      charts
    Settings: enable_bridge_too_far = True, bridge_too_far_bars = 7,
              bridge_count_from = 'before_cross'
-   >>> DECISION 5 IS STILL UNTICKED -- user to confirm count + convention.
-   >>> DISCREPANCY TO CONFIRM: [MH] says the default "counted back from
-       the candle BEFORE the cross" is "already implemented". It is not:
-       today's engine counts the unbroken C1 run INCLUDING the cross candle
-       (c1_direction_run_length(..., idx=cross bar)). That skips one candle
-       earlier than [MH]'s convention. FIX 4 adds bridge_count_from with
+   >>> DECISION 5 RESOLVED (USER-CONFIRMED 2026-10-04): count = before_cross, 7 bars, two-line C1
+       only. A C1 run of 6 before the cross enters; 7 skips. Implemented and live (FIX 4).
+   >>> (historical note) [MH] had said before_cross was "already implemented"; it was not --
+       the pre-FIX-4 engine counted INCLUDING the cross candle. FIX 4 added bridge_count_from with
        values 'before_cross' ([MH] default) and 'including_cross' (today's
        behavior), so the change is visible in the numbers.
 
@@ -316,11 +327,9 @@ X5 (A + U) CLOSE BEFORE NEWS: if in an open trade on a pair with such an
                                                      Src: Forex News Trading
                                                      (VP); user-confirmed
                                                      Status: DORMANT (FIX 7)
-   >>> CHANGE vs [NEWS]: [NEWS] stubbed the cutoff as "close if TP1 not yet
-       hit, STUB-TO-CONFIRM". [MH] supersedes it with VP's sourced cutoff
-       (label A): exit if losing or profit < 1xATR. [NEWS]'s stub is
-       retired. Profit is measured on the decision bar's close vs entry,
-       in ATR-at-entry units.
+   >>> CUTOFF RESOLVED (USER-CONFIRMED 2026-10-04): exit if losing or profit < 1xATR (label A);
+       [NEWS]'s "not past TP1" stub is retired but kept selectable as x5_cutoff='not_past_tp1'.
+       Profit is measured on the decision bar's close vs entry, in ATR-at-entry units.
 
    Settings: enable_news_filter = False, news_calendar_path = None,
              news_window_hours = 24, x5_min_profit_atr = 1.0
