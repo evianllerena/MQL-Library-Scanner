@@ -83,7 +83,7 @@ input double TrailDistanceATR   = 1.5;
 input string TrailStep          = "per_candle"; // the only step: trailing runs once per closed bar
 input string TrailATRRef        = "entry";      // "entry" = ATR at entry (default) | "live" = closed bar's ATR
 input double TP1mult            = 1.0;
-input double RiskPct            = 1.0;
+input double RiskPct            = 2.0;     // M2 (label A): 2% per trade
 input double MinBeyondATR       = 1.0;
 input ulong  MagicNumber        = 20260001;
 input string RunTag             = "";      // unique per batch run -- keeps each run's trade log from colliding
@@ -123,6 +123,20 @@ input bool   RequireC2ForContinuation = true;
 input bool   EnableBaselineExit = true;  // false = pre-FIX-1 behavior
 // --- X2 exit indicator (SS5): read vs its OWN zero_reference, never 0 ------
 input bool   EnableExitIndicator = true; // no-op unless an exit indicator is active
+
+// --- FIX 7 news hook (RULEBOOK_ADDENDUM_NEWS.txt; WIRED-BUT-DORMANT; mirrors NNFXParams) --------
+// Calendar = CSV in MQL5\Files with a header row and columns currency,timestamp_utc,impact
+// (ForexFactory shape; timestamp like 2025-04-02T12:30:00Z, UTC). Only High rows are kept.
+// N1: no new trade if either currency of the pair has a High event in (t, t+NewsWindowHours],
+//     t = the closed bar's close in UTC. X5: close an open trade with such an event ahead per
+//     X5Cutoff: "handoff" (default) = losing or < X5ProfitATR x ATR-at-entry in profit;
+//     "not_past_tp1" = TP1 not hit yet. Sources disagree -> flagged for the user.
+input bool   EnableNewsFilter     = false;
+input string NewsCalendarFile     = "";
+input double NewsWindowHours      = 24.0;
+input string X5Cutoff             = "handoff"; // "handoff" | "not_past_tp1"
+input double X5ProfitATR          = 1.0;
+input double ServerUTCOffsetHours = 0.0;       // broker server time - UTC (e.g. 2 or 3)
 
 // --- chart layout: each role in its OWN subwindow, never shared -----
 #define WIN_MAIN   0
@@ -188,6 +202,9 @@ int  g_posDir = 0; // +1 long, -1 short, 0 flat
 // blended per-lot pip result of the whole trade is the simple average of each half's own
 // pip result -- reported once, when BOTH halves are finally flat.
 double g_entryPriceForLog = 0.0;
+string   g_newsCur[];         // FIX 7: High-impact events (currency, UTC time), loaded in OnInit
+datetime g_newsTime[];
+long     g_summaryNewsSkips=0;
 double g_atrAtEntry = 0.0;   // FIX 6: T4 reference ATR (TrailATRRef="entry")
 bool   g_trailActive = false; // FIX 6: sticky once a close reached TrailActivateATR beyond entry
 bool   g_half1PipsSet = false, g_half2PipsSet = false;
@@ -289,6 +306,14 @@ int OnInit()
       g_exitBuf = RefExitBuf;
       g_exitZeroRef = RefExitZeroReference;
       g_exitWanted = true;
+   }
+
+   // News calendar (FIX 7): dormant unless switched on AND a file is named; a named file that
+   // can't be read is fatal, never a silent "no news".
+   if(EnableNewsFilter && NewsCalendarFile!="" && !LoadNewsCalendar())
+   {
+      Print("NNFXHarness: cannot read news calendar ", NewsCalendarFile);
+      return(INIT_FAILED);
    }
 
    if(h_baseline==INVALID_HANDLE || h_c1==INVALID_HANDLE || h_c2==INVALID_HANDLE ||
@@ -429,6 +454,49 @@ bool BridgeTooFar(int shift,int dir)
    return(C1DirectionRunLength(from,dir)>=BridgeTooFarBars);
 }
 
+// FIX 7: read the calendar's High-impact rows. ISO-8601 "2025-04-02T12:30:00Z" -> StringToTime's
+// "2025.04.02 12:30:00" (the trailing Z / UTC is the file's contract). Mirrors load_news_calendar().
+bool LoadNewsCalendar()
+{
+   int h=FileOpen(NewsCalendarFile,FILE_READ|FILE_CSV|FILE_ANSI,',');
+   if(h==INVALID_HANDLE) return(false);
+   for(int i=0;i<3 && !FileIsEnding(h);i++) FileReadString(h); // header row
+   while(!FileIsEnding(h))
+   {
+      string cur=FileReadString(h), ts=FileReadString(h), impact=FileReadString(h);
+      StringToLower(impact); StringToUpper(cur);
+      StringTrimLeft(impact); StringTrimRight(impact); StringTrimLeft(cur); StringTrimRight(cur);
+      if(impact!="high") continue;
+      StringReplace(ts,"-","."); StringReplace(ts,"T"," "); StringReplace(ts,"Z","");
+      int n=ArraySize(g_newsCur);
+      ArrayResize(g_newsCur,n+1); ArrayResize(g_newsTime,n+1);
+      g_newsCur[n]=cur; g_newsTime[n]=StringToTime(ts);
+   }
+   FileClose(h);
+   return(true);
+}
+
+// N1/X5: a High event for EITHER currency of the pair in (t, t+NewsWindowHours], t = the close of
+// the bar at `shift` in UTC. Always false while dormant. Mirrors NNFXEngine._news_ahead().
+bool NewsAhead(int shift)
+{
+   if(!EnableNewsFilter || ArraySize(g_newsCur)==0) return(false);
+   datetime t = iTime(_Symbol,PERIOD_D1,shift) + 86400 - (datetime)(ServerUTCOffsetHours*3600);
+   datetime until = t + (datetime)(NewsWindowHours*3600);
+   string base=StringSubstr(_Symbol,0,3), quote=StringSubstr(_Symbol,3,3);
+   for(int i=0;i<ArraySize(g_newsCur);i++)
+      if((g_newsCur[i]==base || g_newsCur[i]==quote) && g_newsTime[i]>t && g_newsTime[i]<=until)
+         return(true);
+   return(false);
+}
+
+// Rules that veto ANY new trade (every entry type, continuation included). Logs the skip.
+bool EntryBlocked(int dir,double atrVal)
+{
+   if(NewsAhead(1)) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:news"); g_summaryNewsSkips++; return(true); }
+   return(false);
+}
+
 //====================================================================
 // TRADE LOG (auditable trade log per NNFX_BACKTESTER_BUILD_SPEC.txt Part A)
 //====================================================================
@@ -566,6 +634,7 @@ void OpenPosition(int dir,double atrVal,bool isContinuation,string reason="")
 // E1/E2/E3/E4 -- all of them establish an "original entry" SS7 tracks from. Mirrors _open().
 void OpenFresh(int dir,double atrVal,string reason)
 {
+   if(EntryBlocked(dir,atrVal)) return; // vetoed: opens nothing, arms nothing
    g_trendDir=dir; g_continuationOK=true;
    OpenPosition(dir, atrVal, false, reason);
 }
@@ -685,6 +754,19 @@ void OnNewDailyBar()
       CloseAllHalves("exit:baseline_cross");
    }
 
+   // --- X5 (FIX 7, dormant): a High event for either currency is within the window -> close
+   //     what is left at this close, per X5Cutoff. ---------------------------------------------
+   if(g_posDir!=0 && NewsAhead(shift))
+   {
+      bool smallOrLosing = (X5Cutoff=="not_past_tp1") ? !g_half1.tp1Hit
+                         : (iClose(_Symbol,PERIOD_D1,shift)-g_entryPriceForLog)*g_posDir < X5ProfitATR*g_atrAtEntry;
+      if(smallOrLosing)
+      {
+         g_lastExitDir=g_posDir;
+         CloseAllHalves("exit:news");
+      }
+   }
+
    // --- continuation bookkeeping: the sequence resets the moment a candle closes on the
    //     OPPOSITE side of the baseline from the tracked direction. This is a STICKY reset --
    //     once broken, only a genuine standard entry (not just any bare cross) may re-arm a
@@ -721,6 +803,7 @@ void OnNewDailyBar()
       }
       if(trigger)
       {
+         if(EntryBlocked(d,atrVal)) return; // vetoed: nothing opens; the sequence stays as it was
          OpenPosition(d, atrVal, true);
          g_lastExitDir=0; // consumed
          return;
@@ -870,7 +953,8 @@ double OnTester()
                 DoubleToString(TesterStatistics(STAT_EQUITY_DDREL_PERCENT),2));
       FileWrite(h, TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS), "summary_rule_audit", "-",
                 DoubleToString((double)g_summaryBridgeSkips,0), "", "", "",
-                "bridge_skips", DoubleToString((double)g_summaryContinuationTrades,0), "continuation_trades");
+                "bridge_skips", DoubleToString((double)g_summaryContinuationTrades,0), "continuation_trades",
+                DoubleToString((double)g_summaryNewsSkips,0), "news_skips");
       FileClose(h);
    }
    return(g_summaryPipsSum);

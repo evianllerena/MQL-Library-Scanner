@@ -24,7 +24,10 @@ Function <-> EA cross-reference (NNFXHarness.mq5):
   NNFXEngine.process_bar  <-> OnNewDailyBar() + ManageOpenPosition()
 """
 from __future__ import annotations
+import bisect, csv
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Optional
 
 
@@ -95,6 +98,38 @@ def beyond_pullback_zone(close: float, baseline: float, atr: float, min_beyond_a
     """True = price is MORE than min_beyond_atr x ATR beyond the baseline ->
     NO-TRADE zone (standard entries only; continuation ignores this)."""
     return abs(close - baseline) > min_beyond_atr * atr
+
+
+# ---------------------------------------------------------------------------
+# News calendar (RULEBOOK_ADDENDUM_NEWS.txt N1/X5 -- WIRED-BUT-DORMANT)
+# ---------------------------------------------------------------------------
+
+def _parse_utc(text: str) -> datetime:
+    """ISO-8601 -> aware UTC datetime. A timestamp without an offset is taken as UTC (the
+    calendar file's documented contract)."""
+    t = datetime.fromisoformat(text.strip())
+    return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
+
+
+@lru_cache(maxsize=8)
+def load_news_calendar(path: str) -> dict:
+    """Read a ForexFactory-shaped calendar CSV (columns: currency, timestamp_utc, impact) and
+    keep HIGH-impact ("red folder") rows only. Returns {currency: sorted [UTC datetimes]}."""
+    events: dict = {}
+    with open(path, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            if row['impact'].strip().lower() != 'high':
+                continue
+            events.setdefault(row['currency'].strip().upper(), []).append(_parse_utc(row['timestamp_utc']))
+    return {cur: sorted(ts) for cur, ts in events.items()}
+
+
+def bar_close_utc(date: str, server_utc_offset_hours: float) -> datetime:
+    """The decision moment of a closed DAILY bar, in UTC. `date` is the bar's own (open) date in
+    broker server time ('YYYY.MM.DD' as MT5 extracts it, or 'YYYY-MM-DD'); the bar closes one day
+    later, and server time minus the server's UTC offset is UTC."""
+    opened = datetime.strptime(date[:10].replace('-', '.'), '%Y.%m.%d')
+    return (opened + timedelta(days=1) - timedelta(hours=server_utc_offset_hours)).replace(tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +222,25 @@ class NNFXParams:
     # trade closes what is left. Only active on bars that carry exit_value; a bar
     # without one (no exit indicator supplied) behaves exactly as before FIX 2.
     enable_exit_indicator: bool = True
+    # --- FIX 7 news hook (RULEBOOK_ADDENDUM_NEWS.txt, user-confirmed, ForexFactory HIGH impact).
+    #     WIRED-BUT-DORMANT: off by default, and with no calendar file the gate stays off, so
+    #     results are byte-identical to pre-FIX-7. When on, each bar must carry 'symbol' (e.g.
+    #     'EURUSD') and 'time_utc' (its decision moment, see bar_close_utc).
+    # N1: no NEW trade if either currency of the pair has a High event in (time_utc, time_utc+24h].
+    # X5: an open trade with such an event ahead is closed at the close, per x5_cutoff:
+    #   'handoff' (DEFAULT, MASTER_HANDOFF label A): close if losing OR in profit by less than
+    #             x5_profit_atr x atr_at_entry; otherwise hold.
+    #   'not_past_tp1' (RULEBOOK_ADDENDUM stub): close only if TP1 has not been hit yet.
+    #   The two source docs disagree -> FLAGGED for the user to confirm VP's actual cutoff.
+    enable_news_filter: bool = False
+    news_calendar: Optional[str] = None
+    news_window_hours: float = 24.0
+    x5_cutoff: str = 'handoff'
+    x5_profit_atr: float = 1.0
+    server_utc_offset_hours: float = 0.0  # broker server time -> UTC, used by bar_close_utc callers
+    # M2 (label A): risk 2% per trade. The engine works in pips, so this scales absolute sizing
+    # only and never changes which trades fire.
+    risk_pct: float = 2.0
     volume_threshold_mult: float = 1.0
     pip_size: float = 0.0001
 
@@ -244,10 +298,39 @@ class NNFXEngine:
         run = c1_direction_run_length(self.c1_history, end, direction, p.bridge_lookback)
         return run >= p.bridge_too_far_bars
 
+    def _news_ahead(self, bar: dict) -> bool:
+        """N1/X5 test: a High-impact event for EITHER currency of the pair falls in
+        (time_utc, time_utc + news_window_hours]. Always False while the hook is dormant."""
+        p = self.params
+        if not p.enable_news_filter or not p.news_calendar:
+            return False
+        if 'symbol' not in bar or 'time_utc' not in bar:
+            raise ValueError("enable_news_filter needs 'symbol' and 'time_utc' on every bar")
+        events = load_news_calendar(p.news_calendar)
+        t = bar['time_utc']
+        until = t + timedelta(hours=p.news_window_hours)
+        for cur in (bar['symbol'][:3].upper(), bar['symbol'][3:6].upper()):
+            ts = events.get(cur, [])
+            i = bisect.bisect_right(ts, t)  # first event strictly after t
+            if i < len(ts) and ts[i] <= until:
+                return True
+        return False
+
+    def _entry_block_reason(self, bar: dict) -> Optional[str]:
+        """Rules that veto ANY new trade (every entry type, continuation included)."""
+        if self._news_ahead(bar):
+            return 'skip:news'
+        return None
+
     def _open(self, direction: int, bar: dict, reason: str, record: dict) -> dict:
         """Open a fresh (non-continuation) position and arm the continuation tracker.
-        Shared by E1/E2/E3/E4 -- all of them establish an 'original entry' SS7 tracks from."""
+        Shared by E1/E2/E3/E4 -- all of them establish an 'original entry' SS7 tracks from.
+        A vetoed entry (news) opens nothing and arms nothing."""
         p = self.params
+        blocked = self._entry_block_reason(bar)
+        if blocked:
+            record.update({'action': 'skip', 'reason': blocked})
+            return record
         entry = bar['close']
         sl = entry - p.sl_mult * bar['atr'] if direction > 0 else entry + p.sl_mult * bar['atr']
         tp1 = entry + p.tp1_mult * bar['atr'] if direction > 0 else entry - p.tp1_mult * bar['atr']
@@ -357,6 +440,15 @@ class NNFXEngine:
                 on_close_exit = 'exit:exit_indicator'
             elif p.enable_baseline_exit and pos.half2_open and side != 0 and side != pos.direction:
                 on_close_exit = 'exit:baseline_cross'
+            # X5 (FIX 7, dormant): a High-impact event for either currency is within the window ->
+            # close at the close, per x5_cutoff. Runs after X2/X4, so those keep their own reason.
+            if not on_close_exit and pos.half2_open and self._news_ahead(bar):
+                if p.x5_cutoff == 'not_past_tp1':
+                    small_or_losing = not pos.tp1_hit
+                else:  # 'handoff': losing, or in profit by less than x5_profit_atr x ATR
+                    small_or_losing = (bar['close'] - pos.entry_price) * pos.direction < p.x5_profit_atr * pos.atr_at_entry
+                if small_or_losing:
+                    on_close_exit = 'exit:news'
             if on_close_exit:
                 rec = self._close_all(bar['close'], on_close_exit)
                 if record['action'] == 'exit_half':
@@ -401,6 +493,10 @@ class NNFXEngine:
                 c2_ok = (not p.require_c2_for_continuation) or (c2dir == d)
                 trigger = fresh_c1_signal and c2_ok
             if trigger:
+                blocked = self._entry_block_reason(bar)
+                if blocked:  # vetoed: nothing opens; the sequence stays as it was
+                    record.update({'action': 'skip', 'reason': blocked})
+                    return record
                 entry = bar['close']
                 sl = entry - p.sl_mult * bar['atr'] if d > 0 else entry + p.sl_mult * bar['atr']
                 tp1 = entry + p.tp1_mult * bar['atr'] if d > 0 else entry - p.tp1_mult * bar['atr']

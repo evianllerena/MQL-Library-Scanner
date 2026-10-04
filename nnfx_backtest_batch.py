@@ -31,7 +31,7 @@ from pathlib import Path
 import preview_bridge as pb  # discovery, clone_runtime, compile_file, stage, mql_dir_name, ...
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from nnfx_engine import NNFXEngine, NNFXParams
+from nnfx_engine import NNFXEngine, NNFXParams, bar_close_utc
 
 # ---- output (identical protocol to preview_batch.py) ------------------------
 
@@ -412,6 +412,8 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
                        # X2 reference exit: Examples\Momentum(14), centre line 100 (not 0). Missing
                        # column (pre-FIX-2 extract) or warm-up EMPTY -> no exit indicator that bar.
                        exit_value=fnum(r.get('mom')), exit_zero_reference=REF_EXIT_ZERO_REFERENCE)
+            if eng.params.enable_news_filter:  # N1/X5 (FIX 7): dormant unless switched on
+                bar.update(symbol=sym, time_utc=bar_close_utc(r['date'], eng.params.server_utc_offset_hours))
             rec = eng.process_bar(bar)
             rec['date'] = r['date']
             records.append(rec)

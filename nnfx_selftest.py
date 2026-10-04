@@ -20,12 +20,13 @@ raw price-unit distance. Golden cases use realistic EUR/USD- and AUD/NZD-scale
 numbers instead, for reviewer readability against VP's transcripts.
 """
 from __future__ import annotations
-import argparse, csv, sys
+import argparse, csv, sys, tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from nnfx_engine import (
     NNFXEngine, NNFXParams,
-    c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction,
+    c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction, bar_close_utc,
 )
 
 
@@ -602,7 +603,84 @@ def unit_tests() -> Check:
     c.that('T4 reference ATR: trail_atr_ref=\'live\' uses the bar\'s own ATR -- 2.1 beyond entry is under 2x2.0, so no trail yet',
            sl_path(P(trail_atr_ref='live'), wide_atr)[3] == 100.6)
 
+    # --- FIX 7 / N1 news entry block + X5 close-before-news (dormant hook) ---------------
+    cal_dir = Path(tempfile.mkdtemp(prefix='nnfx_news_'))
+
+    def news_params(name, events, **kw):
+        path = write_news_calendar(cal_dir / f'{name}.csv', events)
+        return P(enable_news_filter=True, news_calendar=str(path), **kw)
+
+    T0 = datetime(2025, 4, 1, 22, 0, tzinfo=timezone.utc)  # decision moment of the setup bar
+
+    def news_entry(params):
+        b = _bar('n1', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)   # otherwise-valid standard long
+        b.update(symbol='EURUSD', time_utc=T0)
+        return NNFXEngine(params).process_bar(b)
+    h = lambda hours: (T0 + timedelta(hours=hours)).isoformat()
+    r = news_entry(news_params('eur6', [('EUR', h(6), 'High')]))
+    c.that('N1 fires: a High EUR event 6h ahead BLOCKS an otherwise-valid EURUSD entry (skip:news)',
+           r['reason'] == 'skip:news', detail=str(r))
+    r = news_entry(news_params('eur30', [('EUR', h(30), 'High')]))
+    c.that('N1 not-fire: the same High EUR event 30h out (beyond 24h) -> the setup ENTERS', r['reason'] == 'enter:standard', detail=str(r))
+    r = news_entry(news_params('eurmed', [('EUR', h(6), 'Medium'), ('EUR', h(7), 'Low')]))
+    c.that('N1 not-fire: only Medium/Low EUR events in the window -> the setup ENTERS (red folder = High only)',
+           r['reason'] == 'enter:standard', detail=str(r))
+    r = news_entry(news_params('usd6', [('USD', h(6), 'High')]))
+    c.that('N1 both legs: a High USD event 6h ahead blocks EUR/USD too', r['reason'] == 'skip:news', detail=str(r))
+    r = news_entry(news_params('gbp6', [('GBP', h(6), 'High')]))
+    c.that('N1 not-fire: a High event for a currency outside the pair (GBP) does not block EUR/USD',
+           r['reason'] == 'enter:standard', detail=str(r))
+    r = news_entry(news_params('edge', [('EUR', h(0), 'High'), ('USD', h(24), 'High')]))
+    c.that('N1 window is (t, t+24h]: an event exactly at t does not count, one exactly at t+24h does -> blocked',
+           r['reason'] == 'skip:news', detail=str(r))
+    r = news_entry(P(enable_news_filter=False, news_calendar=str(write_news_calendar(cal_dir / 'off.csv', [('EUR', h(6), 'High')]))))
+    c.that('News dormant: enable_news_filter=False ignores even a blocking calendar -> the setup ENTERS',
+           r['reason'] == 'enter:standard', detail=str(r))
+    regress = x4_bars() + x2_bars() + t4_long_bars()
+    c.that('News dormant: enable_news_filter=True with NO calendar file gives results identical to the default '
+           '(bars carry no symbol/time at all -- the gate never reads them)',
+           actions(P(enable_news_filter=True), regress) == actions(P(), regress))
+
+    # X5: long entry at T0 (no event ahead of it), then the next bar has a High EUR event 6h ahead.
+    T1 = T0 + timedelta(days=1)
+    x5_cal = [('EUR', (T1 + timedelta(hours=6)).isoformat(), 'High')]   # 30h after T0: entry is not blocked
+
+    def x5_run(second, **kw):
+        e = NNFXEngine(news_params('x5_' + '_'.join(f'{k}{v}' for k, v in kw.items()), x5_cal, **kw))
+        first = _bar('x5a', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)
+        first.update(symbol='EURUSD', time_utc=T0)
+        second.update(symbol='EURUSD', time_utc=T1)
+        r1 = e.process_bar(first)
+        return r1, e.process_bar(second), e
+    r1, r2, _ = x5_run(_bar('x5b', 100.8, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.9, low=100.7))
+    c.that('X5 setup: the entry bar itself is not blocked (event is 30h ahead of it)', r1['reason'] == 'enter:standard', detail=str(r1))
+    c.that('X5 fires: an open not-yet-TP1 trade only 0.2xATR in profit is CLOSED before the event (exit:news)',
+           r2['reason'] == 'exit:news' and r2['pips'] == 0.2, detail=str(r2))
+    _, r2, _ = x5_run(_bar('x5b', 100.3, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.7, low=100.25))
+    c.that('X5 fires: a LOSING trade is closed before the event', r2['reason'] == 'exit:news' and r2['pips'] == -0.3, detail=str(r2))
+    _, r2, e = x5_run(_bar('x5b', 101.7, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=101.75, low=100.7))
+    c.that('X5 not-fire (handoff default): past TP1 and >= 1xATR in profit at the close -> runner HOLDS through the news',
+           r2['reason'] == 'exit:tp1_half' and e.position is not None, detail=str(r2))
+    small_past_tp1 = lambda: _bar('x5b', 101.0, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=101.65, low=100.7)
+    _, r2, _ = x5_run(small_past_tp1())
+    c.that('X5 handoff default: past TP1 but back under 1xATR profit (0.4) at the close -> CLOSED (exit:news)',
+           r2['reason'] == 'exit:news', detail=str(r2))
+    _, r2, e = x5_run(small_past_tp1(), x5_cutoff='not_past_tp1')
+    c.that('X5 not_past_tp1 (addendum alternative): the same past-TP1 trade is NOT force-closed',
+           r2['reason'] == 'exit:tp1_half' and e.position is not None, detail=str(r2))
+
+    c.that('M2: risk_pct defaults to 2.0', NNFXParams().risk_pct == 2.0)
+
     return c
+
+
+def write_news_calendar(path: Path, events) -> Path:
+    """Test calendar in the documented file shape: currency, timestamp_utc, impact."""
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['currency', 'timestamp_utc', 'impact'])
+        w.writerows(events)
+    return path
 
 
 def t4_long_bars():
@@ -823,6 +901,22 @@ def build_traces(out_dir: Path) -> list[Path]:
     # a pullback close (stop stays 101.2, never backward) -> a higher close (stop ratchets to 102.0).
     # Read the sl_after column.
     paths.append(write_trace(out_dir, 'trace_17_t4_trail_activation.csv', t4_long_bars(), P()))
+
+    # Trace 18 (FIX 7, N1): calendar = trace_18_news_calendar.csv. 04-01's valid long cross decides
+    # at 04-02 00:00 UTC with a High EUR event at 12:30 that day -> skip:news. Price drops back
+    # below on 04-02. 04-03's identical cross decides at 04-04 00:00 UTC; the next High event
+    # (USD, 04-05 06:00) is 30h out -> enter:standard. (Server time = UTC here: offset 0.)
+    cal = write_news_calendar(out_dir / 'trace_18_news_calendar.csv',
+                              [('EUR', '2025-04-02T12:30:00Z', 'High'), ('USD', '2025-04-05T06:00:00Z', 'High')])
+    bars = [
+        _bar('2025.04.01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                            # valid cross: BLOCKED
+        _bar('2025.04.02', 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.6, low=99.4),      # back below
+        _bar('2025.04.03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                            # same setup: ENTERS
+    ]
+    for b in bars:
+        b.update(symbol='EURUSD', time_utc=bar_close_utc(b['date'], 0.0))
+    paths.append(write_trace(out_dir, 'trace_18_n1_news_block_then_enter.csv', bars,
+                             P(enable_news_filter=True, news_calendar=str(cal))))
 
     return paths
 
