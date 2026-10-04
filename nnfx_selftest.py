@@ -210,8 +210,11 @@ def unit_tests() -> Check:
     # ^ fresh long C1 signal (matches the original last_exit_dir=+1), C2 agrees, no fresh baseline
     #   cross (already above) -- exactly what the OLD bug would have wrongly entered as a
     #   continuation, because the bare cross on 05-04 used to silently re-arm it.
+    # NOTE (FIX 4): 05-05 is a fresh long C1 cross, on-side, C2 agreeing, within 1xATR, volume
+    # ok -> a legitimate E1 (enter:c1_trigger). The point this test guards is narrower and still
+    # holds: the broken continuation sequence must NOT be resurrected as a CONTINUATION entry.
     c.that('WHIPSAW PART A: a bare cross back to the original side with no trade behind it does NOT '
-           'resurrect a broken continuation sequence', rW2['action'] != 'enter', detail=str(rW2))
+           'resurrect a broken continuation sequence', rW2['reason'] != 'enter:continuation', detail=str(rW2))
 
     rW3 = engW.process_bar(_bar('2024-05-06', 100.4, 100.0, 0.9, 1.0, -1.0, 1.0, close_prev=101.0,
                                  high=100.5, low=100.3))  # still no valid entry path open -> stays flat
@@ -316,8 +319,11 @@ def unit_tests() -> Check:
         eng_x4_cont.process_bar(b)
     eng_x4_cont.process_bar(_bar('2024-06-14', 100.4, 100.0, 0.9, 1.0, -1.0, 10.0, close_prev=99.7))        # back above; C1 short -> no entry
     r_c = eng_x4_cont.process_bar(_bar('2024-06-15', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.4))  # fresh long C1, C2 agrees
-    c.that('X4: the wrong-side close that triggered the exit also resets continuation -- no re-entry after it',
-           r_c['action'] != 'enter', detail=str(r_c))
+    # NOTE (FIX 4): 06-15 is a fresh long C1 cross back on-side with C2 agreeing within 1xATR ->
+    # a legitimate E1 (enter:c1_trigger). The guard here is that it must not be a CONTINUATION
+    # re-entry: the wrong-side close reset the sequence, so enter:continuation must not fire.
+    c.that('X4: the wrong-side close that triggered the exit also resets continuation -- no continuation re-entry after it',
+           r_c['reason'] != 'enter:continuation', detail=str(r_c))
 
     # --- X2 exit indicator (FIX 2). Reference exit = Momentum, centre line 100. ----------
     c.that('X2 exit_direction: 100.4 vs centre line 100 -> long', exit_direction(100.4, 100.0) == 1)
@@ -418,6 +424,93 @@ def unit_tests() -> Check:
     avg = nb.rolling_avg([float(r['vol']) for r in batch_rows(50.0)], nb.VOLUME_AVG_PERIOD)[-1]
     c.that('G10: today\'s value and its average come from the same line -- the cross-bar average (97.5) is the '
            '20-bar mean of the vol column itself', abs(avg - 97.5) < 1e-9, detail=str(avg))
+
+    # --- FIX 4 / E1 C1-TRIGGERED entry (no fresh baseline cross this bar) -----------------
+    # d1 establishes C1 short while price is already above the baseline; d2 is a FRESH C1
+    # long cross, on-side, C2 agreeing, within 1xATR, volume ok -> E1 fires.
+    def e1_seq(d2_c2=5.0, d2_close=100.5, d2_cprev=100.5):
+        e = NNFXEngine(P())
+        e.process_bar(_bar('e1a', 100.5, 100.0, 0.9, 1.0, 5.0, 10.0, close_prev=100.4))  # C1 short, side +1, no cross
+        return e.process_bar(_bar('e1b', d2_close, 100.0, 1.0, 0.9, d2_c2, 10.0, close_prev=d2_cprev))
+    c.that('E1 fires: a fresh C1 long cross while already above the baseline (no fresh cross), C2 agrees, '
+           'within 1xATR, volume ok -> enter:c1_trigger', e1_seq()['reason'] == 'enter:c1_trigger', detail=str(e1_seq()))
+    c.that('E1 not-fire: C2 disagrees on the trigger bar -> no entry', e1_seq(d2_c2=-5.0)['action'] != 'enter')
+    c.that('E1 not-fire: beyond 1xATR on the trigger bar -> skip:beyond_1xATR, not an entry',
+           e1_seq(d2_close=101.6, d2_cprev=101.6)['reason'] == 'skip:beyond_1xATR')
+    # not-fire: price on the WRONG side of the baseline (below) even with a fresh long C1
+    e_ws = NNFXEngine(P())
+    e_ws.process_bar(_bar('e1w1', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=99.4))
+    c.that('E1 not-fire: fresh long C1 but price below the baseline (wrong side) -> no entry',
+           e_ws.process_bar(_bar('e1w2', 99.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))['action'] != 'enter')
+    # not-fire: the first observed bar has no genuine prior cross -> no spurious E1
+    c.that('E1 not-fire: the first observed bar (no prior C1 cross) does not fire E1',
+           NNFXEngine(P()).process_bar(_bar('e1f', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.4))['action'] != 'enter')
+    c.that('E1 off (enable_c1_trigger_entry=False): the same fresh-C1 setup does NOT enter',
+           (lambda e: (e.process_bar(_bar('x1', 100.5, 100.0, 0.9, 1.0, 5.0, 10.0, close_prev=100.4)),
+                       e.process_bar(_bar('x2', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.5)))[1]['action'])(
+               NNFXEngine(P(enable_c1_trigger_entry=False))) != 'enter')
+
+    # --- FIX 4 / E3 PULLBACK (1xATR) -----------------------------------------------------
+    def e3_run(third):
+        e = NNFXEngine(P())
+        recs = [e.process_bar(_bar('e3a', 101.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)),   # cross, beyond 1xATR -> arm
+                e.process_bar(_bar('e3b', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=101.6))]  # still beyond, agreeing -> wait
+        recs.append(e.process_bar(third))
+        return recs
+    r_pb = e3_run(_bar('e3c', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=101.5))               # pulls back within 1xATR
+    c.that('E3 arms: a valid setup that closes >1xATR beyond the baseline is skipped (skip:beyond_1xATR), not lost',
+           r_pb[0]['reason'] == 'skip:beyond_1xATR', detail=str(r_pb[0]))
+    c.that('E3 waits: while still beyond 1xATR and agreeing, the engine holds (does not enter)',
+           r_pb[1]['action'] == 'hold', detail=str(r_pb[1]))
+    c.that('E3 fires: when price later closes back within 1xATR with everything still agreeing -> enter:pullback',
+           r_pb[2]['reason'] == 'enter:pullback', detail=str(r_pb[2]))
+    # expire: C1 flips against before the pullback; keep C1 short on the 3rd bar so no independent E1 fires
+    e = NNFXEngine(P())
+    e.process_bar(_bar('e3a', 101.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))                # arm
+    e.process_bar(_bar('e3b', 101.5, 100.0, 0.9, 1.0, 5.0, 10.0, close_prev=101.6))               # C1 flips short -> break
+    r_ex3 = e.process_bar(_bar('e3c', 100.5, 100.0, 0.9, 1.0, 5.0, 10.0, close_prev=101.5))        # within atr but C1 short
+    c.that('E3 expire: if C1 flips against before the pullback, the pending setup is dropped -> no enter:pullback',
+           r_ex3['reason'] != 'enter:pullback' and r_ex3['action'] != 'enter', detail=str(r_ex3))
+    c.that('E3 off (enable_pullback_entry=False): a beyond-1xATR setup is skipped and never re-entered on pullback',
+           (lambda e: [e.process_bar(_bar('o3a', 101.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)),
+                       e.process_bar(_bar('o3c', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=101.6))][1]['action'])(
+               NNFXEngine(P(enable_pullback_entry=False))) != 'enter')
+
+    # --- FIX 4 / E4 ONE-CANDLE RULE (lagging C2) ----------------------------------------
+    def e4_run(second):
+        e = NNFXEngine(P())
+        r1 = e.process_bar(_bar('e4a', 100.5, 100.0, 1.0, 0.9, -5.0, 10.0, close_prev=99.5))       # cross+C1 ok, C2 lags -> arm
+        return r1, e.process_bar(second)
+    r4a, r4b = e4_run(_bar('e4b', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.5))            # C2 catches up, within 1xATR
+    c.that('E4 arms: a cross bar with exactly one lagging confirmation (C2) waits one candle (skip:one_candle_wait)',
+           r4a['reason'] == 'skip:one_candle_wait', detail=str(r4a))
+    c.that('E4 fires: the lagging C2 agreeing on the very next candle (still within 1xATR) -> enter:one_candle',
+           r4b['reason'] == 'enter:one_candle', detail=str(r4b))
+    _, r4_exp = e4_run(_bar('e4b', 100.6, 100.0, 1.0, 0.9, -5.0, 10.0, close_prev=100.5))          # C2 still lags
+    c.that('E4 expire: if the laggard still disagrees on the next candle, the grace lapses -> no entry',
+           r4_exp['action'] != 'enter', detail=str(r4_exp))
+    _, r4_atr = e4_run(_bar('e4b', 101.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.5))           # C2 agrees but now >1xATR
+    c.that('E4 needs within 1xATR: laggard agrees next candle but price is now beyond 1xATR -> no one_candle entry',
+           r4_atr['reason'] != 'enter:one_candle', detail=str(r4_atr))
+    c.that('E4 off (enable_one_candle_rule=False): a one-lagging-input cross does not arm and does not enter next bar',
+           (lambda e: [e.process_bar(_bar('o4a', 100.5, 100.0, 1.0, 0.9, -5.0, 10.0, close_prev=99.5)),
+                       e.process_bar(_bar('o4b', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.5))][1]['action'])(
+               NNFXEngine(P(enable_one_candle_rule=False))) != 'enter')
+
+    # --- FIX 4 / E5 bridge counting convention (Decision #5 setting) ---------------------
+    def bridge_run(run_before_cross, **kw):
+        e = NNFXEngine(P(**kw))
+        for i in range(run_before_cross):  # C1 long, price BELOW baseline (builds C1 run, no entry)
+            e.process_bar(_bar(f'b{i}', 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))
+        return e.process_bar(_bar('bx', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))       # the cross bar
+    c.that('E5 before_cross (default): C1 run of 6 BEFORE the cross is within range -> enter:standard',
+           bridge_run(6)['reason'] == 'enter:standard', detail=str(bridge_run(6)))
+    c.that('E5 before_cross (default): C1 run of 7 before the cross is too far -> skip:bridge_too_far',
+           bridge_run(7)['reason'] == 'skip:bridge_too_far', detail=str(bridge_run(7)))
+    c.that('E5 include_cross: counting through the cross candle, a run of 6-before is 7 total -> skip (shows the '
+           'default is one candle more lenient)', bridge_run(6, bridge_count_from='include_cross')['reason'] == 'skip:bridge_too_far')
+    c.that('E5 two-line-only: with two_line_c1=False a 10-bar C1 run does NOT bridge-skip (zero-cross C1 exempt)',
+           bridge_run(10, two_line_c1=False)['reason'] == 'enter:standard')
 
     return c
 
@@ -551,6 +644,43 @@ def build_traces(out_dir: Path) -> list[Path]:
         _bar('2024-09-05', 100.5, 100.0, 1.0, 0.9, 5.0, 130.0, close_prev=99.6, volume_avg=101.5),             # same setup, VOLUME PASSES
     ]
     paths.append(write_trace(out_dir, 'trace_10_volume_filter_skip_then_take.csv', bars, P()))
+
+    # Trace 11 (FIX 4, E1 C1-triggered): price is already above the baseline. 09b-02 has C1 short;
+    # 09b-03 is a FRESH C1 long cross with NO fresh baseline cross (close_prev already above), C2
+    # agreeing and within 1xATR -> enter:c1_trigger (an entry the old cross-only engine missed).
+    bars = [
+        _bar('2024-11-01', 100.5, 100.0, 0.9, 1.0, 5.0, 10.0, close_prev=100.4),   # above baseline, C1 short
+        _bar('2024-11-02', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.5),   # FRESH C1 long, no cross -> E1
+        _bar('2024-11-03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.5, high=100.7, low=100.5),  # in position
+    ]
+    paths.append(write_trace(out_dir, 'trace_11_e1_c1_trigger.csv', bars, P()))
+
+    # Trace 12 (FIX 4, E3 pullback): 11b-01 is a valid long cross but closes >1xATR beyond the
+    # baseline -> skip:beyond_1xATR and the setup is remembered. 11b-02 is still too far ->
+    # wait. 11b-03 closes back within 1xATR with everything still agreeing -> enter:pullback.
+    bars = [
+        _bar('2024-11-11', 101.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),    # cross, beyond 1xATR -> arm
+        _bar('2024-11-12', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=101.6),   # still beyond -> wait
+        _bar('2024-11-13', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=101.5),   # pulled back within 1xATR -> enter
+    ]
+    paths.append(write_trace(out_dir, 'trace_12_e3_pullback.csv', bars, P()))
+
+    # Trace 13 (FIX 4, E4 one-candle rule): 11c-01 is a long baseline cross with C1 agreeing but
+    # C2 lagging (short) -> skip:one_candle_wait (one-candle grace armed). 11c-02 the lagging C2
+    # catches up long, price still within 1xATR, no fresh cross -> enter:one_candle.
+    bars = [
+        _bar('2024-11-21', 100.5, 100.0, 1.0, 0.9, -5.0, 10.0, close_prev=99.5),   # cross + C1, C2 lags -> arm
+        _bar('2024-11-22', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.5),   # C2 catches up within 1xATR -> enter
+    ]
+    paths.append(write_trace(out_dir, 'trace_13_e4_one_candle.csv', bars, P()))
+
+    # Trace 14 (FIX 4, E5 before_cross default): C1 has been long for 6 bars BEFORE the cross
+    # (price below the baseline, so no entry yet), then the baseline cross lands. With the default
+    # bridge_count_from='before_cross' the run is 6 (< 7) -> enter:standard. (Under the old
+    # include_cross counting the cross candle makes it 7 and it would skip:bridge_too_far.)
+    bars = [_bar(f'2024-12-{i+1:02d}', 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5) for i in range(6)]
+    bars.append(_bar('2024-12-07', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))   # the cross bar -> enter
+    paths.append(write_trace(out_dir, 'trace_14_e5_before_cross_enters.csv', bars, P()))
 
     return paths
 

@@ -122,6 +122,34 @@ class NNFXParams:
     enable_bridge_too_far: bool = True
     bridge_too_far_bars: int = 7
     bridge_lookback: int = 60
+    # E5 counting convention (NNFX_RULESET_THE_TRUTH.txt SS4 E5 / Decision #5 -- user
+    # UNRESOLVED, so a SETTING). 'before_cross' (default, per MASTER_HANDOFF) counts C1's
+    # unbroken same-direction run ENDING ON THE CANDLE BEFORE the baseline cross;
+    # 'include_cross' counts through the cross candle itself (pre-FIX-4 behavior). Bridge-
+    # too-far is a TWO-LINE C1 rule only -- never applied to a zero-cross/single-line C1
+    # (the caller passes two_line_c1=False to suppress it; default True preserves behavior).
+    bridge_count_from: str = 'before_cross'
+    two_line_c1: bool = True
+    # --- FIX 4 new entry types (NNFX_RULESET_THE_TRUTH.txt SS4). Each a SETTING, default
+    #     ON; turn one off to isolate it in the backtest. ------------------------------
+    # E1 (label B) C1-TRIGGERED: C1 produces a FRESH signal this bar while price is ALREADY
+    #   on the correct side of the baseline (no fresh cross this bar), within 1xATR, with C2
+    #   and volume agreeing. Bridge-too-far is NOT applied to E1: SS4's bridge rule is about
+    #   C1 LEADING the baseline cross; here the cross already happened and C1 is the trigger,
+    #   so the "bridge" does not map. SOURCE-SILENT on E1xbridge -> defaulted OFF + flagged.
+    enable_c1_trigger_entry: bool = True
+    # E3 (label B) PULLBACK / 1xATR: a setup that is valid in every respect EXCEPT it closed
+    #   >1xATR beyond the baseline is remembered; if a LATER candle closes back WITHIN 1xATR
+    #   with everything still agreeing, enter then. Expiry is AGREEMENT-BASED (dropped when
+    #   C1 or C2 flips off the setup direction, or price closes back to the wrong side of the
+    #   baseline). No fixed bar-count expiry exists in the sources -> none invented.
+    enable_pullback_entry: bool = True
+    # E4 (label B) ONE-CANDLE RULE: if EXACTLY ONE input lags on an otherwise-valid setup,
+    #   wait at most ONE candle for it to agree; price must STILL be within 1xATR on that
+    #   second candle (Decision #4). >>> SCOPE IS UNCLEAR IN SOURCES <<< -- implemented for a
+    #   lagging BASELINE-cross or C2 only (the two cases VP demonstrates); a lagging C1 or
+    #   volume is NOT treated as a one-candle case here. Default ON, FLAGGED for user confirm.
+    enable_one_candle_rule: bool = True
     enable_continuation: bool = True
     # STUB (NNFX_RULESET_THE_TRUTH.txt SS12: "C2 ... full rules ... Implement
     # these as stubbed ... never guessed"): SS7 (continuation) names ONLY C1's
@@ -157,6 +185,12 @@ class NNFXEngine:
     last_c1_dir_seen: int = 0
     c1_history: list = field(default_factory=list)  # list of (fast, slow), grows every bar
     realized_pips: float = 0.0
+    # E3: a standard setup was valid but beyond 1xATR; remember its direction until price
+    # pulls back in or agreement breaks. E4: exactly one input lagged on the previous bar;
+    # remember the direction + the bar index so the grace is exactly ONE candle.
+    pending_pullback_dir: int = 0
+    pending_onecandle_dir: int = 0
+    pending_onecandle_bar: int = -1
 
     def _pips(self, entry: float, exitp: float, direction: int) -> float:
         return ((exitp - entry) if direction > 0 else (entry - exitp)) / self.params.pip_size
@@ -173,6 +207,32 @@ class NNFXEngine:
         if self.trend_dir != 0 and side != 0 and side != self.trend_dir:
             self.trend_dir = 0
             self.continuation_ok = False
+
+    def _bridge_too_far(self, direction: int, idx: int) -> bool:
+        """E5. Two-line C1 ONLY (suppressed when two_line_c1 is False). 'before_cross'
+        counts C1's unbroken run ending on the candle BEFORE the cross (idx-1); the run
+        >= bridge_too_far_bars means C1 led the cross by too many candles -> skip."""
+        p = self.params
+        if not p.enable_bridge_too_far or not p.two_line_c1:
+            return False
+        end = idx - 1 if p.bridge_count_from == 'before_cross' else idx
+        if end < 0:
+            return False
+        run = c1_direction_run_length(self.c1_history, end, direction, p.bridge_lookback)
+        return run >= p.bridge_too_far_bars
+
+    def _open(self, direction: int, bar: dict, reason: str, record: dict) -> dict:
+        """Open a fresh (non-continuation) position and arm the continuation tracker.
+        Shared by E1/E2/E3/E4 -- all of them establish an 'original entry' SS7 tracks from."""
+        p = self.params
+        entry = bar['close']
+        sl = entry - p.sl_mult * bar['atr'] if direction > 0 else entry + p.sl_mult * bar['atr']
+        tp1 = entry + p.tp1_mult * bar['atr'] if direction > 0 else entry - p.tp1_mult * bar['atr']
+        self.position = Position(direction, entry, sl, tp1, bar['atr'], is_continuation=False)
+        self.trend_dir = direction
+        self.continuation_ok = True
+        record.update({'action': 'enter', 'reason': reason, 'direction': direction})
+        return record
 
     def process_bar(self, bar: dict) -> dict:
         """bar keys: date, close, high, low, baseline, c1_fast, c1_slow,
@@ -297,31 +357,76 @@ class NNFXEngine:
                 self.last_exit_dir = 0
                 return record
 
-        # --- STANDARD baseline entry: ALL of baseline-cross, C1, C2, Volume ---
-        if cross == 0:
-            return record
-        if c1dir != cross or c2dir != cross:
-            return record
-        if not volume_passes(bar['volume_value'], bar['volume_avg'], p.volume_threshold_mult):
-            record.update({'action': 'skip', 'reason': 'skip:volume_filter'})
-            return record
-        if beyond_pullback_zone(bar['close'], bar['baseline'], bar['atr'], p.min_beyond_atr):
-            record.update({'action': 'skip', 'reason': 'skip:beyond_1xATR'})
-            return record
-        if p.enable_bridge_too_far:
-            run = c1_direction_run_length(self.c1_history, idx, cross, p.bridge_lookback)
-            if run >= p.bridge_too_far_bars:
-                record.update({'action': 'skip', 'reason': 'skip:bridge_too_far'})
-                return record
+        # --- shared entry conditions for this bar -----------------------------
+        within_atr = not beyond_pullback_zone(bar['close'], bar['baseline'], bar['atr'], p.min_beyond_atr)
+        vol_ok = volume_passes(bar['volume_value'], bar['volume_avg'], p.volume_threshold_mult)
 
-        entry = bar['close']
-        sl = entry - p.sl_mult * bar['atr'] if cross > 0 else entry + p.sl_mult * bar['atr']
-        tp1 = entry + p.tp1_mult * bar['atr'] if cross > 0 else entry - p.tp1_mult * bar['atr']
-        self.position = Position(cross, entry, sl, tp1, bar['atr'], is_continuation=False)
-        # THIS standard entry's own baseline cross is "the original entry" NNFX_RULESET_THE_TRUTH.txt
-        # SS7 tracks from -- only a genuine standard entry may (re)arm a trackable sequence, never a
-        # bare cross with no trade behind it (see the reset comment above for why that distinction matters).
-        self.trend_dir = cross
-        self.continuation_ok = True
-        record.update({'action': 'enter', 'reason': 'enter:standard', 'direction': cross})
+        # --- E3 PULLBACK resolution: we already committed to waiting on a setup that
+        #     was valid but beyond 1xATR. Enter when price closes back WITHIN 1xATR with
+        #     everything still agreeing; drop it if agreement breaks; else keep waiting. --
+        if self.pending_pullback_dir != 0:
+            d = self.pending_pullback_dir
+            broke = (side == -d) or (c1dir != 0 and c1dir != d) or (c2dir != 0 and c2dir != d)
+            if broke:
+                self.pending_pullback_dir = 0
+            else:
+                if within_atr and side == d and c1dir == d and c2dir == d and vol_ok and not self._bridge_too_far(d, idx):
+                    self.pending_pullback_dir = 0
+                    return self._open(d, bar, 'enter:pullback', record)
+                return record  # still on-side and agreeing but not yet back within 1xATR -> wait
+
+        # --- E4 ONE-CANDLE resolution: exactly one input lagged on the PREVIOUS bar;
+        #     the grace is exactly one candle (idx == armed_bar + 1). Enter if the laggard
+        #     has caught up AND price is still within 1xATR; otherwise the grace expires. --
+        if self.pending_onecandle_dir != 0:
+            d = self.pending_onecandle_dir
+            is_next_bar = (idx == self.pending_onecandle_bar + 1)
+            self.pending_onecandle_dir = 0
+            self.pending_onecandle_bar = -1
+            if is_next_bar and within_atr and side == d and c1dir == d and c2dir == d and vol_ok and not self._bridge_too_far(d, idx):
+                return self._open(d, bar, 'enter:one_candle', record)
+            # expired or still not agreeing -> fall through to fresh evaluation
+
+        # --- E2 STANDARD baseline entry (cross-triggered): baseline-cross + C1 + C2 +
+        #     Volume + within 1xATR + not bridge-too-far. A valid-but-too-far setup arms
+        #     E3; a setup with exactly ONE lagging confirmation arms E4. ----------------
+        if cross != 0:
+            c1_ok = (c1dir == cross)
+            c2_ok = (c2dir == cross)
+            if c1_ok and c2_ok:
+                if not vol_ok:
+                    record.update({'action': 'skip', 'reason': 'skip:volume_filter'}); return record
+                if not within_atr:
+                    if p.enable_pullback_entry and not self._bridge_too_far(cross, idx):
+                        self.pending_pullback_dir = cross
+                    record.update({'action': 'skip', 'reason': 'skip:beyond_1xATR'}); return record
+                if self._bridge_too_far(cross, idx):
+                    record.update({'action': 'skip', 'reason': 'skip:bridge_too_far'}); return record
+                return self._open(cross, bar, 'enter:standard', record)
+            # exactly one of C1/C2 lags on the cross bar -> one-candle grace (E4)
+            if p.enable_one_candle_rule and within_atr and vol_ok and not self._bridge_too_far(cross, idx):
+                lagging = (0 if c1_ok else 1) + (0 if c2_ok else 1)
+                if lagging == 1:
+                    self.pending_onecandle_dir = cross
+                    self.pending_onecandle_bar = idx
+                    record.update({'action': 'skip', 'reason': 'skip:one_candle_wait'}); return record
+            return record
+
+        # --- E1 C1-TRIGGERED entry (no fresh cross this bar): C1 FRESHLY signals while
+        #     price is ALREADY on the correct side, within 1xATR, C2 + volume agree.
+        #     Bridge-too-far is NOT applied to E1 (see NNFXParams note). ----------------
+        if p.enable_c1_trigger_entry:
+            d = c1dir
+            # A C1 "signal" is a genuine two-line CROSS: C1 must have been on the OPPOSITE
+            # side on the previous bar (prev_c1_dir == -d). This excludes a standing C1
+            # reading and the first observed bar (prev_c1_dir == 0), where no cross occurred.
+            fresh_c1 = (d != 0 and prev_c1_dir == -d)
+            if fresh_c1 and side == d and c2dir == d:
+                if not vol_ok:
+                    record.update({'action': 'skip', 'reason': 'skip:volume_filter'}); return record
+                if not within_atr:
+                    if p.enable_pullback_entry:
+                        self.pending_pullback_dir = d
+                    record.update({'action': 'skip', 'reason': 'skip:beyond_1xATR'}); return record
+                return self._open(d, bar, 'enter:c1_trigger', record)
         return record
