@@ -79,6 +79,9 @@ def ensure_backtest_table(conn):
     cols = {r[1] for r in conn.execute('PRAGMA table_info(backtest_results)')}
     if 'max_drawdown_pct' not in cols:
         conn.execute('ALTER TABLE backtest_results ADD COLUMN max_drawdown_pct REAL')
+    # FIX 8: breaker-ON expectancy for reference; the ranking uses expectancy_pips (breaker OFF).
+    if 'expectancy_pips_breaker' not in cols:
+        conn.execute('ALTER TABLE backtest_results ADD COLUMN expectancy_pips_breaker REAL')
     conn.commit()
 
 TESTABLE_SLOTS = ('CONFIRMATION_1', 'CONFIRMATION_2', 'BASELINE', 'VOLUME')
@@ -358,18 +361,13 @@ def rolling_avg(vals, window=20):
 REF_EXIT_ZERO_REFERENCE = 100.0  # Examples\Momentum = close/close[n]*100, so its centre line is 100
 VOLUME_AVG_PERIOD = 20           # SS7 V2: pass = today's reading >= its own 20-bar average (same line)
 
-def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
-    per_symbol = {}
-    pooled_trades = []
-    bridge_skips = continuation_trades = volume_skips = dd_breaker_skips = news_skips = 0
-    fingerprints = {}
-    # R1 (FIX 7b): ONE equity tracker shared by every symbol's engine, driven in date order
-    # (run_lockstep), so the drawdown breaker and max_drawdown_pct see the candidate's whole account.
-    account = EquityTracker()
-    engines, prepared = {}, {}
+def _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref):
+    """Build the per-symbol bar lists once. Independent of the drawdown breaker, so the same
+    prepared bars feed both the breaker-off and breaker-on scoring runs (FIX 8)."""
+    ref = NNFXParams()  # for the (dormant) news flag only; bars are breaker-agnostic
+    prepared = {}
     for sym in symbols:
-        d = symbol_data[sym]
-        rows = d['rows']
+        rows = symbol_data[sym]['rows']
         cand_a = [fnum(r[col_a]) for r in rows]
         cand_b = [fnum(r[col_b]) for r in rows] if col_b else None
         vol_avg = rolling_avg(cand_a, VOLUME_AVG_PERIOD) if role == 'VOLUME' else None
@@ -379,8 +377,6 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
         has_ref_vol = bool(rows) and 'vol' in rows[0]
         ref_vol = [fnum(r['vol']) for r in rows] if has_ref_vol else None
         ref_vol_avg = rolling_avg(ref_vol, VOLUME_AVG_PERIOD) if has_ref_vol else None
-
-        eng = engines[sym] = NNFXEngine(NNFXParams(pip_size=0.01 if 'JPY' in sym else 0.0001), equity=account)
         bars = prepared[sym] = []
         prev_close = prev_baseline = None
         for i, r in enumerate(rows):
@@ -420,15 +416,29 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
                        # X2 reference exit: Examples\Momentum(14), centre line 100 (not 0). Missing
                        # column (pre-FIX-2 extract) or warm-up EMPTY -> no exit indicator that bar.
                        exit_value=fnum(r.get('mom')), exit_zero_reference=REF_EXIT_ZERO_REFERENCE)
-            if eng.params.enable_news_filter:  # N1/X5 (FIX 7): dormant unless switched on
-                bar.update(symbol=sym, time_utc=bar_close_utc(r['date'], eng.params.server_utc_offset_hours))
+            if ref.enable_news_filter:  # N1/X5 (FIX 7): dormant unless switched on
+                bar.update(symbol=sym, time_utc=bar_close_utc(r['date'], ref.server_utc_offset_hours))
             bars.append(bar)
             prev_close = fnum(r['close']); prev_baseline = base
+    return prepared
 
+
+def _score_run(symbols, prepared, enable_dd_breaker):
+    """One scoring pass over prepared bars at a given breaker setting. Fresh engines + a fresh
+    shared account each call, so the two runs (off/on) are independent."""
+    per_symbol = {}
+    pooled_trades = []
+    bridge_skips = continuation_trades = volume_skips = dd_breaker_skips = news_skips = 0
+    fingerprints = {}
+    # R1 (FIX 7b): ONE equity tracker shared by every symbol's engine, driven in date order
+    # (run_lockstep), so the drawdown breaker and max_drawdown_pct see the candidate's whole account.
+    account = EquityTracker()
+    engines = {sym: NNFXEngine(NNFXParams(pip_size=0.01 if 'JPY' in sym else 0.0001,
+                                          enable_dd_breaker=enable_dd_breaker), equity=account)
+               for sym in symbols}
     all_records = run_lockstep(engines, prepared)
     for sym in symbols:
-        records = all_records[sym]
-        window = [r for r in records if r['date'][:4] >= '2019']
+        window = [r for r in all_records[sym] if r['date'][:4] >= '2019']
         bridge_skips += sum(1 for r in window if r['reason'] == 'skip:bridge_too_far')
         continuation_trades += sum(1 for r in window if r['reason'] == 'enter:continuation')
         volume_skips += sum(1 for r in window if r['reason'] == 'skip:volume_filter')
@@ -462,6 +472,19 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
                 continuation_trades=continuation_trades, volume_skips=volume_skips,
                 max_drawdown_pct=round(account.max_dd_pct, 2), dd_breaker_skips=dd_breaker_skips, news_skips=news_skips,
                 per_symbol=per_symbol, fingerprints=fingerprints)
+
+
+def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
+    """FIX 8: rank on the breaker-OFF run (full trade history, apples-to-apples) and report the
+    breaker-ON expectancy alongside, so the drawdown breaker never distorts the comparison. The
+    risk column max_drawdown_pct comes from the breaker-OFF run (the TRUE unprotected drawdown);
+    dd_breaker_skips comes from the breaker-ON run (how many entries the breaker WOULD stop)."""
+    prepared = _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref)
+    off = _score_run(symbols, prepared, enable_dd_breaker=False)  # ranking metric + true risk
+    on = _score_run(symbols, prepared, enable_dd_breaker=True)    # reference + real breaker skips
+    off['expectancy_pips_breaker'] = on['expectancy_pips']
+    off['dd_breaker_skips'] = on['dd_breaker_skips']
+    return off
 
 # ---- run ----------------------------------------------------------------------
 
@@ -715,15 +738,16 @@ def write_status_row(conn, it, bed, status, reason):
 def write_score_row(conn, it, bed, r):
     conn.execute("""
         INSERT INTO backtest_results(sha256, slot, signal_type, bed, stage, trades, wins, losses,
-            win_rate, expectancy_pips, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
+            win_rate, expectancy_pips, expectancy_pips_breaker, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
             mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b)
-        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
+        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
         ON CONFLICT(sha256, slot, bed) DO UPDATE SET trades=excluded.trades, wins=excluded.wins,
             losses=excluded.losses, win_rate=excluded.win_rate, expectancy_pips=excluded.expectancy_pips,
+            expectancy_pips_breaker=excluded.expectancy_pips_breaker,
             profit_factor=excluded.profit_factor, max_drawdown=excluded.max_drawdown, max_drawdown_pct=excluded.max_drawdown_pct,
             bridge_skips=excluded.bridge_skips, continuation_trades=excluded.continuation_trades, tested_at=excluded.tested_at
     """, (it['sha256'], it['slot'], it['signal_type'], bed, r['trades'], r['wins'], r['losses'], r['win_rate'],
-          r['expectancy_pips'], r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
+          r['expectancy_pips'], r.get('expectancy_pips_breaker'), r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
           f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b']))
     conn.commit()
 

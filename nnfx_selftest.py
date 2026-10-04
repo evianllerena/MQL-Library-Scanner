@@ -431,6 +431,16 @@ def unit_tests() -> Check:
     c.that('G10: today\'s value and its average come from the same line -- the cross-bar average (97.5) is the '
            '20-bar mean of the vol column itself', abs(avg - 97.5) < 1e-9, detail=str(avg))
 
+    # --- FIX 8: ranking runs the breaker OFF; the breaker-ON expectancy is reported alongside so the
+    #     drawdown breaker never distorts the comparison. A candidate that never trips it has identical
+    #     off/on expectancy and zero breaker skips. ----------------------------------------------------
+    _, res_rank = cross_bar_reason(batch_rows(200.0))
+    c.that('FIX 8 ranking: score_candidate reports BOTH expectancy_pips (breaker OFF) and expectancy_pips_breaker (ON)',
+           'expectancy_pips_breaker' in res_rank, detail=str(sorted(res_rank)))
+    c.that('FIX 8 ranking: a candidate that never trips the breaker has equal off/on expectancy and 0 breaker skips',
+           res_rank['expectancy_pips'] == res_rank['expectancy_pips_breaker'] and res_rank['dd_breaker_skips'] == 0,
+           detail=f"off={res_rank['expectancy_pips']} on={res_rank['expectancy_pips_breaker']} skips={res_rank['dd_breaker_skips']}")
+
     # --- FIX 4 / E1 C1-TRIGGERED entry (no fresh baseline cross this bar) -----------------
     # d1 establishes C1 short while price is already above the baseline; d2 is a FRESH C1
     # long cross, on-side, C2 agreeing, within 1xATR, volume ok -> E1 fires.
