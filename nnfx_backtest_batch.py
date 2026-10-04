@@ -70,6 +70,35 @@ def fetch_from(history_from: str) -> str:
     return d.strftime('%Y.%m.%d')
 
 
+def maxbars_for(history_from: str, today=None) -> int:
+    """MT5's per-chart bar cap for the batch runtime: enough D1 bars to reach fetch_from (~5/7 of
+    calendar days, +15%), rounded up to 100. Capping it stops MT5 from downloading ever-older
+    history in the background during extraction -- each new chunk reset every indicator on that
+    symbol (reproduced: EURCHF grew 26 bars per ~30 s, and candidates loaded mid-reset stalled)."""
+    today = today or datetime.now()
+    days = (today - datetime.strptime(fetch_from(history_from), '%Y.%m.%d')).days
+    return -(-int(days * 5 / 7 * 1.15) // 100) * 100
+
+
+def set_runtime_maxbars(rt, maxbars: int) -> None:
+    """Write [Charts] MaxBars into the batch runtime's own config/common.ini (UTF-16, MT5's
+    encoding). Only the batch's cloned runtime is touched, never the user's terminal."""
+    path = Path(rt) / 'config' / 'common.ini'
+    text = path.read_text(encoding='utf-16') if path.exists() else ''
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith('maxbars='):
+            lines[i] = f'MaxBars={maxbars}'
+            break
+    else:
+        if '[Charts]' in lines:
+            lines.insert(lines.index('[Charts]') + 1, f'MaxBars={maxbars}')
+        else:
+            lines += ['[Charts]', f'MaxBars={maxbars}']
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\r\n'.join(lines) + '\r\n', encoding='utf-16')
+
+
 def usable_symbols(statuses: dict, symbols, history_from: str):
     """Split the basket into symbols to score and symbols to leave out, from the controller's
     per-symbol status lines. A symbol is scored only if its history synchronized AND reaches the
@@ -108,7 +137,7 @@ def failure_reason(fails: dict) -> str:
     for sym, st in fails.items():
         by.setdefault(st, []).append(sym)
     parts = []
-    for st in ('load_failed', 'never_calculated', 'too_slow'):
+    for st in ('load_failed', 'never_calculated', 'too_slow', 'queue_unhealthy'):
         if st in by:
             parts.append(f"{st} on {','.join(by[st])}")
     if 'skipped_slow' in by:
@@ -244,6 +273,25 @@ int JInt(string obj,string key,int dflt=-1){
 }
 #define EV(x) ((x)==EMPTY_VALUE ? "EMPTY" : DoubleToString((x),8))
 
+// Some converted indicators leave the symbol's calculation queue in a state where the NEXT
+// indicator created on it never calculates (reproduced: after ZigZagOnFractals / soho-williams the
+// next handle stays at BarsCalculated=-1 indefinitely, even after a pause; the following one is
+// fine). So before every candidate, prove the queue is healthy with a throwaway Examples\Momentum:
+// if it does not calculate within ~0.75 s, release it and try another until one does. A candidate
+// that then fails to calculate is genuinely broken, not a victim of the one before it.
+bool WaitHealthy(string sym,int need,uint limit_ms){
+  uint t0=GetTickCount();
+  while(GetTickCount()-t0<limit_ms){
+    int h=iCustom(sym,PERIOD_D1,"Examples\\Momentum");
+    int c=-1; uint s0=GetTickCount();
+    while(h!=INVALID_HANDLE && GetTickCount()-s0<750){ c=BarsCalculated(h); if(c>=need) break; Sleep(25); }
+    if(h!=INVALID_HANDLE) IndicatorRelease(h);
+    if(c>=need) return(true);
+    Sleep(250);
+  }
+  return(false);
+}
+
 // Ask the server for D1 history back to `from` and wait until the series is synchronized and
 // reaches it (or the server has nothing older). Without this the script only sees whatever was
 // already cached locally -- ~15 bars for a pair the terminal never charted.
@@ -334,7 +382,9 @@ void OnStart(){
     for(int k=0;k<njobs;k++){
       string st="ok"; int calc=-1; uint j0=GetTickCount();
       if(strikes[k]>=MAX_STRIKES) st="skipped_slow";
+      else if(!WaitHealthy(sym,need,60000)) st="queue_unhealthy";  // not the candidate's fault: no strike
       else{
+        j0=GetTickCount();
         int h=iCustom(sym,PERIOD_D1,rels[k]);
         if(h==INVALID_HANDLE){ st="load_failed"; strikes[k]++; }
         else{
@@ -714,6 +764,9 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     sym0 = copied[0] if copied else (pb.copy_mt5_history(Path(mt5['data_dir']), rt) or symbols[0])
     pb.prime_mt5_runtime(rt, terminal_exe, sym0, 'nnfx-backtest')
     restore_account_login(Path(mt5['data_dir']), rt)
+    maxbars = maxbars_for(history_from)
+    set_runtime_maxbars(rt, maxbars)
+    stage_event('runtime_maxbars', maxbars=maxbars)
 
     # 1) stage every candidate source (mirrors render_shard's staging loop)
     prepared = {}

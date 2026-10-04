@@ -470,6 +470,16 @@ def unit_tests() -> Check:
     c.that('Extraction failures: only candidates that failed somewhere are reported, with one readable reason',
            set(fails) == {'slow'} and nb.failure_reason(fails['slow']) == 'too_slow on EURUSD,GBPUSD; skipped_slow on 2 more',
            detail=str(fails))
+    c.that('MaxBars: the runtime keeps just enough D1 bars to reach the warm-up start (2015 start on 2026-10-04 '
+           '-> 3700), so MT5 has nothing older to keep downloading mid-extraction',
+           nb.maxbars_for('2015.01.01', datetime(2026, 10, 4)) == 3700, detail=str(nb.maxbars_for('2015.01.01', datetime(2026, 10, 4))))
+    ini_rt = Path(tempfile.mkdtemp(prefix='nnfx_ini_'))
+    (ini_rt / 'config').mkdir()
+    (ini_rt / 'config' / 'common.ini').write_text('[Common]\r\nLogin=1\r\n[Charts]\r\nMaxBars=100000\r\n', encoding='utf-16')
+    nb.set_runtime_maxbars(ini_rt, 3700)
+    ini_text = (ini_rt / 'config' / 'common.ini').read_text(encoding='utf-16')
+    c.that("MaxBars: only the [Charts] MaxBars line of the runtime's own common.ini changes (UTF-16 kept)",
+           'MaxBars=3700' in ini_text and 'MaxBars=100000' not in ini_text and 'Login=1' in ini_text, detail=ini_text)
     c.that('History: the scoring window starts at score_from -- bars before it are warm-up only (no records counted)',
            in_win[-1][1:] == ('enter', 'enter:standard') and out_win == (), detail=f'{in_win[-1:]} {out_win}')
 
