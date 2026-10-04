@@ -27,6 +27,7 @@ from pathlib import Path
 from nnfx_engine import (
     NNFXEngine, NNFXParams,
     c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction, bar_close_utc,
+    EquityTracker, run_lockstep,
 )
 
 
@@ -671,7 +672,64 @@ def unit_tests() -> Check:
 
     c.that('M2: risk_pct defaults to 2.0', NNFXParams().risk_pct == 2.0)
 
+    # --- FIX 7b / R1 drawdown: % metric + 10%-from-peak circuit breaker --------------------
+    t = EquityTracker()
+    for r_mult in (1.0, -1.0, -1.0, 2.0):  # at 2% risk: 102 -> 99.96 -> 97.9608 -> 101.879
+        t.realize(r_mult, 2.0, 'd')
+    c.that('R1 metric: max_drawdown_pct matches the hand-computed value on a small curve (peak 102, two -2% steps to '
+           '97.9608 -> 1 - 0.98^2 = 3.96%)', abs(t.max_dd_pct - 3.96) < 1e-9, detail=str(t.max_dd_pct))
+
+    recs, acct, engs = dd_scenario(P(risk_pct=6.0))
+    a, b = recs['EURUSD'], recs['GBPUSD']
+    c.that('R1 metric (chronological, both symbols on one account): two EURUSD stop-outs at 6% risk take the account '
+           'to 88.36 -> max_drawdown_pct 11.64', round(acct.max_dd_pct, 2) == 11.64, detail=str(acct.curve))
+    c.that('R1 breaker fires: with the account 11.64% below its peak, the next valid EURUSD setup is SKIPPED '
+           '(skip:dd_breaker)', a[4]['reason'] == 'skip:dd_breaker', detail=str(a[4]))
+    c.that('R1 open trades keep their stops: the GBPUSD trade opened before the breach stays open through it and '
+           'exits normally on its own C1 flip', [r['action'] for r in b[1:5]] == ['hold'] * 4 and b[5]['reason'] == 'exit:c1_flip',
+           detail=str([r['reason'] for r in b]))
+    c.that('R1 breaker resumes (below_threshold): GBPUSD\'s profitable close lifts the account back to a 4.47% drawdown '
+           '-> the next EURUSD setup ENTERS', a[6]['reason'] == 'enter:standard' and round(acct.drawdown_pct(), 2) == 4.47,
+           detail=f"{a[6]} dd={acct.drawdown_pct()}")
+    recs_off, _, _ = dd_scenario(P(risk_pct=6.0, enable_dd_breaker=False))
+    c.that('R1 off (enable_dd_breaker=False): the same EURUSD setup during the drawdown ENTERS (pre-FIX-7b behavior)',
+           recs_off['EURUSD'][4]['reason'] == 'enter:standard', detail=str(recs_off['EURUSD'][4]))
+    solo = {sym: actions(P(risk_pct=6.0, enable_dd_breaker=False), bars) for sym, bars in dd_scenario_bars().items()}
+    c.that('R1 lockstep: driving symbols together in date order gives each symbol exactly the records it gets alone '
+           '(only a shared tracker + the breaker couple them)',
+           all([(r['action'], r['reason'], r['pips']) for r in recs_off[sym]] == solo[sym] for sym in solo))
+
     return c
+
+
+def dd_scenario_bars():
+    """FIX 7b fixture: EURUSD is stopped out twice (05-02, 05-04), then sets up again on 05-05
+    and 05-07; GBPUSD holds one long from 05-01 and exits +3.0 on its C1 flip on 05-06."""
+    lose = dict(high=100.65, low=99.0)  # SL 99.1 hit
+    eur = [
+        _bar('2025-05-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),             # enter
+        _bar('2025-05-02', 99.05, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, **lose),     # SL: -1R
+        _bar('2025-05-03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.05),             # enter again
+        _bar('2025-05-04', 99.05, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, **lose),     # SL: -1R -> 11.64% DD
+        _bar('2025-05-05', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.05),             # valid setup: BREAKER
+        _bar('2025-05-06', 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.65, low=99.45),  # back below
+        _bar('2025-05-07', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),              # valid setup: resumed
+    ]
+    hold = lambda d: _bar(d, 100.8, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.8, high=100.9, low=100.7)
+    gbp = [
+        _bar('2025-05-01', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),             # enter
+        hold('2025-05-02'), hold('2025-05-03'), hold('2025-05-04'), hold('2025-05-05'),
+        _bar('2025-05-06', 103.6, 100.0, 0.9, 1.0, 5.0, 10.0, close_prev=100.8, high=103.7, low=100.8),  # TP1 + C1 flip: +1.33R
+    ]
+    return {'EURUSD': eur, 'GBPUSD': gbp}
+
+
+def dd_scenario(params):
+    """Both symbols' engines share ONE EquityTracker and run in date order (run_lockstep)."""
+    acct = EquityTracker()
+    bars = dd_scenario_bars()
+    engs = {sym: NNFXEngine(params, equity=acct) for sym in bars}
+    return run_lockstep(engs, bars), acct, engs
 
 
 def write_news_calendar(path: Path, events) -> Path:
@@ -917,6 +975,24 @@ def build_traces(out_dir: Path) -> list[Path]:
         b.update(symbol='EURUSD', time_utc=bar_close_utc(b['date'], 0.0))
     paths.append(write_trace(out_dir, 'trace_18_n1_news_block_then_enter.csv', bars,
                              P(enable_news_filter=True, news_calendar=str(cal))))
+
+    # Trace 19 (FIX 7b, R1): EURUSD and GBPUSD share one account (6% risk so two stops breach 10%),
+    # run in date order. Two EURUSD stop-outs take equity to 88.36 (-11.64% from peak) -> the
+    # 05-05 EURUSD setup is skipped (skip:dd_breaker) while GBPUSD's open trade keeps running;
+    # GBPUSD's +1.33R close on 05-06 lifts the drawdown to 4.47% -> the 05-07 EURUSD setup enters.
+    acct = EquityTracker()
+    scen = dd_scenario_bars()
+    engs = {sym: NNFXEngine(P(risk_pct=6.0), equity=acct) for sym in scen}
+    path = out_dir / 'trace_19_r1_dd_breaker.csv'
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['date', 'symbol', 'close', 'action', 'reason', 'pips', 'equity_pct', 'drawdown_pct'])
+        order = sorted((b['date'], k, i, sym) for k, sym in enumerate(scen) for i, b in enumerate(scen[sym]))
+        for date, _k, i, sym in order:  # the same date order run_lockstep uses
+            rec = engs[sym].process_bar(scen[sym][i])
+            w.writerow([date, sym, scen[sym][i]['close'], rec['action'], rec['reason'], rec['pips'],
+                        round(acct.equity, 2), round(acct.drawdown_pct(), 2)])
+    paths.append(path)
 
     return paths
 

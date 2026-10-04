@@ -24,7 +24,7 @@ Function <-> EA cross-reference (NNFXHarness.mq5):
   NNFXEngine.process_bar  <-> OnNewDailyBar() + ManageOpenPosition()
 """
 from __future__ import annotations
-import bisect, csv
+import bisect, csv, heapq
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -151,6 +151,27 @@ class Position:
 
 
 @dataclass
+class EquityTracker:
+    """R1 (FIX 7b): REALIZED equity as % of the starting account, compounded per realized result
+    at risk_pct per trade. A result of R (pips / the 1.5xATR stop distance) moves equity by
+    R x risk_pct %. One tracker can be SHARED by several engines (one per symbol) driven in
+    chronological order (run_lockstep), which makes it the candidate's whole-account curve."""
+    equity: float = 100.0
+    peak: float = 100.0
+    max_dd_pct: float = 0.0
+    curve: list = field(default_factory=list)  # (date, equity) after each realized result
+
+    def drawdown_pct(self) -> float:
+        return (self.peak - self.equity) / self.peak * 100.0
+
+    def realize(self, r_multiple: float, risk_pct: float, date: str) -> None:
+        self.equity *= 1.0 + r_multiple * risk_pct / 100.0
+        self.peak = max(self.peak, self.equity)
+        self.max_dd_pct = max(self.max_dd_pct, self.drawdown_pct())
+        self.curve.append((date, self.equity))
+
+
+@dataclass
 class NNFXParams:
     sl_mult: float = 1.5
     tp1_mult: float = 1.0
@@ -238,9 +259,18 @@ class NNFXParams:
     x5_cutoff: str = 'handoff'
     x5_profit_atr: float = 1.0
     server_utc_offset_hours: float = 0.0  # broker server time -> UTC, used by bar_close_utc callers
-    # M2 (label A): risk 2% per trade. The engine works in pips, so this scales absolute sizing
-    # only and never changes which trades fire.
+    # M2 (label A): risk 2% per trade. The engine works in pips, so this never changes which
+    # trades fire by itself; it sets how far each result moves the % equity curve (R1 below).
     risk_pct: float = 2.0
+    # --- FIX 7b R1 drawdown circuit breaker (MASTER_HANDOFF Section 0 / Decision #12) -------
+    # Once REALIZED equity is >= dd_breaker_pct below its peak, open NO new trades (every entry
+    # type, continuation included); open trades keep their stops and exits. dd_resume_rule:
+    # 'below_threshold' (DEFAULT, FLAGGED for user confirm) = resume as soon as the drawdown is
+    # back under dd_breaker_pct. NB: realized equity only moves when a trade closes, so once every
+    # position is flat while tripped, nothing can lift the drawdown back under the threshold.
+    enable_dd_breaker: bool = True
+    dd_breaker_pct: float = 10.0
+    dd_resume_rule: str = 'below_threshold'
     volume_threshold_mult: float = 1.0
     pip_size: float = 0.0001
 
@@ -268,13 +298,23 @@ class NNFXEngine:
     pending_pullback_dir: int = 0
     pending_onecandle_dir: int = 0
     pending_onecandle_bar: int = -1
+    # R1 (FIX 7b): realized % equity. Pass ONE shared tracker to several engines (run_lockstep)
+    # for a whole-account curve across symbols; by default each engine has its own.
+    equity: EquityTracker = field(default_factory=EquityTracker)
+    _date: str = ''  # date of the bar being processed (stamps realized results)
 
     def _pips(self, entry: float, exitp: float, direction: int) -> float:
         return ((exitp - entry) if direction > 0 else (entry - exitp)) / self.params.pip_size
 
+    def _realize(self, pos: Position, exit_price: float, fraction: float) -> None:
+        """Book `fraction` of the position (0.5 = one half) closed at exit_price, in R."""
+        r = (exit_price - pos.entry_price) * pos.direction / (self.params.sl_mult * pos.atr_at_entry)
+        self.equity.realize(fraction * r, self.params.risk_pct, self._date)
+
     def _close_all(self, exit_price: float, reason: str) -> dict:
         pos = self.position
         pips = self._pips(pos.entry_price, exit_price, pos.direction)
+        self._realize(pos, exit_price, 0.5 if pos.tp1_hit else 1.0)  # after TP1 only the runner is left
         self.last_exit_dir = pos.direction
         self.realized_pips += pips
         self.position = None
@@ -318,6 +358,9 @@ class NNFXEngine:
 
     def _entry_block_reason(self, bar: dict) -> Optional[str]:
         """Rules that veto ANY new trade (every entry type, continuation included)."""
+        p = self.params
+        if p.enable_dd_breaker and self.equity.drawdown_pct() >= p.dd_breaker_pct:
+            return 'skip:dd_breaker'  # R1; resumes once back under the threshold ('below_threshold')
         if self._news_ahead(bar):
             return 'skip:news'
         return None
@@ -345,6 +388,7 @@ class NNFXEngine:
         c2_value, c2_zero_reference, volume_value, volume_avg, atr.
         Optional: exit_value + exit_zero_reference (X2 exit indicator)."""
         p = self.params
+        self._date = bar['date']
         self.c1_history.append((bar['c1_fast'], bar['c1_slow']))
         idx = len(self.c1_history) - 1
 
@@ -397,6 +441,7 @@ class NNFXEngine:
                     pos.half1_open = False
                     # remaining half's stop -> breakeven immediately (NNFX_RULESET_THE_TRUTH.txt SS5)
                     pos.sl = pos.entry_price
+                    self._realize(pos, pos.tp1, 0.5)
                     half_pips = self._pips(pos.entry_price, pos.tp1, pos.direction)
                     record.update({'action': 'exit_half', 'reason': 'exit:tp1_half', 'pips': round(half_pips, 1)})
 
@@ -578,3 +623,16 @@ class NNFXEngine:
                     record.update({'action': 'skip', 'reason': 'skip:beyond_1xATR'}); return record
                 return self._open(d, bar, 'enter:c1_trigger', record)
         return record
+
+
+def run_lockstep(engines: dict, bars: dict) -> dict:
+    """Drive several symbols' engines together in CHRONOLOGICAL order: every symbol's bar for a
+    date is processed before any later date (ties in `bars` key order). Engines that share one
+    EquityTracker then see the candidate's whole-account equity as it stood on each date (R1).
+    bars = {symbol: [bar, ...] oldest-first}; returns {symbol: [record, ...]}. Engines that do
+    NOT share a tracker give the same records as driving each symbol on its own."""
+    streams = [[(b['date'], k, i, sym) for i, b in enumerate(bars[sym])] for k, sym in enumerate(bars)]
+    records = {sym: [] for sym in bars}
+    for _date, _k, i, sym in heapq.merge(*streams):
+        records[sym].append(engines[sym].process_bar(bars[sym][i]))
+    return records

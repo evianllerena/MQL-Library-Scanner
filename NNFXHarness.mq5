@@ -138,6 +138,13 @@ input string X5Cutoff             = "handoff"; // "handoff" | "not_past_tp1"
 input double X5ProfitATR          = 1.0;
 input double ServerUTCOffsetHours = 0.0;       // broker server time - UTC (e.g. 2 or 3)
 
+// --- FIX 7b R1 drawdown circuit breaker (mirrors NNFXParams enable_dd_breaker/dd_*) ------------
+// Once REALIZED balance is >= DDBreakerPct below its peak, open no new trades (any entry type);
+// open trades keep their stops. "below_threshold" (default, flagged) = resume once back under.
+input bool   EnableDDBreaker      = true;
+input double DDBreakerPct         = 10.0;
+input string DDResumeRule         = "below_threshold";
+
 // --- chart layout: each role in its OWN subwindow, never shared -----
 #define WIN_MAIN   0
 #define WIN_C1     1
@@ -205,6 +212,8 @@ double g_entryPriceForLog = 0.0;
 string   g_newsCur[];         // FIX 7: High-impact events (currency, UTC time), loaded in OnInit
 datetime g_newsTime[];
 long     g_summaryNewsSkips=0;
+double   g_peakBalance=0.0;   // FIX 7b: realized-balance peak
+long     g_summaryDDSkips=0;
 double g_atrAtEntry = 0.0;   // FIX 6: T4 reference ATR (TrailATRRef="entry")
 bool   g_trailActive = false; // FIX 6: sticky once a close reached TrailActivateATR beyond entry
 bool   g_half1PipsSet = false, g_half2PipsSet = false;
@@ -493,6 +502,11 @@ bool NewsAhead(int shift)
 // Rules that veto ANY new trade (every entry type, continuation included). Logs the skip.
 bool EntryBlocked(int dir,double atrVal)
 {
+   if(EnableDDBreaker && g_peakBalance>0)
+   {
+      double dd=(g_peakBalance-AccountInfoDouble(ACCOUNT_BALANCE))/g_peakBalance*100.0;
+      if(dd>=DDBreakerPct) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:dd_breaker"); g_summaryDDSkips++; return(true); }
+   }
    if(NewsAhead(1)) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:news"); g_summaryNewsSkips++; return(true); }
    return(false);
 }
@@ -923,6 +937,7 @@ int ExitDirection(int shift)
 void OnTick()
 {
    double atrVal;
+   g_peakBalance = MathMax(g_peakBalance, AccountInfoDouble(ACCOUNT_BALANCE)); // R1: realized peak
    datetime t0 = iTime(_Symbol,PERIOD_D1,0);
    bool newBar = (t0!=g_lastBarTime);
    if(BufVal(h_atr,0,1,atrVal)) ManageOpenPosition(atrVal,newBar); // fills every tick; T4 trail on newBar only
@@ -954,7 +969,9 @@ double OnTester()
       FileWrite(h, TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS), "summary_rule_audit", "-",
                 DoubleToString((double)g_summaryBridgeSkips,0), "", "", "",
                 "bridge_skips", DoubleToString((double)g_summaryContinuationTrades,0), "continuation_trades",
-                DoubleToString((double)g_summaryNewsSkips,0), "news_skips");
+                DoubleToString((double)g_summaryNewsSkips,0), "news_skips",
+                DoubleToString((double)g_summaryDDSkips,0), "dd_breaker_skips",
+                DoubleToString(TesterStatistics(STAT_BALANCE_DDREL_PERCENT),2), "max_drawdown_pct_balance");
       FileClose(h);
    }
    return(g_summaryPipsSum);
