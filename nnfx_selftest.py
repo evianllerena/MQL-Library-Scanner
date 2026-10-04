@@ -25,7 +25,7 @@ from pathlib import Path
 
 from nnfx_engine import (
     NNFXEngine, NNFXParams,
-    c2_direction, baseline_cross_closed, c1_direction_run_length,
+    c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction,
 )
 
 
@@ -279,6 +279,146 @@ def unit_tests() -> Check:
     c.that('entry_agreement: no fresh baseline cross (already on that side) -> no entry',
            try_entry(close=100.6, close_prev=100.6, baseline=100.0, baseline_prev=100.0)['action'] != 'enter')
 
+    # --- X4 wrong-side-baseline exit (FIX 1). Long entry at 100.6, SL 99.1, TP1 101.6.
+    #     C1 stays long the whole time, so neither SL nor a C1 flip can be the exit. -----
+    def x4_bars():
+        return [
+            _bar('2024-06-10', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                         # standard long entry
+            _bar('2024-06-11', 100.2, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.7, low=99.7),  # dips below intrabar, CLOSES above
+            _bar('2024-06-12', 100.0, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.2, high=100.3, low=99.8),  # closes exactly ON the baseline
+            _bar('2024-06-13', 99.7, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.0, high=100.1, low=99.6),   # CLOSES below; low 99.6 > SL 99.1
+        ]
+    eng_x4 = NNFXEngine(P())
+    r_x4 = [eng_x4.process_bar(b) for b in x4_bars()]
+    c.that('X4: an intrabar dip below the baseline that CLOSES above does not exit',
+           r_x4[1]['action'] == 'hold', detail=str(r_x4[1]))
+    c.that('X4: a close exactly ON the baseline (side 0) does not exit', r_x4[2]['action'] == 'hold', detail=str(r_x4[2]))
+    c.that('X4: a CLOSE on the wrong side of the baseline exits the whole position at the close, '
+           'with SL untouched and C1 still agreeing',
+           r_x4[3]['action'] == 'exit' and r_x4[3]['reason'] == 'exit:baseline_cross' and r_x4[3]['pips'] == -0.9
+           and eng_x4.position is None, detail=str(r_x4[3]))
+
+    eng_x4_off = NNFXEngine(P(enable_baseline_exit=False))
+    r_off = [eng_x4_off.process_bar(b) for b in x4_bars()]
+    c.that('X4 off (enable_baseline_exit=False): the same wrong-side close leaves the trade open (pre-FIX-1 behavior)',
+           r_off[3]['action'] == 'hold' and eng_x4_off.position is not None, detail=str(r_off[3]))
+
+    eng_x4_short = NNFXEngine(P())
+    eng_x4_short.process_bar(_bar('2024-06-20', 99.4, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5))      # standard short entry
+    r_s = eng_x4_short.process_bar(_bar('2024-06-21', 100.3, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=99.4,
+                                        high=100.4, low=99.9))                                              # closes ABOVE: wrong side for a short
+    c.that('X4: mirrors for shorts -- a close above the baseline exits a short', r_s['reason'] == 'exit:baseline_cross', detail=str(r_s))
+
+    # X4 exit also breaks the continuation sequence: price closed across the baseline after
+    # the original entry, so a later fresh long C1 + C2 back above must NOT continuation-enter.
+    eng_x4_cont = NNFXEngine(P())
+    for b in x4_bars():
+        eng_x4_cont.process_bar(b)
+    eng_x4_cont.process_bar(_bar('2024-06-14', 100.4, 100.0, 0.9, 1.0, -1.0, 10.0, close_prev=99.7))        # back above; C1 short -> no entry
+    r_c = eng_x4_cont.process_bar(_bar('2024-06-15', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.4))  # fresh long C1, C2 agrees
+    c.that('X4: the wrong-side close that triggered the exit also resets continuation -- no re-entry after it',
+           r_c['action'] != 'enter', detail=str(r_c))
+
+    # --- X2 exit indicator (FIX 2). Reference exit = Momentum, centre line 100. ----------
+    c.that('X2 exit_direction: 100.4 vs centre line 100 -> long', exit_direction(100.4, 100.0) == 1)
+    c.that('X2 exit_direction: 99.6 vs centre line 100 -> SHORT, although 99.6 > 0 (never assume 0)',
+           exit_direction(99.6, 100.0) == -1)
+    c.that('X2 exit_direction: exactly on the centre line -> 0 (no signal)', exit_direction(100.0, 100.0) == 0)
+
+    def x2_bars(zero_ref=100.0, with_exit=True):
+        bars = [
+            _bar('2024-08-12', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                         # standard long entry
+            _bar('2024-08-13', 100.8, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.9, low=100.5),
+            _bar('2024-08-14', 100.4, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.8, high=100.8, low=100.3),
+        ]
+        for b, v in zip(bars, (100.5, 100.4, 99.6)):
+            if with_exit:
+                b.update(exit_value=v, exit_zero_reference=zero_ref)
+        return bars
+
+    eng_x2 = NNFXEngine(P())
+    r_x2 = [eng_x2.process_bar(b) for b in x2_bars()]
+    c.that('X2: exit indicator above its centre line (100.4 vs 100) holds the long', r_x2[1]['action'] == 'hold', detail=str(r_x2[1]))
+    c.that('X2: exit indicator crossing below its centre line (99.6 vs 100) closes the long at the close, with '
+           'C1 still long, price above the baseline and SL untouched',
+           r_x2[2]['action'] == 'exit' and r_x2[2]['reason'] == 'exit:exit_indicator' and r_x2[2]['pips'] == -0.2,
+           detail=str(r_x2[2]))
+
+    eng_x2_zero = NNFXEngine(P())
+    r_zero = [eng_x2_zero.process_bar(b) for b in x2_bars(zero_ref=0.0)]
+    c.that('X2 zero_reference proof: the SAME value 99.6 read against an assumed 0 would say "long" and hold -- '
+           'so the exit above can only come from the indicator\'s own centre line of 100',
+           r_zero[2]['action'] == 'hold' and eng_x2_zero.position is not None, detail=str(r_zero[2]))
+
+    eng_x2_off = NNFXEngine(P(enable_exit_indicator=False))
+    r_off2 = [eng_x2_off.process_bar(b) for b in x2_bars()]
+    c.that('X2 off (enable_exit_indicator=False): the same bars hold', r_off2[2]['action'] == 'hold', detail=str(r_off2[2]))
+
+    eng_short_x2 = NNFXEngine(P())
+    eng_short_x2.process_bar(dict(_bar('2024-08-20', 99.4, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5),
+                                  exit_value=99.0, exit_zero_reference=100.0))                        # short entry
+    r_sx = eng_short_x2.process_bar(dict(_bar('2024-08-21', 99.6, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=99.4,
+                                              high=99.7, low=99.3), exit_value=100.3, exit_zero_reference=100.0))
+    c.that('X2: mirrors for shorts -- exit indicator rising above its centre line closes a short',
+           r_sx['reason'] == 'exit:exit_indicator', detail=str(r_sx))
+
+    # No exit indicator supplied => bar-for-bar identical to FIX 1 (regression guard). Run every
+    # existing trace fixture plus the X2 bars without exit keys vs with the feature disabled.
+    def actions(params, bars):
+        e = NNFXEngine(params)
+        return [(r['action'], r['reason'], r['pips']) for r in (e.process_bar(dict(b)) for b in bars)]
+    no_exit_bars = x4_bars() + x2_bars(with_exit=False)
+    c.that('X2 dormant: with no exit indicator on the bars, results equal the feature switched off',
+           actions(P(), no_exit_bars) == actions(P(enable_exit_indicator=False), no_exit_bars))
+
+    # --- FIX 3 / G9: the batch scorer filters NON-volume candidates with the reference volume
+    #     indicator (column "vol"), value and 20-bar average from that same line. Uses the real
+    #     nnfx_backtest_batch.score_candidate on synthetic extract rows (Baseline candidate). ---
+    import nnfx_backtest_batch as nb
+
+    def batch_rows(vol_at_cross, with_vol=True):
+        rows = []
+        for i in range(22):
+            cross = i == 21
+            close = 100.6 if cross else 99.5
+            row = dict(date=f'2024.03.{i + 1:02d}', close=str(close), high=str(close + 0.05), low=str(close - 0.05),
+                       ma='100.0', macd_m='1.0' if i >= 19 else '0.9', macd_s='0.95',   # C1 long for 3 bars only
+                       rvi='0.2' if cross else '-0.1', atr='1.0', cand_a='100.0')       # C2 long on the cross bar
+            if with_vol:
+                row['vol'] = str(vol_at_cross if cross else 100.0)
+            rows.append(row)
+        return rows
+
+    def cross_bar_reason(rows):
+        res = nb.score_candidate({'EURUSD': {'rows': rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)
+        return res['fingerprints']['EURUSD'][-1], res
+
+    fp_fail, res_fail = cross_bar_reason(batch_rows(50.0))    # 50 < 20-bar avg 97.5
+    c.that('G9 wiring: a Baseline candidate\'s otherwise-valid entry (cross + C1 + C2, within 1xATR) is SKIPPED '
+           'when the reference volume is below its own 20-bar average',
+           fp_fail[1:] == ('skip', 'skip:volume_filter') and res_fail['volume_skips'] == 1, detail=str(fp_fail))
+    fp_pass, _ = cross_bar_reason(batch_rows(200.0))          # 200 >= 20-bar avg 105
+    c.that('G9 wiring: the same entry is TAKEN when the reference volume is at/above its 20-bar average',
+           fp_pass[1:] == ('enter', 'enter:standard'), detail=str(fp_pass))
+    fp_legacy, _ = cross_bar_reason(batch_rows(50.0, with_vol=False))
+    c.that('G9 wiring: a pre-FIX-3 extract (no "vol" column) keeps the old always-pass and enters',
+           fp_legacy[1:] == ('enter', 'enter:standard'), detail=str(fp_legacy))
+    # Warm-up: bars before the 20-bar volume average exists must still reach the engine (they
+    # fail the filter), so C1 history is unbroken. Here C1 is long for all 22 bars -> at the
+    # cross C1 has run 22 bars -> bridge-too-far must still skip. Dropping warm-up bars would
+    # leave only 3 bars of C1 history and wrongly let the trade through.
+    long_c1 = batch_rows(200.0)
+    for row in long_c1:
+        row['macd_m'] = '1.0'
+    fp_warm, _ = cross_bar_reason(long_c1)
+    c.that('G9 warm-up: bars without a volume average still feed C1 history -- a long C1 run is still '
+           'skipped as bridge-too-far, not let through by a truncated history',
+           fp_warm[1:] == ('skip', 'skip:bridge_too_far'), detail=str(fp_warm))
+
+    avg = nb.rolling_avg([float(r['vol']) for r in batch_rows(50.0)], nb.VOLUME_AVG_PERIOD)[-1]
+    c.that('G10: today\'s value and its average come from the same line -- the cross-bar average (97.5) is the '
+           '20-bar mean of the vol column itself', abs(avg - 97.5) < 1e-9, detail=str(avg))
+
     return c
 
 
@@ -286,8 +426,9 @@ def unit_tests() -> Check:
 # 2. TRACE MODE -- 5 named scenarios, bar-by-bar CSV
 # ---------------------------------------------------------------------------
 
-TRACE_HEADER = ['date', 'baseline', 'c1_fast', 'c1_slow', 'c1_dir', 'c2_value', 'c2_dir',
-                'volume_value', 'volume_avg', 'direction_decision', 'action', 'reason', 'lots', 'atr', 'pips']
+TRACE_HEADER = ['date', 'close', 'high', 'low', 'baseline', 'c1_fast', 'c1_slow', 'c1_dir', 'c2_value', 'c2_dir',
+                'volume_value', 'volume_avg', 'exit_value', 'exit_dir', 'direction_decision', 'action', 'reason',
+                'lots', 'atr', 'pips', 'sl_after']
 
 
 def write_trace(out_dir: Path, filename: str, bars: list[dict], params: NNFXParams) -> Path:
@@ -298,7 +439,10 @@ def write_trace(out_dir: Path, filename: str, bars: list[dict], params: NNFXPara
         w.writeheader()
         for bar in bars:
             rec = eng.process_bar(bar)
-            w.writerow({k: rec.get(k, '') for k in TRACE_HEADER})
+            row = {k: rec.get(k, '') for k in TRACE_HEADER}
+            row.update(close=bar['close'], high=round(bar['high'], 5), low=round(bar['low'], 5),
+                       sl_after=round(eng.position.sl, 4) if eng.position else '')
+            w.writerow(row)
     return path
 
 
@@ -348,6 +492,65 @@ def build_traces(out_dir: Path) -> list[Path]:
         _bar('2024-10-03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.0),                   # fresh cross, within 1xATR -> standard entry
     ]
     paths.append(write_trace(out_dir, 'trace_5_volume_then_pullback_skips.csv', bars, P()))
+
+    # Trace 6 (FIX 1, X4 ON): long entry, an intrabar dip below the baseline that closes
+    # above (no exit), a close exactly on the baseline (no exit), then a close below it ->
+    # exit:baseline_cross. SL (99.1) is never touched and C1 never flips. The bars after the
+    # exit show what the trade would have run into: SL on 07-09, C1 flip on 07-10.
+    # Trace 7 = the SAME bars with X4 off (control): the trade survives the wrong-side
+    # close and is only stopped out two bars later at the full -1.5xATR.
+    bars = [
+        _bar('2024-07-03', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5),                         # standard long entry
+        _bar('2024-07-04', 100.2, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.7, low=99.7),  # dip below intrabar, close above: HOLD
+        _bar('2024-07-05', 100.0, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.2, high=100.3, low=99.8),  # close ON baseline: HOLD
+        _bar('2024-07-08', 99.7, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.0, high=100.1, low=99.6),   # close BELOW: X4 EXIT (-0.9)
+        _bar('2024-07-09', 99.3, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.7, high=99.6, low=99.0),     # would hit SL 99.1 here
+        _bar('2024-07-10', 99.2, 100.0, 0.9, 1.0, -1.0, 10.0, close_prev=99.3, high=99.4, low=99.1),    # C1 flips short here
+    ]
+    paths.append(write_trace(out_dir, 'trace_6_x4_baseline_exit.csv', bars, P()))
+    paths.append(write_trace(out_dir, 'trace_7_x4_off_control.csv', bars, P(enable_baseline_exit=False)))
+
+    # Trace 8 (FIX 2, X2): long entry; the exit indicator (Momentum, centre line 100) drops to
+    # 99.6 on 08-07 while C1 is long, price is above the baseline and SL is far away ->
+    # exit:exit_indicator. Later bars show what the trade would have run into: a wrong-side
+    # close on 08-08 (X4), the stop on 08-09, the C1 flip on 08-12.
+    # Trace 9 = the SAME bars with no exit indicator supplied (control): identical to FIX 1
+    # behavior -- the trade rides on and is closed by X4 on 08-08.
+    def x2_trace_bars(with_exit):
+        rows = [
+            ('2024-08-05', 100.6, None, None, 1.0, 0.9, 100.5, dict(close_prev=99.5)),                # standard long entry
+            ('2024-08-06', 100.9, 101.0, 100.5, 1.0, 0.9, 100.4, {}),                                 # exit ind. above 100: HOLD
+            ('2024-08-07', 100.5, 100.9, 100.4, 1.0, 0.9, 99.6, {}),                                  # exit ind. 99.6 < 100: X2 EXIT
+            ('2024-08-08', 99.8, 100.4, 99.7, 1.0, 0.9, 99.3, {}),                                    # wrong-side close (X4) here
+            ('2024-08-09', 99.2, 99.8, 99.0, 1.0, 0.9, 99.1, {}),                                     # SL 99.1 hit here
+            ('2024-08-12', 99.1, 99.3, 99.0, 0.9, 1.0, 98.9, {}),                                     # C1 flips here
+        ]
+        out, prev = [], None
+        for date, close, hi, lo, f, s, ev, extra in rows:
+            kw = dict(close_prev=prev if prev is not None else close)
+            kw.update(extra)
+            if hi is not None:
+                kw.update(high=hi, low=lo)
+            b = _bar(date, close, 100.0, f, s, 5.0, 10.0, **kw)
+            if with_exit:
+                b.update(exit_value=ev, exit_zero_reference=100.0)
+            out.append(b)
+            prev = close
+        return out
+    paths.append(write_trace(out_dir, 'trace_8_x2_exit_indicator.csv', x2_trace_bars(True), P()))
+    paths.append(write_trace(out_dir, 'trace_9_x2_no_exit_indicator_control.csv', x2_trace_bars(False), P()))
+
+    # Trace 10 (FIX 3, volume filter): two fresh long baseline crosses where baseline, C1 and
+    # C2 all agree and price is within 1xATR. On 09-03 the reference volume (80) is below its
+    # own 20-bar average (100) -> skip:volume_filter. Price drops back below, then on 09-05 the
+    # same setup crosses again with volume 130 >= average 101.5 -> enter:standard.
+    bars = [
+        _bar('2024-09-02', 99.5, 100.0, 0.9, 1.0, -1.0, 100.0, close_prev=99.6, volume_avg=100.0),             # below baseline, C1 short
+        _bar('2024-09-03', 100.6, 100.0, 1.0, 0.9, 5.0, 80.0, close_prev=99.5, volume_avg=100.0),              # cross+C1+C2 agree, VOLUME FAILS
+        _bar('2024-09-04', 99.6, 100.0, 1.0, 0.9, 5.0, 90.0, close_prev=100.6, high=100.7, low=99.5, volume_avg=99.5),  # back below: no entry
+        _bar('2024-09-05', 100.5, 100.0, 1.0, 0.9, 5.0, 130.0, close_prev=99.6, volume_avg=101.5),             # same setup, VOLUME PASSES
+    ]
+    paths.append(write_trace(out_dir, 'trace_10_volume_filter_skip_then_take.csv', bars, P()))
 
     return paths
 

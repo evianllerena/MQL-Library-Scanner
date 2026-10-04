@@ -19,6 +19,7 @@ Function <-> EA cross-reference (NNFXHarness.mq5):
   baseline_cross_closed   <-> BaselineCrossClosed()
   baseline_side           <-> BaselineSide()
   volume_passes           <-> VolumePasses()
+  exit_direction          <-> ExitDirection()
   c1_direction_run_length <-> C1DirectionRunLength()
   NNFXEngine.process_bar  <-> OnNewDailyBar() + ManageOpenPosition()
 """
@@ -44,6 +45,12 @@ def c2_direction(value: float, zero_reference: float) -> int:
     if value > zero_reference: return 1
     if value < zero_reference: return -1
     return 0
+
+
+def exit_direction(value: float, zero_reference: float) -> int:
+    """Exit indicator side vs its OWN zero_reference (X2; never assumed 0). Same
+    centre-line read as c2_direction -- e.g. Momentum's centre line is 100."""
+    return c2_direction(value, zero_reference)
 
 
 def baseline_cross_closed(close_now: float, close_prev: float, base_now: float, base_prev: float) -> int:
@@ -124,6 +131,13 @@ class NNFXParams:
     # it would be inventing an unstated third exemption; set False only once
     # VP's exact wording on this is available, per SS12's own instruction.
     require_c2_for_continuation: bool = True
+    # X4 (NNFX_RULESET_THE_TRUTH.txt SS5, label B, Decision 2): a close on the
+    # wrong side of the baseline closes what is left. False = pre-FIX-1 behavior.
+    enable_baseline_exit: bool = True
+    # X2 (SS5, label A slot / B mechanics): the exit indicator turning against the
+    # trade closes what is left. Only active on bars that carry exit_value; a bar
+    # without one (no exit indicator supplied) behaves exactly as before FIX 2.
+    enable_exit_indicator: bool = True
     volume_threshold_mult: float = 1.0
     pip_size: float = 0.0001
 
@@ -155,9 +169,15 @@ class NNFXEngine:
         self.position = None
         return {'action': 'exit', 'reason': reason, 'direction': pos.direction, 'pips': round(pips, 1)}
 
+    def _reset_continuation_if_wrong_side(self, side: int) -> None:
+        if self.trend_dir != 0 and side != 0 and side != self.trend_dir:
+            self.trend_dir = 0
+            self.continuation_ok = False
+
     def process_bar(self, bar: dict) -> dict:
         """bar keys: date, close, high, low, baseline, c1_fast, c1_slow,
-        c2_value, c2_zero_reference, volume_value, volume_avg, atr."""
+        c2_value, c2_zero_reference, volume_value, volume_avg, atr.
+        Optional: exit_value + exit_zero_reference (X2 exit indicator)."""
         p = self.params
         self.c1_history.append((bar['c1_fast'], bar['c1_slow']))
         idx = len(self.c1_history) - 1
@@ -174,12 +194,15 @@ class NNFXEngine:
         c2dir = c2_direction(bar['c2_value'], bar['c2_zero_reference'])
         cross = baseline_cross_closed(bar['close'], bar.get('close_prev', bar['close']), bar['baseline'], bar.get('baseline_prev', bar['baseline']))
         side = baseline_side(bar['close'], bar['baseline'])
+        exit_value = bar.get('exit_value')
+        exitdir = exit_direction(exit_value, bar['exit_zero_reference']) if exit_value is not None else 0
 
         record = {
             'date': bar['date'], 'baseline': bar['baseline'],
             'c1_fast': bar['c1_fast'], 'c1_slow': bar['c1_slow'], 'c1_dir': c1dir,
             'c2_value': bar['c2_value'], 'c2_dir': c2dir,
             'volume_value': bar['volume_value'], 'volume_avg': bar['volume_avg'],
+            'exit_value': exit_value if exit_value is not None else '', 'exit_dir': exitdir if exit_value is not None else '',
             'direction_decision': cross if cross != 0 else side,
             'action': 'hold', 'reason': '', 'lots': '', 'atr': bar['atr'], 'pips': '',
         }
@@ -224,6 +247,23 @@ class NNFXEngine:
                 record.update(rec)
                 return record
 
+            # X2: exit indicator turned against the trade (read vs its own zero_reference).
+            # X4: a close on the wrong side of the baseline. Either closes what is left.
+            # Both branches return before the continuation bookkeeping below, so they
+            # apply its wrong-side reset themselves (SS6: no baseline cross since entry).
+            on_close_exit = None
+            if p.enable_exit_indicator and pos.half2_open and exitdir != 0 and exitdir != pos.direction:
+                on_close_exit = 'exit:exit_indicator'
+            elif p.enable_baseline_exit and pos.half2_open and side != 0 and side != pos.direction:
+                on_close_exit = 'exit:baseline_cross'
+            if on_close_exit:
+                rec = self._close_all(bar['close'], on_close_exit)
+                if record['action'] == 'exit_half':
+                    rec['pips'] = round((record['pips'] + rec['pips']) / 2.0, 1)
+                record.update(rec)
+                self._reset_continuation_if_wrong_side(side)
+                return record
+
             if record['action'] == 'exit_half':
                 return record
 
@@ -238,9 +278,7 @@ class NNFXEngine:
         #     silently undid the reset on the very same bar whenever the reset
         #     bar was itself a fresh cross to the new side -- caught by tracing
         #     a real choppy EURUSD stretch, never by the simpler Part C fixtures.)
-        if self.trend_dir != 0 and side != 0 and side != self.trend_dir:
-            self.trend_dir = 0
-            self.continuation_ok = False
+        self._reset_continuation_if_wrong_side(side)
 
         if self.position is not None:
             return record  # already in a trade; nothing else to evaluate this bar

@@ -60,6 +60,9 @@ input ENUM_MA_METHOD  RefBaselineMAMethod = MODE_SMA;
 input string RefC1Path       = ""; input int RefC1BufFast = 0; input int RefC1BufSlow = 1;     // fixed two-line C1
 input string RefC2Path       = ""; input int RefC2Buf = 0;     input double RefC2ZeroReference = 0.0; // fixed zero-cross C2
 input string RefVolumePath   = ""; input int RefVolumeBuf = 0;                                 // fixed volume/volatility filter
+// Fixed reference exit (X2). Empty path = no reference exit indicator (pre-FIX-2 behavior).
+// nnfx_backtest_batch.py uses "Examples\Momentum" (default period 14), centre line 100.
+input string RefExitPath     = ""; input int RefExitBuf = 0;   input double RefExitZeroReference = 100.0;
 
 // --- generic Volume/Volatility pass-rule (held IDENTICAL across every candidate during Stage-1
 //     so ranking is apples-to-apples per NNFX_RULESET_THE_TRUTH.txt SS9: "hold baseline+C1+C2
@@ -94,13 +97,18 @@ input bool   EnableContinuation = true;
 // false only once VP's exact wording on this is available, per SS12's own instruction.
 input bool   RequireC2ForContinuation = true;
 
+// --- X4 wrong-side-baseline exit (NNFX_RULESET_THE_TRUTH.txt SS5, label B) --
+input bool   EnableBaselineExit = true;  // false = pre-FIX-1 behavior
+// --- X2 exit indicator (SS5): read vs its OWN zero_reference, never 0 ------
+input bool   EnableExitIndicator = true; // no-op unless an exit indicator is active
+
 // --- chart layout: each role in its OWN subwindow, never shared -----
 #define WIN_MAIN   0
 #define WIN_C1     1
 #define WIN_C2     2
 #define WIN_VOLUME 3
 #define WIN_ATR    4
-#define WIN_EXIT   5   // only used when CandidateSlot==SLOT_EXIT
+#define WIN_EXIT   5   // only used when an exit indicator is active
 
 //====================================================================
 // STATE
@@ -111,8 +119,10 @@ int h_c1       = INVALID_HANDLE; // ALWAYS two-line by construction (candidate o
 int h_c2       = INVALID_HANDLE; // ALWAYS zero-cross by construction (candidate or reference)
 int h_volume   = INVALID_HANDLE;
 int h_atr      = INVALID_HANDLE; // fixed, always iATR
-int h_exit     = INVALID_HANDLE; // only when CandidateSlot==SLOT_EXIT
+int h_exit     = INVALID_HANDLE; // candidate (SLOT_EXIT) or RefExitPath; INVALID = no exit indicator
+bool g_exitWanted = false;       // an exit indicator was requested, so a failed handle is fatal
 double g_c2ZeroRef = 0.0;        // whichever zero_reference is actually in play for h_c2
+double g_exitZeroRef = 0.0;      // whichever zero_reference is actually in play for h_exit
 // Actual buffer indices used to READ each handle via CopyBuffer -- set once in OnInit from
 // whichever of Candidate*/Ref* is actually active for that role. Never hardcoded elsewhere.
 int g_baselineBuf = 0, g_c1BufFast = 0, g_c1BufSlow = 1, g_c2Buf = 0, g_volumeBuf = 0, g_exitBuf = 0;
@@ -228,18 +238,27 @@ int OnInit()
    // ATR: fixed, never a candidate
    h_atr = iATR(_Symbol, PERIOD_D1, ATRPeriod);
 
-   // Exit candidate (only relevant when testing SLOT_EXIT; hard-exit-on-flip then reads THIS
-   // instead of C1). When CandidateSlot != SLOT_EXIT the default exit rule (hard-exit on C1
-   // flip) is used and h_exit stays unused.
+   // Exit indicator (X2). Runs ALONGSIDE the C1-flip and baseline exits, never instead of
+   // them -- whichever fires first closes the trade. zero_reference travels with whichever
+   // indicator is in play, exactly like C2.
    if(CandidateSlot == SLOT_EXIT)
    {
       h_exit = iCustom(_Symbol, PERIOD_D1, CandidatePath);
       g_exitBuf = CandidateBufMain;
+      g_exitZeroRef = CandidateZeroReference;
+      g_exitWanted = true;
+   }
+   else if(RefExitPath != "")
+   {
+      h_exit = iCustom(_Symbol, PERIOD_D1, RefExitPath);
+      g_exitBuf = RefExitBuf;
+      g_exitZeroRef = RefExitZeroReference;
+      g_exitWanted = true;
    }
 
    if(h_baseline==INVALID_HANDLE || h_c1==INVALID_HANDLE || h_c2==INVALID_HANDLE ||
       h_volume==INVALID_HANDLE || h_atr==INVALID_HANDLE ||
-      (CandidateSlot==SLOT_EXIT && h_exit==INVALID_HANDLE))
+      (g_exitWanted && h_exit==INVALID_HANDLE))
    {
       Print("NNFXHarness: failed to create one or more indicator handles");
       return(INIT_FAILED);
@@ -251,7 +270,7 @@ int OnInit()
    ChartIndicatorAdd(0, WIN_C2, h_c2);
    ChartIndicatorAdd(0, WIN_VOLUME, h_volume);
    ChartIndicatorAdd(0, WIN_ATR, h_atr);
-   if(CandidateSlot == SLOT_EXIT)
+   if(g_exitWanted)
       ChartIndicatorAdd(0, WIN_EXIT, h_exit);
 
    g_half1.open=false; g_half1.tp1Hit=false; g_half1.ticket=0;
@@ -347,7 +366,8 @@ bool VolumePasses(int shift,int dir)
 {
    double v;
    if(!BufVal(h_volume,g_volumeBuf,shift,v)) return(false);
-   double avg=AvgBuffer(h_volume,0,shift,VolumeAvgPeriod);
+   // G10: the average must come from the SAME configured line as today's value (was buffer 0).
+   double avg=AvgBuffer(h_volume,g_volumeBuf,shift,VolumeAvgPeriod);
    return(v >= avg*VolumeThresholdMult);
 }
 
@@ -567,16 +587,30 @@ void OnNewDailyBar()
    int crossDir = BaselineCrossClosed(shift);
    int side = BaselineSide(shift);
 
-   // --- hard exit: whole position closes immediately on a C1 flip (or, when testing
-   //     SLOT_EXIT, on the candidate exit indicator's own flip instead). --------------
-   if(g_posDir!=0)
+   // --- X3 hard exit: whole position closes immediately on a C1 flip. ---------------
+   if(g_posDir!=0 && c1dir!=0 && c1dir!=g_posDir)
    {
-      int flipSource = (CandidateSlot==SLOT_EXIT) ? ExitCandidateDirection(shift) : c1dir;
-      if(flipSource!=0 && flipSource!=g_posDir)
+      g_lastExitDir=g_posDir;
+      CloseAllHalves("exit:c1_flip");
+   }
+
+   // --- X2: exit indicator turned against the trade (vs its own zero_reference). -------
+   if(g_posDir!=0 && EnableExitIndicator && h_exit!=INVALID_HANDLE)
+   {
+      int exitdir = ExitDirection(shift);
+      if(exitdir!=0 && exitdir!=g_posDir)
       {
          g_lastExitDir=g_posDir;
-         CloseAllHalves("exit:c1_flip");
+         CloseAllHalves("exit:exit_indicator");
       }
+   }
+
+   // --- X4: a close on the wrong side of the baseline closes what is left. The
+   //     continuation reset just below then sees the same wrong-side close. -----------
+   if(g_posDir!=0 && EnableBaselineExit && side!=0 && side!=g_posDir)
+   {
+      g_lastExitDir=g_posDir;
+      CloseAllHalves("exit:baseline_cross");
    }
 
    // --- continuation bookkeeping: the sequence resets the moment a candle closes on the
@@ -642,14 +676,14 @@ void OnNewDailyBar()
    OpenPosition(crossDir, atrVal, false);
 }
 
-int ExitCandidateDirection(int shift)
+int ExitDirection(int shift)
 {
-   // Only meaningful when CandidateSlot==SLOT_EXIT; treated as a generic two-state
-   // directional read (>0 => long-side agree, <0 => short-side agree) off buffer 0.
+   // Centre-line read against the active exit indicator's OWN zero_reference (never 0):
+   // above => long side, below => short side. Mirrors nnfx_engine.exit_direction().
    double v;
    if(!BufVal(h_exit,g_exitBuf,shift,v)) return(0);
-   if(v>0) return(+1);
-   if(v<0) return(-1);
+   if(v>g_exitZeroRef) return(+1);
+   if(v<g_exitZeroRef) return(-1);
    return(0);
 }
 
