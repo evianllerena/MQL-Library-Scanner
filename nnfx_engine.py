@@ -147,8 +147,10 @@ class NNFXParams:
     # E4 (label B) ONE-CANDLE RULE: if EXACTLY ONE input lags on an otherwise-valid setup,
     #   wait at most ONE candle for it to agree; price must STILL be within 1xATR on that
     #   second candle (Decision #4). >>> SCOPE IS UNCLEAR IN SOURCES <<< -- implemented for a
-    #   lagging BASELINE-cross or C2 only (the two cases VP demonstrates); a lagging C1 or
-    #   volume is NOT treated as a one-candle case here. Default ON, FLAGGED for user confirm.
+    #   lagging C1 OR C2 on the cross bar (symmetric: exactly one of the two confirmations is
+    #   one candle late). A lagging BASELINE resolves as a normal standard entry on the actual
+    #   cross bar; a failing VOLUME is not a one-candle case (volume must pass to arm).
+    #   Default ON, FLAGGED for user confirm.
     enable_one_candle_rule: bool = True
     enable_continuation: bool = True
     # STUB (NNFX_RULESET_THE_TRUTH.txt SS12: "C2 ... full rules ... Implement
