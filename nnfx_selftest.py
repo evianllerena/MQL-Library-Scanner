@@ -741,6 +741,23 @@ def unit_tests() -> Check:
            '(only a shared tracker + the breaker couple them)',
            all([(r['action'], r['reason'], r['pips']) for r in recs_off[sym]] == solo[sym] for sym in solo))
 
+    # --- Rank on expectancy in R (P/L / the 1.5xATR stop) with a 95% margin of error --------
+    exit_rs = {sym: [round(r['r'], 4) for r in recs if r['action'] == 'exit'] for sym, recs in recs_off.items()}
+    c.that('R per trade: a full stop-out is exactly -1R; a wrong-side close at 99.5 from 100.6 is -1.1/1.5 = -0.7333R; '
+           'TP1 (+1xATR on half) plus the runner closed +3xATR on the same bar is 0.5x(1/1.5) + 0.5x(3/1.5) = +1.3333R',
+           exit_rs == {'EURUSD': [-1.0, -1.0, -0.7333], 'GBPUSD': [1.3333]}, detail=str(exit_rs))
+    mean, ci = nb.r_stats([1.0, -1.0, 1.0, -1.0])
+    c.that('R stats: mean 0 with a 95% margin of 1.96 x stdev(1.1547) / sqrt(4) = 1.1316',
+           mean == 0.0 and abs(ci - 1.13161) < 1e-4 and nb.r_stats([]) == (0.0, None), detail=f'{mean} {ci}')
+    board = nb.leaderboard_order([
+        dict(slot='BASELINE', trades=11, expectancy_r=0.096),   # higher R, but only 11 trades
+        dict(slot='BASELINE', trades=1272, expectancy_r=0.015),
+        dict(slot='BASELINE', trades=1632, expectancy_r=0.016),
+        dict(slot='CONFIRMATION_1', trades=1933, expectancy_r=0.022)])
+    c.that('Leaderboard order: within a slot by expectancy_r, best first; an insufficient sample (<30 trades) sorts '
+           'last however high its R', [(r['slot'], r['trades']) for r in board] ==
+           [('BASELINE', 1632), ('BASELINE', 1272), ('BASELINE', 11), ('CONFIRMATION_1', 1933)], detail=str(board))
+
     return c
 
 

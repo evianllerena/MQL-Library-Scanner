@@ -22,7 +22,8 @@ verified nnfx_engine.py, writing real backtest_results rows.
 Commands (JSONL on stdout, like the other sidecars):
   plan --db <db> [--limit N]
   run  --db <db> --out <dir> --bed-symbols EURUSD,GBPUSD,USDJPY [--limit N]
-       [--min-trades 30] [--force]
+       [--min-trades 30] [--force] [--history-from 2015.01.01]
+  rescore --db <db> --out <dir of an earlier run> --csv <leaderboard.csv> [--history-from 2015.01.01]
 """
 from __future__ import annotations
 import argparse, json, os, shutil, sqlite3, sys, time, hashlib, threading, tempfile
@@ -86,6 +87,28 @@ def usable_symbols(statuses: dict, symbols, history_from: str):
             keep.append(sym)
     return keep, dropped
 
+MIN_TRADES = 30  # below this a result is an insufficient sample (same default as the app's board)
+
+
+def r_stats(trade_rs):
+    """Expectancy in R (P/L / the 1.5xATR-at-entry stop) and its 95% margin of error.
+    R puts every pair on one scale (pips are not comparable: a GBPNZD day moves ~3x an EURCHF
+    day). The margin is 1.96 x sample stdev / sqrt(n): an edge is only distinguishable from zero
+    -- or from another candidate -- when the ranges do not overlap."""
+    n = len(trade_rs)
+    if n == 0:
+        return 0.0, None
+    mean = sum(trade_rs) / n
+    if n < 2:
+        return mean, None
+    var = sum((x - mean) ** 2 for x in trade_rs) / (n - 1)
+    return mean, 1.96 * (var ** 0.5) / n ** 0.5
+
+
+def leaderboard_order(rows, min_trades=MIN_TRADES):
+    """Rank within each slot on expectancy_r (best first); insufficient samples always sort last."""
+    return sorted(rows, key=lambda r: (r['slot'], r['trades'] < min_trades, -r['expectancy_r']))
+
 # ---- DB ----------------------------------------------------------------------
 
 def connect(db):
@@ -122,6 +145,9 @@ def ensure_backtest_table(conn):
     # FIX 8: breaker-ON expectancy for reference; the ranking uses expectancy_pips (breaker OFF).
     if 'expectancy_pips_breaker' not in cols:
         conn.execute('ALTER TABLE backtest_results ADD COLUMN expectancy_pips_breaker REAL')
+    for col in ('expectancy_r', 'expectancy_r_ci95'):  # ranking metric in R + its 95% margin
+        if col not in cols:
+            conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} REAL')
     conn.commit()
 
 TESTABLE_SLOTS = ('CONFIRMATION_1', 'CONFIRMATION_2', 'BASELINE', 'VOLUME')
@@ -511,6 +537,7 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
     shared account each call, so the two runs (off/on) are independent."""
     per_symbol = {}
     pooled_trades = []
+    pooled_r = []  # whole-trade results in R, from the engine's closing records
     bridge_skips = continuation_trades = volume_skips = dd_breaker_skips = news_skips = 0
     fingerprints = {}
     # R1 (FIX 7b): ONE equity tracker shared by every symbol's engine, driven in date order
@@ -535,6 +562,7 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
                 pending_half1 = r['pips']
             elif r['action'] == 'exit':
                 trades.append((pending_half1 + r['pips']) / 2.0 if pending_half1 is not None else r['pips'])
+                pooled_r.append(r['r'])
                 pending_half1 = None
         per_symbol[sym] = len(trades)
         pooled_trades.extend(trades)
@@ -551,7 +579,9 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
     equity = peak = maxdd = 0.0
     for t in pooled_trades:
         equity += t; peak = max(peak, equity); maxdd = min(maxdd, equity - peak)
+    exp_r, ci_r = r_stats(pooled_r)
     return dict(trades=n, wins=wins, losses=losses, win_rate=win_rate, expectancy_pips=expectancy,
+                expectancy_r=round(exp_r, 4), expectancy_r_ci95=round(ci_r, 4) if ci_r is not None else None,
                 profit_factor=profit_factor, max_drawdown=round(maxdd, 1), bridge_skips=bridge_skips,
                 continuation_trades=continuation_trades, volume_skips=volume_skips,
                 max_drawdown_pct=round(account.max_dd_pct, 2), dd_breaker_skips=dd_breaker_skips, news_skips=news_skips,
@@ -561,6 +591,7 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
 def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_from=DEFAULT_HISTORY_FROM):
     """FIX 8: rank on the breaker-OFF run (full trade history, apples-to-apples) and report the
     breaker-ON expectancy alongside, so the drawdown breaker never distorts the comparison. The
+    ranking metric is expectancy_r (with expectancy_r_ci95); expectancy_pips is kept alongside. The
     risk column max_drawdown_pct comes from the breaker-OFF run (the TRUE unprotected drawdown);
     dd_breaker_skips comes from the breaker-ON run (how many entries the breaker WOULD stop)."""
     prepared = _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref)
@@ -840,18 +871,68 @@ def write_status_row(conn, it, bed, status, reason):
 def write_score_row(conn, it, bed, r):
     conn.execute("""
         INSERT INTO backtest_results(sha256, slot, signal_type, bed, stage, trades, wins, losses,
-            win_rate, expectancy_pips, expectancy_pips_breaker, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
+            win_rate, expectancy_pips, expectancy_pips_breaker, expectancy_r, expectancy_r_ci95, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
             mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b)
-        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
+        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
         ON CONFLICT(sha256, slot, bed) DO UPDATE SET trades=excluded.trades, wins=excluded.wins,
             losses=excluded.losses, win_rate=excluded.win_rate, expectancy_pips=excluded.expectancy_pips,
             expectancy_pips_breaker=excluded.expectancy_pips_breaker,
+            expectancy_r=excluded.expectancy_r, expectancy_r_ci95=excluded.expectancy_r_ci95,
             profit_factor=excluded.profit_factor, max_drawdown=excluded.max_drawdown, max_drawdown_pct=excluded.max_drawdown_pct,
             bridge_skips=excluded.bridge_skips, continuation_trades=excluded.continuation_trades, tested_at=excluded.tested_at
     """, (it['sha256'], it['slot'], it['signal_type'], bed, r['trades'], r['wins'], r['losses'], r['win_rate'],
-          r['expectancy_pips'], r.get('expectancy_pips_breaker'), r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
+          r['expectancy_pips'], r.get('expectancy_pips_breaker'), r['expectancy_r'], r['expectancy_r_ci95'], r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
           f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b']))
     conn.commit()
+
+LEADERBOARD_COLUMNS = (
+    'indicator', 'slot', 'trades', 'sufficient_sample', 'expectancy_r', 'expectancy_r_ci95', 'expectancy_r_low',
+    'expectancy_r_high', 'expectancy_pips', 'expectancy_pips_breaker', 'win_rate', 'profit_factor',
+    'max_drawdown_pips', 'max_drawdown_pct', 'dd_breaker_skips', 'bridge_skips', 'continuation_trades',
+    'volume_skips', 'news_skips', 'symbols_traded')
+
+
+def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN_TRADES):
+    """Re-score a saved extraction (--out of an earlier run: nnfx_batch.json + per-symbol CSVs)
+    with the current engine and write the leaderboard CSV ranked on expectancy_r. No MT5 needed.
+    Symbols missing from the extraction or excluded by its history-depth report are left out."""
+    import csv as _csv
+    out = Path(out)
+    job_json = json.loads((out / 'nnfx_batch.json').read_text(encoding='utf-8'))
+    statuses = {r['symbol']: r for r in _read_jsonl(out / 'nnfx_batch_results.jsonl') if 'symbol' in r and 'status' in r}
+    symbols = [s for s in job_json['symbols'] if (out / f'nnfx_batch_extract_{s}.csv').exists()]
+    if statuses:
+        symbols, dropped = usable_symbols(statuses, symbols, history_from)
+        if dropped:
+            stage_event('symbols_excluded', excluded=dropped)
+    symbol_data = {s: {'rows': list(_csv.DictReader(open(out / f'nnfx_batch_extract_{s}.csv', encoding='utf-8', errors='replace')))}
+                   for s in symbols}
+    conn = connect(db)
+    names = dict(conn.execute('SELECT sha256, filename FROM indicators'))
+    conn.close()
+    rows = []
+    for j in job_json['jobs']:
+        col_b = j['key'] + '_b' if j['buf_b'] >= 0 else None
+        r = score_candidate(symbol_data, symbols, j['role'], j['key'] + '_a', col_b, None, score_from=history_from)
+        ci = r['expectancy_r_ci95']
+        rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], trades=r['trades'],
+                         sufficient_sample=r['trades'] >= min_trades, expectancy_r=r['expectancy_r'],
+                         expectancy_r_ci95=ci,
+                         expectancy_r_low=round(r['expectancy_r'] - ci, 4) if ci is not None else None,
+                         expectancy_r_high=round(r['expectancy_r'] + ci, 4) if ci is not None else None,
+                         expectancy_pips=r['expectancy_pips'], expectancy_pips_breaker=r['expectancy_pips_breaker'],
+                         win_rate=r['win_rate'], profit_factor=r['profit_factor'], max_drawdown_pips=r['max_drawdown'],
+                         max_drawdown_pct=r['max_drawdown_pct'], dd_breaker_skips=r['dd_breaker_skips'],
+                         bridge_skips=r['bridge_skips'], continuation_trades=r['continuation_trades'],
+                         volume_skips=r['volume_skips'], news_skips=r['news_skips'],
+                         symbols_traded=sum(1 for n in r['per_symbol'].values() if n)))
+    rows = leaderboard_order(rows, min_trades)
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        w = _csv.DictWriter(f, fieldnames=LEADERBOARD_COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+    emit({'type': 'rescore_complete', 'csv': str(csv_path), 'symbols': len(symbols), 'candidates': len(rows)})
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -864,12 +945,17 @@ def main():
     p.add_argument('--force', action='store_true')
     p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM,
                    help='score trades from this date (YYYY.MM.DD); history is fetched ~6 months earlier for warm-up')
+    p = sub.add_parser('rescore', help='re-score a saved extraction (no MT5) and write the leaderboard CSV')
+    p.add_argument('--db', required=True); p.add_argument('--out', required=True); p.add_argument('--csv', required=True)
+    p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM); p.add_argument('--min-trades', type=int, default=MIN_TRADES)
     args = ap.parse_args()
     if args.cmd == 'plan':
         plan(args.db, args.limit)
     elif args.cmd == 'run':
         run(args.db, args.out, [s.strip() for s in args.bed_symbols.split(',') if s.strip()],
             args.limit, args.min_trades, args.force, args.history_from)
+    elif args.cmd == 'rescore':
+        rescore(args.db, args.out, args.csv, args.history_from, args.min_trades)
 
 if __name__ == '__main__':
     try:
