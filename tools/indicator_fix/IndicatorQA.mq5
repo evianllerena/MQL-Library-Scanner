@@ -15,7 +15,8 @@
 #define MAXBUF  16
 
 int fh;
-uint g_timeout = 10000;
+int jf=INVALID_HANDLE;
+uint g_timeout = 8000;   // slowest working indicator in the first 90: 7.4 s
 
 void Out(string s){ int h=FileOpen("qa_results.jsonl",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI); if(h==INVALID_HANDLE) return; FileSeek(h,0,SEEK_END); FileWriteString(h,s+"\n"); FileClose(h); }
 string Esc(string s){ StringReplace(s,"\\","\\\\"); StringReplace(s,"\"","\\\""); return s; }
@@ -24,10 +25,10 @@ bool WaitHealthy(string sym,uint limit_ms){
   int need=Bars(sym,PERIOD_D1); uint t0=GetTickCount();
   while(GetTickCount()-t0<limit_ms){
     int h=iCustom(sym,PERIOD_D1,"Examples\\Momentum"); int c=-1; uint s0=GetTickCount();
-    while(h!=INVALID_HANDLE && GetTickCount()-s0<750){ c=BarsCalculated(h); if(c>=need) break; Sleep(25); }
+    while(h!=INVALID_HANDLE && GetTickCount()-s0<300){ c=BarsCalculated(h); if(c>=need) break; Sleep(10); }
     if(h!=INVALID_HANDLE) IndicatorRelease(h);
     if(c>=need) return(true);
-    Sleep(250);
+    Sleep(50);
   }
   return(false);
 }
@@ -70,10 +71,10 @@ int BufferStats(int h,int count,string &json,bool &has_values){
 // compare buffers on QA_CUT vs QA_FULL over the CMP shared bars before the cut
 string AlignTest(string rel,string &verdict){
   string st1,st2; int c1,c2; uint m1,m2;
-  if(!WaitHealthy("QA_CUT",30000) ){ verdict="queue_unhealthy"; return("{}"); }
+  if(!WaitHealthy("QA_CUT",15000) ){ verdict="queue_unhealthy"; return("{}"); }
   int h1=LoadCalc("QA_CUT",rel,st1,c1,m1);
   if(st1!="ok"){ if(h1!=INVALID_HANDLE) IndicatorRelease(h1); verdict="cut_"+st1; return("{}"); }
-  if(!WaitHealthy("QA_FULL",30000)){ IndicatorRelease(h1); verdict="queue_unhealthy"; return("{}"); }
+  if(!WaitHealthy("QA_FULL",15000)){ IndicatorRelease(h1); verdict="queue_unhealthy"; return("{}"); }
   int h2=LoadCalc("QA_FULL",rel,st2,c2,m2);
   if(st2!="ok"){ IndicatorRelease(h1); if(h2!=INVALID_HANDLE) IndicatorRelease(h2); verdict="full_"+st2; return("{}"); }
   int compared=0,diffs=0,deepest=-1,nb=0;
@@ -110,6 +111,9 @@ bool MakeCustom(string name,string origin,int drop){
   MqlRates k[]; ArrayResize(k,n-drop); for(int i=0;i<n-drop;i++) k[i]=r[i];
   if(CustomRatesReplace(name,k[0].time,k[n-drop-1].time+86400,k)<=0) return(false);
   SymbolSelect(name,true);
+  MqlTick tk[1]; tk[0].time=k[n-drop-1].time+3600; tk[0].bid=k[n-drop-1].close; tk[0].ask=k[n-drop-1].close+10*SymbolInfoDouble(origin,SYMBOL_POINT);
+  tk[0].last=tk[0].bid; tk[0].volume=1; tk[0].time_msc=(long)tk[0].time*1000; tk[0].flags=TICK_FLAG_BID|TICK_FLAG_ASK;
+  CustomTicksAdd(name,tk);
   uint t0=GetTickCount(); while(Bars(name,PERIOD_D1)<n-drop && GetTickCount()-t0<30000) Sleep(100);
   return(Bars(name,PERIOD_D1)>=n-drop);
 }
@@ -121,7 +125,7 @@ void OnStart(){
   bool cuts_ok=MakeCustom("QA_FULL","EURUSD",0) && MakeCustom("QA_CUT","EURUSD",CUT);
   Out("{\"session\":\"start\",\"custom_symbols\":"+(cuts_ok?"true":"false")+",\"bars_eurusd\":"+IntegerToString(Bars("EURUSD",PERIOD_D1))+
       ",\"bars_cut\":"+IntegerToString(Bars("QA_CUT",PERIOD_D1))+",\"bars_full\":"+IntegerToString(Bars("QA_FULL",PERIOD_D1))+"}");
-  int jf=FileOpen("qa_jobs.txt",FILE_READ|FILE_TXT|FILE_ANSI);
+  jf=FileOpen("qa_jobs.txt",FILE_READ|FILE_TXT|FILE_ANSI);
   if(jf==INVALID_HANDLE){ Out("{\"fatal\":\"no jobs\"}"); TerminalClose(0); return; }
   while(!FileIsEnding(jf) && !IsStopped()){
     string line=FileReadString(jf); if(StringLen(line)<3) continue;
@@ -134,13 +138,14 @@ void OnStart(){
     string syms[]={"EURUSD","GBPJPY"};
     for(int s=0;s<2;s++){
       string st; int calc; uint ms; string js="[]"; bool hv=false; int nb=0;
-      if(!WaitHealthy(syms[s],60000)){ st="queue_unhealthy"; ms=0; calc=-1; }
+      if(s>0 && worst!="ok"){ st="skipped"; ms=0; calc=-1; }
+      else if(!WaitHealthy(syms[s],15000)){ Out("{\"id\":\""+Esc(id)+"\",\"requeue\":true}"); FileClose(jf); TerminalClose(0); return; }
       else{
         int h=LoadCalc(syms[s],rel,st,calc,ms);
         if(st=="ok"){ nb=BufferStats(h,400,js,hv); if(hv) any_values=true; }
         if(h!=INVALID_HANDLE) IndicatorRelease(h);
       }
-      if(st!="ok" && worst=="ok") worst=st;
+      if(st!="ok" && st!="skipped" && worst=="ok") worst=st;
       res+=",\""+syms[s]+"\":{\"status\":\""+st+"\",\"calc\":"+IntegerToString(calc)+",\"ms\":"+IntegerToString(ms)+",\"nbuf\":"+IntegerToString(nb)+",\"stats\":"+js+"}";
     }
     res+=",\"load\":\""+worst+"\",\"has_values\":"+(any_values?"true":"false");

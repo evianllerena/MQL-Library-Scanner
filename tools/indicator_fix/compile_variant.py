@@ -5,6 +5,7 @@ from pathlib import Path
 V = sys.argv[1]
 root = Path(r'F:\MQLFIX_BUILD') / V
 ME = r'C:\Program Files\MetaTrader 5\MetaEditor64.exe'
+INC = r'C:\Users\Evision\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5'  # standard + user includes
 files = sorted(p for p in root.glob('*.mq5'))
 for i in range(0, len(files), 500):           # move loose files into chunk folders
     d = root / f'c{i // 500:03d}'; d.mkdir(exist_ok=True)
@@ -15,11 +16,11 @@ t = time.time()
 for d in chunks:
     log = root / f'{d.name}.log'
     if not log.exists():
-        subprocess.run([ME, f'/compile:{d}', f'/log:{log}'], timeout=3600)
+        subprocess.run([ME, f'/compile:{d}', f'/inc:{INC}', f'/log:{log}'], timeout=3600)
     text = log.read_text(encoding='utf-16', errors='replace') if log.exists() else ''
     cur = None
     for line in text.splitlines():
-        m = re.search(r"compiling '([^']+)'", line)
+        m = re.search(r"information: compiling (.+\.mq5)\s*$", line)
         if m: cur = Path(m.group(1)).stem; results.setdefault(cur, {'errors': 0, 'first_errors': []}); continue
         if cur and ' error ' in line:
             r = results[cur]; r['errors'] += 1

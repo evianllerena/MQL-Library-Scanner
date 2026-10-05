@@ -4,7 +4,7 @@ Copies each <name>.ex5 into <runtime>\MQL5\Indicators\QA\<V>\, writes Files\qa_j
 terminal, and appends every result line to F:\MQLFIX_BUILD\qa_<V>.jsonl. Resumable: names already in the
 results file are skipped. If the terminal stops producing output for HANG_S seconds, it is killed, the
 indicator it was on is recorded as 'hang', and a new session continues after it."""
-import json, os, shutil, subprocess, sys, time
+import hashlib, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 RT = Path(r'C:\Users\Evision\AppData\Local\nnfx-backtest-runtime\preview-runtime\v5\mt5-5ece741c1d')
@@ -17,6 +17,25 @@ only = None
 if '--names' in sys.argv:
     only = [l.strip() for l in open(sys.argv[sys.argv.index('--names') + 1], encoding='utf-8') if l.strip()]
 OUT = W / f'qa_{V}.jsonl'
+requeues = {}
+
+def alias(name):
+    """MT5's script reads the job file as ANSI, so non-ASCII names (e.g. Cyrillic) become '?' and the
+    indicator can't be found. Such indicators are tested under an ASCII alias, mapped back on output."""
+    if re.fullmatch(r'[\x20-\x7e]+', name) and '|' not in name:
+        return name
+    return 'u_' + hashlib.sha1(name.encode('utf-8')).hexdigest()[:12]
+
+def aligned_in_A():
+    """B (flipped) is only worth testing where A is not already aligned."""
+    a = W / 'qa_A.jsonl'
+    ok = set()
+    if a.exists():
+        for line in open(a, encoding='utf-8', errors='replace'):
+            try: r = json.loads(line)
+            except Exception: continue
+            if r.get('align') == 'aligned': ok.add(r.get('id'))
+    return ok
 
 def compiled():
     for chunk in sorted((W / V).glob('c*')):
@@ -40,10 +59,11 @@ def done_ids():
 def run_session(batch):
     dest = RT / 'MQL5' / 'Indicators' / 'QA' / V
     dest.mkdir(parents=True, exist_ok=True)
-    jobs = []
+    jobs = []; back = {}
     for name, ex in batch:
-        shutil.copy2(ex, dest / ex.name)
-        jobs.append(f'{name}|QA\\{V}\\{name}')
+        a = alias(name); back[a] = name
+        shutil.copy2(ex, dest / f'{a}.ex5')
+        jobs.append(f'{a}|QA\\{V}\\{a}')
     (FILES / 'qa_jobs.txt').write_text('\n'.join(jobs) + '\n', encoding='ascii', errors='replace')
     for f in ('qa_results.jsonl', 'qa_done.flag'):
         try: (FILES / f).unlink()
@@ -71,8 +91,18 @@ def run_session(batch):
         for line in lines:
             try: r = json.loads(line)
             except Exception: continue
+            if 'id' in r: r['id'] = back.get(r['id'], r['id'])
             if r.get('phase') == 'begin':
                 begun = r['id']; continue
+            if r.get('requeue'):
+                # The symbol's calculation queue was still blocked by the PREVIOUS indicator: this one is
+                # untested, not failed. Retry it in a fresh session; after 3 tries record queue_unhealthy.
+                requeues[r['id']] = requeues.get(r['id'], 0) + 1
+                if requeues[r['id']] >= 3:
+                    o.write(json.dumps({'id': r['id'], 'load': 'queue_unhealthy', 'has_values': False, 'align': 'skipped'}) + '\n')
+                    finished.add(r['id'])
+                begun = None
+                continue
             if 'id' in r:
                 finished.add(r['id']); o.write(json.dumps(r) + '\n')
             elif 'session' in r:
@@ -83,14 +113,16 @@ def run_session(batch):
     return len(finished)
 
 if __name__ == '__main__':
-    t0 = time.time()
+    t0 = time.time(); stalls = 0
     while True:
         done = done_ids()
-        todo = [(n, ex) for n, ex in compiled() if n not in done and (only is None or n in only)]
+        skip = aligned_in_A() if V == 'B' else set()
+        todo = [(n, ex) for n, ex in compiled() if n not in done and n not in skip and (only is None or n in only)]
         if not todo:
             break
         n = run_session(todo[:SESSION])
         print(f'{V}: session finished {n}, remaining ~{len(todo) - n}, elapsed {round(time.time() - t0)} s', flush=True)
-        if n == 0:
-            print('no progress in a session -- stopping'); break
+        stalls = stalls + 1 if n == 0 else 0
+        if stalls >= 3:
+            print('no progress in 3 sessions -- stopping'); break
     print(V, 'QA complete', round(time.time() - t0), 's')
