@@ -5,7 +5,7 @@ Each job gets F:\MQLFIX_BUILD\R\<name>\<name>.mq5 (+ any local .mqh it includes,
 original). One `claude -p` run per job may only Read/Edit that folder and run the compile helper. The
 result is then re-verified by an independent compile. Results -> F:\MQLFIX_BUILD\R\repair_results.jsonl
 (resumable: names already there are skipped)."""
-import json, re, shutil, subprocess, sys, time
+import hashlib, json, re, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -56,9 +56,11 @@ def local_includes(text, original):
     return found
 
 def run_job(job):
-    name = job['name']; d = R / name
+    name = job['name']
+    short = re.sub(r'[^\w\-]', '_', name)[:40] + '__' + hashlib.sha1(name.encode('utf-8')).hexdigest()[:8]
+    d = R / short                                  # stay well under Windows' 260-character path limit
     shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True)
-    target = d / f'{name}.mq5'
+    target = d / f'{short}.mq5'
     shutil.copy2(job['source'], target)
     text = target.read_bytes().decode('utf-8', 'replace')
     for inc in local_includes(text, job.get('original', job['source'])):
@@ -72,7 +74,7 @@ def run_job(job):
     try:
         cp = subprocess.run([CLAUDE, '-p', prompt, '--model', arg('--model', 'sonnet'),
                              '--permission-mode', 'acceptEdits',
-                             '--allowedTools', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash(python c.py)',
+                             '--allowedTools', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash(python c.py)', 'Bash(python c.py:*)',
                              '--output-format', 'text'],
                             cwd=str(d), capture_output=True, text=True, encoding='utf-8', errors='replace',
                             timeout=int(arg('--timeout', 1200)))
@@ -93,5 +95,13 @@ if __name__ == '__main__':
     todo = [j for j in jobs if j['name'] not in skip]
     print(f'{len(todo)} jobs ({len(jobs) - len(todo)} already done)', flush=True)
     with ThreadPoolExecutor(max_workers=int(arg('--workers', 4))) as ex:
-        for i, rec in enumerate(ex.map(run_job, todo), 1):
+        def safe(job):
+            try:
+                return run_job(job)
+            except Exception as e:                 # one bad job must not stop the batch
+                rec = {'name': job['name'], 'problem': job['problem'], 'agent': f'ERROR: {e!r}'[:300],
+                       'compiles': False, 'compile_result': [], 'seconds': 0, 'path': ''}
+                with open(OUT, 'a', encoding='utf-8') as f: f.write(json.dumps(rec) + '\n')
+                return rec
+        for i, rec in enumerate(ex.map(safe, todo), 1):
             print(f"{i}/{len(todo)} {rec['name'][:40]} compiles={rec['compiles']} {rec['seconds']}s {rec['agent'][:60]}", flush=True)

@@ -33,13 +33,33 @@ bool WaitHealthy(string sym,uint limit_ms){
   return(false);
 }
 
+// A live chart re-runs OnCalculate on every tick; custom symbols get none, so indicators that return 0
+// until their built-in sub-indicators are ready would never finish. Pump same-price ticks inside the
+// last bar (bars unchanged) while waiting on a QA_ symbol.
+long g_tick_msc=0;
+void PumpTick(string sym){
+  if(StringFind(sym,"QA_")!=0) return;
+  MqlRates r[]; if(CopyRates(sym,PERIOD_D1,0,1,r)!=1) return;
+  long t=(long)r[0].time*1000+3600000;
+  if(g_tick_msc<t) g_tick_msc=t; g_tick_msc+=1000;
+  MqlTick tk[1]; tk[0].time=(datetime)(g_tick_msc/1000); tk[0].time_msc=g_tick_msc;
+  tk[0].bid=r[0].close; tk[0].ask=r[0].close+10*SymbolInfoDouble(sym,SYMBOL_POINT); tk[0].last=r[0].close;
+  tk[0].volume=1; tk[0].flags=TICK_FLAG_BID|TICK_FLAG_ASK;
+  CustomTicksAdd(sym,tk);
+}
+
 // load rel on sym; returns handle (caller releases) and status
 int LoadCalc(string sym,string rel,string &status,int &calc,uint &ms){
   int need=Bars(sym,PERIOD_D1); uint t0=GetTickCount(); calc=-1;
   ResetLastError();
   int h=iCustom(sym,PERIOD_D1,rel);
   if(h==INVALID_HANDLE){ status="load_failed"; ms=GetTickCount()-t0; return(h); }
-  while(true){ calc=BarsCalculated(h); if(calc>=need || GetTickCount()-t0>=g_timeout) break; Sleep(25); }
+  uint lastpump=0;
+  while(true){
+    calc=BarsCalculated(h); if(calc>=need || GetTickCount()-t0>=g_timeout) break;
+    if(GetTickCount()-lastpump>=250){ PumpTick(sym); lastpump=GetTickCount(); }
+    Sleep(25);
+  }
   ms=GetTickCount()-t0;
   if(calc>=need) status="ok"; else status=(calc<=0)?"never_calculated":"too_slow";
   return(h);

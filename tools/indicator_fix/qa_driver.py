@@ -34,10 +34,12 @@ def alias(name):
         return name
     return 'u_' + hashlib.sha1(name.encode('utf-8')).hexdigest()[:12]
 
+REF = {'B': 'A', 'D': 'C'}     # a flipped variant is only worth testing where its base is not aligned
+
 def aligned_in_A():
-    """B (flipped) is only worth testing where A is not already aligned."""
     ok = set()
-    for a in W.glob('qa_A*.jsonl'):
+    if V not in REF: return ok
+    for a in W.glob(f'qa_{REF[V]}_s*.jsonl'):
         for line in open(a, encoding='utf-8', errors='replace'):
             try: r = json.loads(line)
             except Exception: continue
@@ -123,7 +125,7 @@ if __name__ == '__main__':
     t0 = time.time(); stalls = 0
     while True:
         done = done_ids()
-        skip = aligned_in_A() if V == 'B' else set()
+        skip = aligned_in_A()
         todo = [(n, ex) for n, ex in compiled() if n not in done and n not in skip and in_shard(n) and (only is None or n in only)]
         if not todo:
             break
