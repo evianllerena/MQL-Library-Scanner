@@ -1,0 +1,97 @@
+r"""AI repair worker (MQL_ONE-style loop, using the installed `claude` CLI headless).
+Usage: repair_ai.py <jobs.json> [--workers 4] [--model sonnet]
+jobs.json: [{"name": ..., "source": <path .mq5>, "problem": "compile" | "runtime", "detail": <text>}]
+Each job gets F:\MQLFIX_BUILD\R\<name>\<name>.mq5 (+ any local .mqh it includes, copied from beside the
+original). One `claude -p` run per job may only Read/Edit that folder and run the compile helper. The
+result is then re-verified by an independent compile. Results -> F:\MQLFIX_BUILD\R\repair_results.jsonl
+(resumable: names already there are skipped)."""
+import json, re, shutil, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+W = Path(r'F:\MQLFIX_BUILD'); R = W / 'R'; R.mkdir(parents=True, exist_ok=True)
+CLAUDE = r'C:\Users\Evision\.local\bin\claude.exe'
+MQLC = r'F:\MQLFIX_BUILD\tools\mqlc.py'
+OUT = R / 'repair_results.jsonl'
+INCLUDE_DIRS = [Path(r'F:\Converted Indicators'), Path(r'F:\Ready MQL5 Indicators')]
+
+def arg(flag, default):
+    return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
+
+PROMPT = """You are repairing ONE MetaTrader 5 custom indicator that was machine-converted from MQL4.
+File: {file} (in the current directory). Problem: {problem}.
+{detail}
+
+Goal: the indicator must compile with 0 errors and compute the SAME values the original MQL4 indicator
+did, on the correct bars.
+Rules:
+- Edit only {file} (and .mqh files in this directory if they are the cause). Keep every input
+  parameter, buffer, plot and the calculation logic; fix conversion mistakes, do not redesign.
+  Renaming an identifier that collides with an MQL5 built-in (e.g. an input named SymbolName) is fine.
+- MQL4 code indexes price series and indicator buffers newest-first (index 0 = current bar). If the
+  code is written that way, call ArraySetAsSeries(buffer,true) for its buffers (and for any
+  OnCalculate price arrays it reads) at the start of OnCalculate. Never read beyond an array's size:
+  guard loops so indexes stay within 0..size-1 ("array out of range" stops the indicator in MT5).
+- No DLL imports, no trading/order functions, no file/network/web access.
+- Check your work by running exactly:  python c.py
+  It compiles {file} and prints "Result: N errors" plus the error lines. Repeat fix -> compile until it
+  reports 0 errors.
+Finish with exactly one line: DONE (if it compiles with 0 errors) or FAILED: <short reason>."""
+
+def done_names():
+    names = set()
+    if OUT.exists():
+        for line in open(OUT, encoding='utf-8', errors='replace'):
+            try: names.add(json.loads(line)['name'])
+            except Exception: pass
+    return names
+
+def local_includes(text, original):
+    found = []
+    for inc in re.findall(r'#include\s+"([^"]+)"', text):
+        for base in [Path(original).parent] + INCLUDE_DIRS:
+            p = base / inc
+            if p.exists():
+                found.append(p); break
+    return found
+
+def run_job(job):
+    name = job['name']; d = R / name
+    shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True)
+    target = d / f'{name}.mq5'
+    shutil.copy2(job['source'], target)
+    text = target.read_bytes().decode('utf-8', 'replace')
+    for inc in local_includes(text, job.get('original', job['source'])):
+        shutil.copy2(inc, d / inc.name)
+    (d / 'c.py').write_text('import subprocess, sys\n'
+                            f'sys.exit(subprocess.run([sys.executable, r"{MQLC}", r"{target}"]).returncode)\n',
+                            encoding='utf-8')
+    prompt = PROMPT.format(file=target.name, problem=job['problem'], detail=job.get('detail', ''),
+                           mqlc=MQLC, path=str(target))
+    t0 = time.time()
+    try:
+        cp = subprocess.run([CLAUDE, '-p', prompt, '--model', arg('--model', 'sonnet'),
+                             '--permission-mode', 'acceptEdits',
+                             '--allowedTools', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash(python c.py)',
+                             '--output-format', 'text'],
+                            cwd=str(d), capture_output=True, text=True, encoding='utf-8', errors='replace',
+                            timeout=int(arg('--timeout', 1200)))
+        answer = (cp.stdout or '').strip().splitlines()[-1:] or ['']
+    except subprocess.TimeoutExpired:
+        answer = ['FAILED: timeout']
+    verify = subprocess.run([sys.executable, MQLC, str(target)], capture_output=True, text=True)
+    rec = {'name': name, 'problem': job['problem'], 'agent': answer[0][:300],
+           'compiles': verify.returncode == 0, 'compile_result': verify.stdout.splitlines()[:1],
+           'seconds': round(time.time() - t0), 'path': str(target)}
+    with open(OUT, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(rec) + '\n')
+    return rec
+
+if __name__ == '__main__':
+    jobs = json.load(open(sys.argv[1], encoding='utf-8'))
+    skip = done_names()
+    todo = [j for j in jobs if j['name'] not in skip]
+    print(f'{len(todo)} jobs ({len(jobs) - len(todo)} already done)', flush=True)
+    with ThreadPoolExecutor(max_workers=int(arg('--workers', 4))) as ex:
+        for i, rec in enumerate(ex.map(run_job, todo), 1):
+            print(f"{i}/{len(todo)} {rec['name'][:40]} compiles={rec['compiles']} {rec['seconds']}s {rec['agent'][:60]}", flush=True)

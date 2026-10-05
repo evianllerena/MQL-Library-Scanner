@@ -7,17 +7,25 @@ indicator it was on is recorded as 'hang', and a new session continues after it.
 import hashlib, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
-RT = Path(r'C:\Users\Evision\AppData\Local\nnfx-backtest-runtime\preview-runtime\v5\mt5-5ece741c1d')
+def arg(flag, default=None):
+    return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
+
+# --rt <portable MT5 dir> and --shard k/N let several runtime copies test disjoint shares in parallel
+RT = Path(arg('--rt', r'C:\Users\Evision\AppData\Local\nnfx-backtest-runtime\preview-runtime\v5\mt5-5ece741c1d'))
 FILES = RT / 'MQL5' / 'Files'
 W = Path(r'F:\MQLFIX_BUILD')
 HANG_S = 120
 V = sys.argv[1]
-SESSION = int(sys.argv[sys.argv.index('--session') + 1]) if '--session' in sys.argv else 300
+SESSION = int(arg('--session', 300))
+SHARD_K, SHARD_N = (int(x) for x in arg('--shard', '0/1').split('/'))
 only = None
 if '--names' in sys.argv:
-    only = [l.strip() for l in open(sys.argv[sys.argv.index('--names') + 1], encoding='utf-8') if l.strip()]
-OUT = W / f'qa_{V}.jsonl'
+    only = [l.strip() for l in open(arg('--names'), encoding='utf-8') if l.strip()]
+OUT = W / (f'qa_{V}.jsonl' if SHARD_N == 1 else f'qa_{V}_s{SHARD_K}.jsonl')
 requeues = {}
+
+def in_shard(name):
+    return int(hashlib.md5(name.encode('utf-8')).hexdigest(), 16) % SHARD_N == SHARD_K
 
 def alias(name):
     """MT5's script reads the job file as ANSI, so non-ASCII names (e.g. Cyrillic) become '?' and the
@@ -28,9 +36,8 @@ def alias(name):
 
 def aligned_in_A():
     """B (flipped) is only worth testing where A is not already aligned."""
-    a = W / 'qa_A.jsonl'
     ok = set()
-    if a.exists():
+    for a in W.glob('qa_A*.jsonl'):
         for line in open(a, encoding='utf-8', errors='replace'):
             try: r = json.loads(line)
             except Exception: continue
@@ -46,8 +53,8 @@ def compiled():
 
 def done_ids():
     ids = set()
-    if OUT.exists():
-        for line in open(OUT, encoding='utf-8', errors='replace'):
+    for f in W.glob(f'qa_{V}*.jsonl'):
+        for line in open(f, encoding='utf-8', errors='replace'):
             try:
                 r = json.loads(line)
             except Exception:
@@ -117,7 +124,7 @@ if __name__ == '__main__':
     while True:
         done = done_ids()
         skip = aligned_in_A() if V == 'B' else set()
-        todo = [(n, ex) for n, ex in compiled() if n not in done and n not in skip and (only is None or n in only)]
+        todo = [(n, ex) for n, ex in compiled() if n not in done and n not in skip and in_shard(n) and (only is None or n in only)]
         if not todo:
             break
         n = run_session(todo[:SESSION])
