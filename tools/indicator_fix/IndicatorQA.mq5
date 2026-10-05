@@ -106,15 +106,17 @@ string AlignTest(string rel,string &verdict){
     nb++;
     int n=MathMin(ga,gf);
     for(int j=0;j<n;j++){
-      bool ea=(a[j]==EMPTY_VALUE || !MathIsValidNumber(a[j])), ef=(f[j]==EMPTY_VALUE || !MathIsValidNumber(f[j]));
-      if(ea && ef) continue;
+      // compare only bars BOTH histories calculated: indicators that fill just the last N bars (CountBars
+      // inputs) leave EMPTY/0 outside that window, which lands on different dates in QA_CUT and QA_FULL
+      bool ea=(a[j]==EMPTY_VALUE || !MathIsValidNumber(a[j]) || a[j]==0.0), ef=(f[j]==EMPTY_VALUE || !MathIsValidNumber(f[j]) || f[j]==0.0);
+      if(ea || ef) continue;
       compared++;
       bool same=(ea==ef) && (MathAbs(a[j]-f[j])<=1e-8*MathMax(1.0,MathAbs(a[j])));
       if(!same){ diffs++; if(j>deepest) deepest=j; }
     }
   }
   IndicatorRelease(h1); IndicatorRelease(h2);
-  if(compared==0) verdict="no_comparable_values";
+  if(compared<50) verdict="no_comparable_values";
   else if(diffs==0) verdict="aligned";
   else if(deepest<REPAINT) verdict="repaints";
   else verdict="misaligned";

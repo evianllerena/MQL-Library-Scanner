@@ -15,7 +15,7 @@ from pathlib import Path
 W = Path(r'F:\MQLFIX_BUILD')
 DEST = Path(sys.argv[1] if len(sys.argv) > 1 else r'F:\Fixed MQL5 Indicators')
 HERE = Path(__file__).resolve().parent
-ORDER = ['A', 'B', 'X', 'RA', 'RB']          # variant preference on ties
+ORDER = ['C', 'A', 'D', 'B', 'X']          # variant preference on ties
 
 def verdict(r):
     """Classify one QA record -> (rank, label, detail); lower rank is better."""
