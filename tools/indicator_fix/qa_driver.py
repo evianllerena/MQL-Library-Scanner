@@ -77,6 +77,9 @@ def run_session(batch):
     for f in ('qa_results.jsonl', 'qa_done.flag'):
         try: (FILES / f).unlink()
         except FileNotFoundError: pass
+    for old in (RT / 'MQL5' / 'Logs').glob('*.log'):   # indicators' error spam grows these to GBs
+        try: old.unlink()
+        except OSError: pass
     ini = RT / 'qa.ini'
     ini.write_text('[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol=EURUSD\nPeriod=D1\n'
                    'Script=IndicatorQA\nShutdownTerminal=0\n', encoding='utf-8')

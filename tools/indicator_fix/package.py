@@ -56,6 +56,12 @@ if __name__ == '__main__':
     xmap = json.load(open(W / 'X_map.json', encoding='utf-8')) if (W / 'X_map.json').exists() else {}
     excluded = json.load(open(HERE / 'repair_excluded.json', encoding='utf-8'))
     best = load_qa()
+    repaired = {}                             # AI runtime repairs that passed the independent re-check
+    rf = W / 'R2' / 'results.jsonl'
+    if rf.exists():
+        for line in open(rf, encoding='utf-8'):
+            r = json.loads(line)
+            if r.get('passes') and r.get('path'): repaired[r['name']] = r['path']
     rows = []
     folders = {'working': 'Working', 'repaints': 'Repaints', 'working (alignment untestable)': 'Working - alignment untestable',
                'not working': 'Not working', 'not compiling': 'Not compiling'}
@@ -66,6 +72,9 @@ if __name__ == '__main__':
         if src_ex5 and Path(src_ex5).exists(): shutil.copy2(src_ex5, sub / f'{name}.ex5')
         rows.append({'indicator': name, 'status': status, 'detail': detail, 'original': original})
     for name, rec in variants.items():
+        if name in repaired:
+            p = repaired[name]; emit(name, rec['original'], 'working', 'AI-repaired, passed runtime + look-ahead test',
+                                     p, p[:-4] + '.ex5'); continue
         b = best.get(name)
         if not b:
             emit(name, rec['original'], 'not compiling' if not ex5_for('A', name) else 'not working',
@@ -74,12 +83,19 @@ if __name__ == '__main__':
         mq5 = next((W / v).glob(f'c*/{name}.mq5'), None)
         emit(name, rec['original'], label, f'{detail} (version {v})', mq5, ex5_for(v, name))
     for name, info in xmap.items():           # Offline-Converter originals: compiled directly or AI-repaired
+        if name in repaired:
+            p = repaired[name]; emit(info['name'], info['original'], 'working', 'AI-repaired, passed runtime + look-ahead test',
+                                     p, p[:-4] + '.ex5'); continue
         b = best.get(name)
         if b:
             emit(info['name'], info['original'], b[3], f"{b[4]} ({info['how']})", info['mq5'], info['ex5'])
         else:
             emit(info['name'], info['original'], 'not compiling' if not info.get('ex5') else 'not working',
                  info.get('why', 'not runtime-tested'), info.get('mq5'), info.get('ex5'))
+    seen = {r['indicator'] for r in rows}     # repaired indicators that had never compiled before
+    for name, p in repaired.items():
+        if name not in seen:
+            emit(name, '', 'working', 'AI-repaired (was not compiling), passed runtime + look-ahead test', p, p[:-4] + '.ex5')
     labels = {'trading': ('Excluded/Trading tools (not indicators)', 'uses the MT4 order API'),
               'dll': ('Excluded/Needs Windows DLL', 'imports a Windows DLL'),
               'no_entry': ('Excluded/Not an indicator', 'no OnCalculate/start/OnInit')}
