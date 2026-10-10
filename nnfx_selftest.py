@@ -20,7 +20,7 @@ raw price-unit distance. Golden cases use realistic EUR/USD- and AUD/NZD-scale
 numbers instead, for reviewer readability against VP's transcripts.
 """
 from __future__ import annotations
-import argparse, csv, sys, tempfile
+import argparse, csv, os, sys, tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -431,6 +431,58 @@ def unit_tests() -> Check:
     c.that('G10: today\'s value and its average come from the same line -- the cross-bar average (97.5) is the '
            '20-bar mean of the vol column itself', abs(avg - 97.5) < 1e-9, detail=str(avg))
 
+    # --- Data-history lever 2: requested history depth, merge-only history seeding, scoring window ---
+    c.that('History: the controller fetches ~6 months of warm-up before the scoring start (2015.01.01 -> 2014.07.02)',
+           nb.fetch_from('2015.01.01') == '2014.07.02', detail=nb.fetch_from('2015.01.01'))
+    hist = Path(tempfile.mkdtemp(prefix='nnfx_hist_'))
+    live_dir, rt_dir = hist / 'live' / 'EURUSD', hist / 'rt' / 'EURUSD'
+    live_dir.mkdir(parents=True); rt_dir.mkdir(parents=True)
+    for d, name, text, mtime in ((live_dir, '2024.hcc', 'live-old', 1000), (live_dir, '2026.hcc', 'live-new', 3000),
+                                 (rt_dir, '2015.hcc', 'rt-deep', 2000), (rt_dir, '2024.hcc', 'rt-newer', 2000),
+                                 (rt_dir, '2026.hcc', 'rt-stale', 2000)):
+        (d / name).write_text(text)
+        os.utime(d / name, (mtime, mtime))
+    nb.merge_tree_newer(live_dir, rt_dir)
+    merged = {f.name: f.read_text() for f in rt_dir.iterdir()}
+    c.that('History seeding MERGES: the runtime keeps a year the live terminal never loaded (2015) and its own newer '
+           '2024, and takes only the live copy that is newer (2026) -- nothing is wiped',
+           merged == {'2015.hcc': 'rt-deep', '2024.hcc': 'rt-newer', '2026.hcc': 'live-new'}, detail=str(merged))
+    statuses = {'EURUSD': {'status': 'done', 'synced': True, 'first': '2014.07.02'},
+                'AUDUSD': {'status': 'done', 'synced': True, 'first': '2026.09.14'},     # 15 bars, the old failure
+                'NZDUSD': {'status': 'done', 'synced': False, 'first': '2014.07.02'},
+                'CADCHF': {'status': 'symbol_select_failed'}}
+    keep, dropped = nb.usable_symbols(statuses, ['EURUSD', 'AUDUSD', 'NZDUSD', 'CADCHF', 'GBPCHF'], '2015.01.01')
+    c.that('History: only a synced symbol whose history reaches the scoring start is scored; short, unsynced, '
+           'unselectable and missing symbols are reported, never scored',
+           keep == ['EURUSD'] and set(dropped) == {'AUDUSD', 'NZDUSD', 'CADCHF', 'GBPCHF'}, detail=f'{keep} {dropped}')
+    late_rows = batch_rows(200.0)  # dated 2024.03.xx, the valid entry is on the last bar
+    in_win = nb.score_candidate({'EURUSD': {'rows': late_rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None,
+                                score_from='2024.03.01')['fingerprints']['EURUSD']
+    out_win = nb.score_candidate({'EURUSD': {'rows': late_rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None,
+                                 score_from='2024.04.01')['fingerprints']['EURUSD']
+    fails = nb.job_failures([
+        {'symbol': 'EURUSD', 'key': 'slow', 'job_status': 'too_slow'},
+        {'symbol': 'GBPUSD', 'key': 'slow', 'job_status': 'too_slow'},
+        {'symbol': 'USDJPY', 'key': 'slow', 'job_status': 'skipped_slow'},
+        {'symbol': 'AUDUSD', 'key': 'slow', 'job_status': 'skipped_slow'},
+        {'symbol': 'EURUSD', 'key': 'fine', 'job_status': 'ok'},
+        {'symbol': 'EURUSD', 'status': 'done', 'rows': 3182}])
+    c.that('Extraction failures: only candidates that failed somewhere are reported, with one readable reason',
+           set(fails) == {'slow'} and nb.failure_reason(fails['slow']) == 'too_slow on EURUSD,GBPUSD; skipped_slow on 2 more',
+           detail=str(fails))
+    c.that('MaxBars: the runtime keeps just enough D1 bars to reach the warm-up start (2015 start on 2026-10-04 '
+           '-> 3700), so MT5 has nothing older to keep downloading mid-extraction',
+           nb.maxbars_for('2015.01.01', datetime(2026, 10, 4)) == 3700, detail=str(nb.maxbars_for('2015.01.01', datetime(2026, 10, 4))))
+    ini_rt = Path(tempfile.mkdtemp(prefix='nnfx_ini_'))
+    (ini_rt / 'config').mkdir()
+    (ini_rt / 'config' / 'common.ini').write_text('[Common]\r\nLogin=1\r\n[Charts]\r\nMaxBars=100000\r\n', encoding='utf-16')
+    nb.set_runtime_maxbars(ini_rt, 3700)
+    ini_text = (ini_rt / 'config' / 'common.ini').read_text(encoding='utf-16')
+    c.that("MaxBars: only the [Charts] MaxBars line of the runtime's own common.ini changes (UTF-16 kept)",
+           'MaxBars=3700' in ini_text and 'MaxBars=100000' not in ini_text and 'Login=1' in ini_text, detail=ini_text)
+    c.that('History: the scoring window starts at score_from -- bars before it are warm-up only (no records counted)',
+           in_win[-1][1:] == ('enter', 'enter:standard') and out_win == (), detail=f'{in_win[-1:]} {out_win}')
+
     # --- FIX 8: ranking runs the breaker OFF; the breaker-ON expectancy is reported alongside so the
     #     drawdown breaker never distorts the comparison. A candidate that never trips it has identical
     #     off/on expectancy and zero breaker skips. ----------------------------------------------------
@@ -708,6 +760,23 @@ def unit_tests() -> Check:
     c.that('R1 lockstep: driving symbols together in date order gives each symbol exactly the records it gets alone '
            '(only a shared tracker + the breaker couple them)',
            all([(r['action'], r['reason'], r['pips']) for r in recs_off[sym]] == solo[sym] for sym in solo))
+
+    # --- Rank on expectancy in R (P/L / the 1.5xATR stop) with a 95% margin of error --------
+    exit_rs = {sym: [round(r['r'], 4) for r in recs if r['action'] == 'exit'] for sym, recs in recs_off.items()}
+    c.that('R per trade: a full stop-out is exactly -1R; a wrong-side close at 99.5 from 100.6 is -1.1/1.5 = -0.7333R; '
+           'TP1 (+1xATR on half) plus the runner closed +3xATR on the same bar is 0.5x(1/1.5) + 0.5x(3/1.5) = +1.3333R',
+           exit_rs == {'EURUSD': [-1.0, -1.0, -0.7333], 'GBPUSD': [1.3333]}, detail=str(exit_rs))
+    mean, ci = nb.r_stats([1.0, -1.0, 1.0, -1.0])
+    c.that('R stats: mean 0 with a 95% margin of 1.96 x stdev(1.1547) / sqrt(4) = 1.1316',
+           mean == 0.0 and abs(ci - 1.13161) < 1e-4 and nb.r_stats([]) == (0.0, None), detail=f'{mean} {ci}')
+    board = nb.leaderboard_order([
+        dict(slot='BASELINE', trades=11, expectancy_r=0.096),   # higher R, but only 11 trades
+        dict(slot='BASELINE', trades=1272, expectancy_r=0.015),
+        dict(slot='BASELINE', trades=1632, expectancy_r=0.016),
+        dict(slot='CONFIRMATION_1', trades=1933, expectancy_r=0.022)])
+    c.that('Leaderboard order: within a slot by expectancy_r, best first; an insufficient sample (<30 trades) sorts '
+           'last however high its R', [(r['slot'], r['trades']) for r in board] ==
+           [('BASELINE', 1632), ('BASELINE', 1272), ('BASELINE', 11), ('CONFIRMATION_1', 1933)], detail=str(board))
 
     return c
 

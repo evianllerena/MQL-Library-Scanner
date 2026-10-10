@@ -22,10 +22,12 @@ verified nnfx_engine.py, writing real backtest_results rows.
 Commands (JSONL on stdout, like the other sidecars):
   plan --db <db> [--limit N]
   run  --db <db> --out <dir> --bed-symbols EURUSD,GBPUSD,USDJPY [--limit N]
-       [--min-trades 30] [--force]
+       [--min-trades 30] [--force] [--history-from 2015.01.01]
+  rescore --db <db> --out <dir of an earlier run> --csv <leaderboard.csv> [--history-from 2015.01.01]
 """
 from __future__ import annotations
 import argparse, json, os, shutil, sqlite3, sys, time, hashlib, threading, tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import preview_bridge as pb  # discovery, clone_runtime, compile_file, stage, mql_dir_name, ...
@@ -54,6 +56,116 @@ DEFAULT_NNFX_BASKET = ('EURUSD,GBPUSD,AUDUSD,NZDUSD,USDCAD,USDCHF,USDJPY,'
                        'EURGBP,EURAUD,EURNZD,EURCAD,EURCHF,EURJPY,'
                        'GBPAUD,GBPNZD,GBPCAD,GBPCHF,GBPJPY,'
                        'AUDNZD,AUDCAD,AUDCHF,AUDJPY,NZDCAD,NZDCHF,NZDJPY,CADCHF,CADJPY,CHFJPY')
+
+# Data-history lever 2: the controller REQUESTS D1 history from the server back to the scoring
+# start minus a warm-up margin (it used to read only what the terminal happened to have cached),
+# and trades are scored from the scoring start on. Override with --history-from.
+DEFAULT_HISTORY_FROM = '2015.01.01'
+HISTORY_WARMUP_DAYS = 183  # ~6 months of extra bars so indicators/ATR/volume average are settled
+
+
+def fetch_from(history_from: str) -> str:
+    """The date the controller requests history from: the scoring start minus the warm-up."""
+    d = datetime.strptime(history_from, '%Y.%m.%d') - timedelta(days=HISTORY_WARMUP_DAYS)
+    return d.strftime('%Y.%m.%d')
+
+
+def maxbars_for(history_from: str, today=None) -> int:
+    """MT5's per-chart bar cap for the batch runtime: enough D1 bars to reach fetch_from (~5/7 of
+    calendar days, +15%), rounded up to 100. Capping it stops MT5 from downloading ever-older
+    history in the background during extraction -- each new chunk reset every indicator on that
+    symbol (reproduced: EURCHF grew 26 bars per ~30 s, and candidates loaded mid-reset stalled)."""
+    today = today or datetime.now()
+    days = (today - datetime.strptime(fetch_from(history_from), '%Y.%m.%d')).days
+    return -(-int(days * 5 / 7 * 1.15) // 100) * 100
+
+
+def set_runtime_maxbars(rt, maxbars: int) -> None:
+    """Write [Charts] MaxBars into the batch runtime's own config/common.ini (UTF-16, MT5's
+    encoding). Only the batch's cloned runtime is touched, never the user's terminal."""
+    path = Path(rt) / 'config' / 'common.ini'
+    text = path.read_text(encoding='utf-16') if path.exists() else ''
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith('maxbars='):
+            lines[i] = f'MaxBars={maxbars}'
+            break
+    else:
+        if '[Charts]' in lines:
+            lines.insert(lines.index('[Charts]') + 1, f'MaxBars={maxbars}')
+        else:
+            lines += ['[Charts]', f'MaxBars={maxbars}']
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\r\n'.join(lines) + '\r\n', encoding='utf-16')
+
+
+def usable_symbols(statuses: dict, symbols, history_from: str):
+    """Split the basket into symbols to score and symbols to leave out, from the controller's
+    per-symbol status lines. A symbol is scored only if its history synchronized AND reaches the
+    scoring start; anything else is reported, never silently scored on a few weeks of bars."""
+    keep, dropped = [], {}
+    for sym in symbols:
+        st = statuses.get(sym)
+        if not st or st.get('status') != 'done':
+            dropped[sym] = (st or {}).get('status', 'no_status')
+        elif not st.get('synced'):
+            dropped[sym] = 'history_not_synced'
+        elif st.get('first', '9999') > history_from:
+            dropped[sym] = f"history_starts_{st.get('first')}"
+        else:
+            keep.append(sym)
+    return keep, dropped
+
+JOB_TIMEOUT_SECONDS = 30  # per candidate per pair; a candidate that misses it on 2 pairs is skipped
+
+
+def job_failures(results):
+    """{candidate key: {symbol: job_status}} for every candidate the controller could not extract
+    on some symbol (too_slow / never_calculated / load_failed / skipped_slow)."""
+    out = {}
+    for r in results:
+        st = r.get('job_status')
+        if st and st != 'ok':
+            out.setdefault(r['key'], {})[r['symbol']] = st
+    return out
+
+
+def failure_reason(fails: dict) -> str:
+    """One readable line for a candidate's extraction failures, e.g.
+    'too_slow on EURUSD,GBPUSD; skipped_slow on 26 more'."""
+    by = {}
+    for sym, st in fails.items():
+        by.setdefault(st, []).append(sym)
+    parts = []
+    for st in ('load_failed', 'never_calculated', 'too_slow', 'queue_unhealthy'):
+        if st in by:
+            parts.append(f"{st} on {','.join(by[st])}")
+    if 'skipped_slow' in by:
+        parts.append(f"skipped_slow on {len(by['skipped_slow'])} more")
+    return '; '.join(parts)
+
+
+MIN_TRADES = 30  # below this a result is an insufficient sample (same default as the app's board)
+
+
+def r_stats(trade_rs):
+    """Expectancy in R (P/L / the 1.5xATR-at-entry stop) and its 95% margin of error.
+    R puts every pair on one scale (pips are not comparable: a GBPNZD day moves ~3x an EURCHF
+    day). The margin is 1.96 x sample stdev / sqrt(n): an edge is only distinguishable from zero
+    -- or from another candidate -- when the ranges do not overlap."""
+    n = len(trade_rs)
+    if n == 0:
+        return 0.0, None
+    mean = sum(trade_rs) / n
+    if n < 2:
+        return mean, None
+    var = sum((x - mean) ** 2 for x in trade_rs) / (n - 1)
+    return mean, 1.96 * (var ** 0.5) / n ** 0.5
+
+
+def leaderboard_order(rows, min_trades=MIN_TRADES):
+    """Rank within each slot on expectancy_r (best first); insufficient samples always sort last."""
+    return sorted(rows, key=lambda r: (r['slot'], r['trades'] < min_trades, -r['expectancy_r']))
 
 # ---- DB ----------------------------------------------------------------------
 
@@ -91,6 +203,9 @@ def ensure_backtest_table(conn):
     # FIX 8: breaker-ON expectancy for reference; the ranking uses expectancy_pips (breaker OFF).
     if 'expectancy_pips_breaker' not in cols:
         conn.execute('ALTER TABLE backtest_results ADD COLUMN expectancy_pips_breaker REAL')
+    for col in ('expectancy_r', 'expectancy_r_ci95'):  # ranking metric in R + its 95% margin
+        if col not in cols:
+            conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} REAL')
     conn.commit()
 
 TESTABLE_SLOTS = ('CONFIRMATION_1', 'CONFIRMATION_2', 'BASELINE', 'VOLUME')
@@ -158,6 +273,43 @@ int JInt(string obj,string key,int dflt=-1){
 }
 #define EV(x) ((x)==EMPTY_VALUE ? "EMPTY" : DoubleToString((x),8))
 
+// Some converted indicators leave the symbol's calculation queue in a state where the NEXT
+// indicator created on it never calculates (reproduced: after ZigZagOnFractals / soho-williams the
+// next handle stays at BarsCalculated=-1 indefinitely, even after a pause; the following one is
+// fine). So before every candidate, prove the queue is healthy with a throwaway Examples\Momentum:
+// if it does not calculate within ~0.75 s, release it and try another until one does. A candidate
+// that then fails to calculate is genuinely broken, not a victim of the one before it.
+bool WaitHealthy(string sym,int need,uint limit_ms){
+  uint t0=GetTickCount();
+  while(GetTickCount()-t0<limit_ms){
+    int h=iCustom(sym,PERIOD_D1,"Examples\\Momentum");
+    int c=-1; uint s0=GetTickCount();
+    while(h!=INVALID_HANDLE && GetTickCount()-s0<750){ c=BarsCalculated(h); if(c>=need) break; Sleep(25); }
+    if(h!=INVALID_HANDLE) IndicatorRelease(h);
+    if(c>=need) return(true);
+    Sleep(250);
+  }
+  return(false);
+}
+
+// Ask the server for D1 history back to `from` and wait until the series is synchronized and
+// reaches it (or the server has nothing older). Without this the script only sees whatever was
+// already cached locally -- ~15 bars for a pair the terminal never charted.
+bool SyncHistory(string sym,datetime from,uint timeout_ms){
+  uint t0=GetTickCount();
+  while(GetTickCount()-t0<timeout_ms){
+    datetime t[];
+    int got=CopyTime(sym,PERIOD_D1,from,TimeCurrent(),t);
+    if(got>0 && SeriesInfoInteger(sym,PERIOD_D1,SERIES_SYNCHRONIZED)){
+      datetime first=(datetime)SeriesInfoInteger(sym,PERIOD_D1,SERIES_FIRSTDATE);
+      datetime sfirst=(datetime)SeriesInfoInteger(sym,PERIOD_D1,SERIES_SERVER_FIRSTDATE);
+      if(first<=from+7*86400 || (sfirst>0 && first<=sfirst+7*86400)) return(true);
+    }
+    Sleep(250);
+  }
+  return(false);
+}
+
 void OnStart(){
   string body=ReadFileText("nnfx_batch.json");
   if(StringLen(body)==0){ AppendResult("{\"fatal\":\"no job file\"}"); return; }
@@ -182,12 +334,22 @@ void OnStart(){
     int q1=StringFind(sarr,"\"",pos); if(q1<0) break; int q2=StringFind(sarr,"\"",q1+1); if(q2<0) break;
     ArrayResize(syms,nsyms+1); syms[nsyms]=StringSubstr(sarr,q1+1,q2-q1-1); nsyms++; pos=q2+1;
   }
-  AppendResult("{\"info\":\"loaded\",\"jobs\":"+IntegerToString(njobs)+",\"symbols\":"+IntegerToString(nsyms)+"}");
+  datetime from=StringToTime(JStr(body,"history_from"));
+  uint jobTimeout=(uint)JInt(body,"job_timeout_ms",30000);
+  // strikes[k]: pairs on which candidate k timed out / never calculated / failed to load. After
+  // MAX_STRIKES it is skipped on the remaining pairs, so a broken indicator costs ~2 time limits.
+  #define MAX_STRIKES 2
+  int strikes[]; ArrayResize(strikes,njobs); ArrayInitialize(strikes,0);
+  AppendResult("{\"info\":\"loaded\",\"jobs\":"+IntegerToString(njobs)+",\"symbols\":"+IntegerToString(nsyms)+",\"history_from\":\""+TimeToString(from,TIME_DATE)+"\"}");
+  uint c0=GetTickCount();  // the session may still be logging in when the script starts
+  while(!TerminalInfoInteger(TERMINAL_CONNECTED) && GetTickCount()-c0<60000) Sleep(250);
 
   for(int s=0;s<nsyms;s++){
     string sym=syms[s];
     if(!SymbolSelect(sym,true)){ AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"symbol_select_failed\"}"); continue; }
-    int total=iBars(sym,PERIOD_D1);
+    bool synced=SyncHistory(sym,from,120000);
+    int total=Bars(sym,PERIOD_D1,from,TimeCurrent());  // only bars from `from` on (warm-up included)
+    if(total<=0){ AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"no_history\",\"synced\":"+(synced?"true":"false")+"}"); continue; }
 
     int h_ma=iCustom(sym,PERIOD_D1,"Examples\\Custom Moving Average",20,0,MODE_SMA);
     int h_macd=iCustom(sym,PERIOD_D1,"Examples\\MACD");
@@ -196,15 +358,13 @@ void OnStart(){
     int h_vol=iCustom(sym,PERIOD_D1,"Examples\\Volumes");
     int h_atr=iATR(sym,PERIOD_D1,14);
 
-    int handles[]; ArrayResize(handles,njobs);
-    for(int k=0;k<njobs;k++) handles[k]=iCustom(sym,PERIOD_D1,rels[k]);
-
-    int waited=0;
-    while(waited<20){
-      bool ready=(BarsCalculated(h_ma)>0 && BarsCalculated(h_macd)>0 && BarsCalculated(h_rvi)>0 && BarsCalculated(h_mom)>0 && BarsCalculated(h_vol)>0 && BarsCalculated(h_atr)>0);
-      for(int k=0;k<njobs;k++) if(BarsCalculated(handles[k])<=0) ready=false;
-      if(ready) break;
-      Sleep(100); waited++;
+    // the fixed backdrop must have calculated EVERY bar (not just one) before it is read
+    int need=Bars(sym,PERIOD_D1);
+    uint w0=GetTickCount();
+    while(GetTickCount()-w0<60000){
+      if(BarsCalculated(h_ma)>=need && BarsCalculated(h_macd)>=need && BarsCalculated(h_rvi)>=need &&
+         BarsCalculated(h_mom)>=need && BarsCalculated(h_vol)>=need && BarsCalculated(h_atr)>=need) break;
+      Sleep(100);
     }
 
     double ma[],macdM[],macdS[],rvi[],mom[],vol[],atr[];
@@ -214,18 +374,41 @@ void OnStart(){
     int gotMom=CopyBuffer(h_mom,0,0,total,mom);
     int gotVol=CopyBuffer(h_vol,0,0,total,vol);
 
-    double allA[]; ArrayResize(allA,njobs*total);
-    double allB[]; ArrayResize(allB,njobs*total);
+    // candidates ONE AT A TIME, each with its own time limit: MT5 calculates every indicator on a
+    // symbol in one queue, so loading them all together let one slow conversion (O(n^2) recalcs,
+    // a missing dependency) stall every other candidate on that symbol.
+    double allA[]; ArrayResize(allA,njobs*total); ArrayInitialize(allA,EMPTY_VALUE);
+    double allB[]; ArrayResize(allB,njobs*total); ArrayInitialize(allB,EMPTY_VALUE);
     for(int k=0;k<njobs;k++){
-      double a[]; ArraySetAsSeries(a,true);
-      int gotA = (handles[k]!=INVALID_HANDLE) ? CopyBuffer(handles[k],bufA[k],0,total,a) : -1;
-      for(int i=0;i<total;i++) allA[k*total+i]=(i<gotA)?a[i]:EMPTY_VALUE;
-      if(bufB[k]>=0){
-        double b[]; ArraySetAsSeries(b,true);
-        int gotB=(handles[k]!=INVALID_HANDLE) ? CopyBuffer(handles[k],bufB[k],0,total,b) : -1;
-        for(int i=0;i<total;i++) allB[k*total+i]=(i<gotB)?b[i]:EMPTY_VALUE;
+      string st="ok"; int calc=-1; uint j0=GetTickCount();
+      if(strikes[k]>=MAX_STRIKES) st="skipped_slow";
+      else if(!WaitHealthy(sym,need,60000)) st="queue_unhealthy";  // not the candidate's fault: no strike
+      else{
+        j0=GetTickCount();
+        int h=iCustom(sym,PERIOD_D1,rels[k]);
+        if(h==INVALID_HANDLE){ st="load_failed"; strikes[k]++; }
+        else{
+          while(true){
+            calc=BarsCalculated(h);
+            if(calc>=need || GetTickCount()-j0>=jobTimeout) break;
+            Sleep(50);
+          }
+          if(calc<need){ st=(calc<=0)?"never_calculated":"too_slow"; strikes[k]++; }
+          else{
+            double a[]; ArraySetAsSeries(a,true);
+            int gotA=CopyBuffer(h,bufA[k],0,total,a);
+            for(int i=0;i<total;i++) allA[k*total+i]=(i<gotA)?a[i]:EMPTY_VALUE;
+            if(bufB[k]>=0){
+              double b[]; ArraySetAsSeries(b,true);
+              int gotB=CopyBuffer(h,bufB[k],0,total,b);
+              for(int i=0;i<total;i++) allB[k*total+i]=(i<gotB)?b[i]:EMPTY_VALUE;
+            }
+          }
+          IndicatorRelease(h);
+        }
       }
-      AppendResult("{\"symbol\":\""+sym+"\",\"key\":\""+keys[k]+"\",\"handle\":"+(handles[k]==INVALID_HANDLE?"\"invalid\"":"\"ok\"")+"}");
+      AppendResult("{\"symbol\":\""+sym+"\",\"key\":\""+keys[k]+"\",\"job_status\":\""+st+"\",\"calculated\":"+
+                   IntegerToString(calc)+",\"ms\":"+IntegerToString(GetTickCount()-j0)+"}");
     }
 
     string outfile="nnfx_batch_extract_"+sym+".csv";
@@ -243,9 +426,10 @@ void OnStart(){
       FileWriteString(fh,line+"\r\n");
     }
     FileClose(fh);
-    for(int k=0;k<njobs;k++) IndicatorRelease(handles[k]);
     IndicatorRelease(h_ma); IndicatorRelease(h_macd); IndicatorRelease(h_rvi); IndicatorRelease(h_mom); IndicatorRelease(h_vol); IndicatorRelease(h_atr);
-    AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"done\",\"rows\":"+IntegerToString(total)+"}");
+    AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"done\",\"rows\":"+IntegerToString(total)+
+                 ",\"first\":\""+TimeToString(iTime(sym,PERIOD_D1,total-1),TIME_DATE)+"\",\"synced\":"+(synced?"true":"false")+
+                 ",\"server_first\":\""+TimeToString((datetime)SeriesInfoInteger(sym,PERIOD_D1,SERIES_SERVER_FIRSTDATE),TIME_DATE)+"\"}");
   }
   int f=FileOpen("nnfx_batch_done.flag",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
   if(f!=INVALID_HANDLE){ FileWriteString(f,"done"); FileClose(f); }
@@ -256,10 +440,15 @@ void OnStart(){
 def copy_history_for_symbols(live, rt, symbols):
     """pb.copy_mt5_history() only seeds ONE symbol's cached history into a
     fresh clone (whichever was most recently active). A multi-pair basket
-    needs all of them, so this copies each basket symbol's history folder
+    needs all of them, so this seeds each basket symbol's history folder
     directly -- same mechanism, just not limited to a single symbol. Lives
     here rather than in preview_bridge.py since preview never needed more
-    than one symbol; this doesn't touch preview_bridge.py at all."""
+    than one symbol; this doesn't touch preview_bridge.py at all.
+
+    MERGE, never replace: the runtime keeps the deeper history the controller
+    downloaded on earlier runs (years the live terminal never loaded), so a
+    file is copied only when the runtime lacks it or the live copy is newer.
+    (It used to rmtree each symbol first, wiping that history every run.)"""
     copied = []
     bases_dir = Path(live) / 'bases'
     if not bases_dir.exists():
@@ -273,14 +462,25 @@ def copy_history_for_symbols(live, rt, symbols):
             if not src.is_dir():
                 continue
             dst = Path(rt) / src.relative_to(live)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.rmtree(dst, ignore_errors=True)
             try:
-                shutil.copytree(src, dst)
+                merge_tree_newer(src, dst)
                 copied.append(sym)
             except Exception:
                 pass
     return copied
+
+
+def merge_tree_newer(src: Path, dst: Path) -> None:
+    """Copy every file under src into dst when dst lacks it or src's copy is newer. Nothing in
+    dst is ever deleted."""
+    for f in src.rglob('*'):
+        if not f.is_file():
+            continue
+        target = dst / f.relative_to(src)
+        if target.exists() and target.stat().st_mtime >= f.stat().st_mtime:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
 
 def restore_account_login(live, rt):
     """pb.prime_mt5_runtime() runs pb._prepare_offline_runtime(), which deletes
@@ -432,11 +632,12 @@ def _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref):
     return prepared
 
 
-def _score_run(symbols, prepared, enable_dd_breaker):
+def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_FROM):
     """One scoring pass over prepared bars at a given breaker setting. Fresh engines + a fresh
     shared account each call, so the two runs (off/on) are independent."""
     per_symbol = {}
     pooled_trades = []
+    pooled_r = []  # whole-trade results in R, from the engine's closing records
     bridge_skips = continuation_trades = volume_skips = dd_breaker_skips = news_skips = 0
     fingerprints = {}
     # R1 (FIX 7b): ONE equity tracker shared by every symbol's engine, driven in date order
@@ -447,7 +648,8 @@ def _score_run(symbols, prepared, enable_dd_breaker):
                for sym in symbols}
     all_records = run_lockstep(engines, prepared)
     for sym in symbols:
-        window = [r for r in all_records[sym] if r['date'][:4] >= '2019']
+        # trades from the scoring start on; earlier bars are indicator warm-up only
+        window = [r for r in all_records[sym] if r['date'][:10].replace('-', '.') >= score_from]
         bridge_skips += sum(1 for r in window if r['reason'] == 'skip:bridge_too_far')
         continuation_trades += sum(1 for r in window if r['reason'] == 'enter:continuation')
         volume_skips += sum(1 for r in window if r['reason'] == 'skip:volume_filter')
@@ -460,6 +662,7 @@ def _score_run(symbols, prepared, enable_dd_breaker):
                 pending_half1 = r['pips']
             elif r['action'] == 'exit':
                 trades.append((pending_half1 + r['pips']) / 2.0 if pending_half1 is not None else r['pips'])
+                pooled_r.append(r['r'])
                 pending_half1 = None
         per_symbol[sym] = len(trades)
         pooled_trades.extend(trades)
@@ -476,28 +679,32 @@ def _score_run(symbols, prepared, enable_dd_breaker):
     equity = peak = maxdd = 0.0
     for t in pooled_trades:
         equity += t; peak = max(peak, equity); maxdd = min(maxdd, equity - peak)
+    exp_r, ci_r = r_stats(pooled_r)
     return dict(trades=n, wins=wins, losses=losses, win_rate=win_rate, expectancy_pips=expectancy,
+                expectancy_r=round(exp_r, 4), expectancy_r_ci95=round(ci_r, 4) if ci_r is not None else None,
                 profit_factor=profit_factor, max_drawdown=round(maxdd, 1), bridge_skips=bridge_skips,
                 continuation_trades=continuation_trades, volume_skips=volume_skips,
                 max_drawdown_pct=round(account.max_dd_pct, 2), dd_breaker_skips=dd_breaker_skips, news_skips=news_skips,
                 per_symbol=per_symbol, fingerprints=fingerprints)
 
 
-def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref):
+def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_from=DEFAULT_HISTORY_FROM):
     """FIX 8: rank on the breaker-OFF run (full trade history, apples-to-apples) and report the
     breaker-ON expectancy alongside, so the drawdown breaker never distorts the comparison. The
+    ranking metric is expectancy_r (with expectancy_r_ci95); expectancy_pips is kept alongside. The
     risk column max_drawdown_pct comes from the breaker-OFF run (the TRUE unprotected drawdown);
     dd_breaker_skips comes from the breaker-ON run (how many entries the breaker WOULD stop)."""
     prepared = _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref)
-    off = _score_run(symbols, prepared, enable_dd_breaker=False)  # ranking metric + true risk
-    on = _score_run(symbols, prepared, enable_dd_breaker=True)    # reference + real breaker skips
+    off = _score_run(symbols, prepared, enable_dd_breaker=False, score_from=score_from)  # ranking metric + true risk
+    on = _score_run(symbols, prepared, enable_dd_breaker=True, score_from=score_from)    # reference + real breaker skips
     off['expectancy_pips_breaker'] = on['expectancy_pips']
     off['dd_breaker_skips'] = on['dd_breaker_skips']
     return off
 
 # ---- run ----------------------------------------------------------------------
 
-def run(db, out, symbols, limit=None, min_trades=30, force=False):
+def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=DEFAULT_HISTORY_FROM,
+        job_timeout=JOB_TIMEOUT_SECONDS):
     conn = connect(db)
     ensure_backtest_table(conn)
     items = candidacy_rows(conn, limit)
@@ -557,6 +764,9 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
     sym0 = copied[0] if copied else (pb.copy_mt5_history(Path(mt5['data_dir']), rt) or symbols[0])
     pb.prime_mt5_runtime(rt, terminal_exe, sym0, 'nnfx-backtest')
     restore_account_login(Path(mt5['data_dir']), rt)
+    maxbars = maxbars_for(history_from)
+    set_runtime_maxbars(rt, maxbars)
+    stage_event('runtime_maxbars', maxbars=maxbars)
 
     # 1) stage every candidate source (mirrors render_shard's staging loop)
     prepared = {}
@@ -634,7 +844,8 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
     # 4) write job list + controller, compile controller, launch ONE session
     job_json = {'jobs': [{'key': j['key'], 'rel': j['rel'], 'role': j['role'],
                            'buf_a': j['buf_a'], 'buf_b': j['buf_b'] if j['buf_b'] is not None else -1} for j in jobs],
-                'symbols': symbols}
+                'symbols': symbols, 'history_from': fetch_from(history_from),
+                'job_timeout_ms': int(job_timeout * 1000)}
     # compact separators (no space after ':' or ','): the controller's hand-rolled
     # JInt() parser doesn't skip whitespace before a digit, so json.dumps's default
     # "key": 1 style silently made every int field parse back as its -1 default
@@ -656,7 +867,10 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
     proc = pb.subprocess.Popen([str(terminal_exe), '/portable', f'/config:{cfg}'],
                                 cwd=str(rt), creationflags=pb.CREATE_NO_WINDOW, startupinfo=pb.startupinfo())
     try:
-        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(jobs) * len(symbols)))
+        # ceiling: ~20 s per candidate per pair, + 2 time limits per candidate (strikes), + up to
+        # 2.5 min per symbol for the controller's history download/sync
+        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(jobs) * len(symbols)
+                                                            + 2 * job_timeout * len(jobs) + 150 * len(symbols)))
     finally:
         pb.terminate_tree(proc)
     if not finished:
@@ -678,7 +892,24 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
         except Exception:
             pass
 
-    # 5) load per-symbol CSVs, classify, score, write results
+    # 5) history depth per symbol: score only the symbols whose history synchronized and reaches
+    #    the scoring start; report the rest (and every symbol's bars + oldest date) explicitly.
+    results = _read_jsonl(files_dir / 'nnfx_batch_results.jsonl')
+    statuses = {r['symbol']: r for r in results if 'symbol' in r and 'status' in r}
+    failures = job_failures(results)
+    stage_event('history_depth', history_from=history_from, fetch_from=fetch_from(history_from),
+                symbols={s: {k: statuses.get(s, {}).get(k) for k in ('status', 'rows', 'first', 'synced', 'server_first')}
+                         for s in symbols})
+    symbols, dropped = usable_symbols(statuses, symbols, history_from)
+    if dropped:
+        stage_event('symbols_excluded', excluded=dropped)
+    if not symbols:
+        emit({'type': 'fatal', 'error': 'no symbol has usable history', 'excluded': dropped})
+        conn.close()
+        return
+    bed = '+'.join(symbols) + '|D1|LIVE'
+
+    # 6) load per-symbol CSVs, classify, score, write results
     symbol_data = {}
     for sym in symbols:
         p = files_dir / f'nnfx_batch_extract_{sym}.csv'
@@ -694,6 +925,11 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
         try:
             col_a = j['key'] + '_a'
             col_b = j['key'] + '_b' if j['buf_b'] is not None else None
+            fails = {sym: st for sym, st in failures.get(j['key'], {}).items() if sym in symbols}
+            if fails:  # timed out / never calculated / failed to load on some pair: say so, don't score
+                write_status_row(conn, it, bed, 'EXTRACT_FAILED', failure_reason(fails))
+                emit({'type': 'item_error', 'filename': it['filename'], 'error': failure_reason(fails)})
+                continue
             bad = False
             bad_reason = ''
             for sym in symbols:
@@ -711,7 +947,8 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False):
             if bad:
                 write_status_row(conn, it, bed, 'EXTRACT_GARBAGE', bad_reason)
                 continue
-            result = score_candidate(symbol_data, symbols, it['slot'], col_a, col_b, it['zero_reference'])
+            result = score_candidate(symbol_data, symbols, it['slot'], col_a, col_b, it['zero_reference'],
+                                     score_from=history_from)
             write_score_row(conn, it, bed, result)
             scored += 1
             emit({'type': 'item_scored', 'filename': it['filename'], 'slot': it['slot'],
@@ -747,18 +984,75 @@ def write_status_row(conn, it, bed, status, reason):
 def write_score_row(conn, it, bed, r):
     conn.execute("""
         INSERT INTO backtest_results(sha256, slot, signal_type, bed, stage, trades, wins, losses,
-            win_rate, expectancy_pips, expectancy_pips_breaker, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
+            win_rate, expectancy_pips, expectancy_pips_breaker, expectancy_r, expectancy_r_ci95, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
             mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b)
-        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
+        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
         ON CONFLICT(sha256, slot, bed) DO UPDATE SET trades=excluded.trades, wins=excluded.wins,
             losses=excluded.losses, win_rate=excluded.win_rate, expectancy_pips=excluded.expectancy_pips,
             expectancy_pips_breaker=excluded.expectancy_pips_breaker,
+            expectancy_r=excluded.expectancy_r, expectancy_r_ci95=excluded.expectancy_r_ci95,
             profit_factor=excluded.profit_factor, max_drawdown=excluded.max_drawdown, max_drawdown_pct=excluded.max_drawdown_pct,
             bridge_skips=excluded.bridge_skips, continuation_trades=excluded.continuation_trades, tested_at=excluded.tested_at
     """, (it['sha256'], it['slot'], it['signal_type'], bed, r['trades'], r['wins'], r['losses'], r['win_rate'],
-          r['expectancy_pips'], r.get('expectancy_pips_breaker'), r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
+          r['expectancy_pips'], r.get('expectancy_pips_breaker'), r['expectancy_r'], r['expectancy_r_ci95'], r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
           f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b']))
     conn.commit()
+
+LEADERBOARD_COLUMNS = (
+    'indicator', 'slot', 'status', 'trades', 'sufficient_sample', 'expectancy_r', 'expectancy_r_ci95', 'expectancy_r_low',
+    'expectancy_r_high', 'expectancy_pips', 'expectancy_pips_breaker', 'win_rate', 'profit_factor',
+    'max_drawdown_pips', 'max_drawdown_pct', 'dd_breaker_skips', 'bridge_skips', 'continuation_trades',
+    'volume_skips', 'news_skips', 'symbols_traded')
+
+
+def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN_TRADES):
+    """Re-score a saved extraction (--out of an earlier run: nnfx_batch.json + per-symbol CSVs)
+    with the current engine and write the leaderboard CSV ranked on expectancy_r. No MT5 needed.
+    Symbols missing from the extraction or excluded by its history-depth report are left out."""
+    import csv as _csv
+    out = Path(out)
+    job_json = json.loads((out / 'nnfx_batch.json').read_text(encoding='utf-8'))
+    results = _read_jsonl(out / 'nnfx_batch_results.jsonl')
+    statuses = {r['symbol']: r for r in results if 'symbol' in r and 'status' in r}
+    failures = job_failures(results)
+    symbols = [s for s in job_json['symbols'] if (out / f'nnfx_batch_extract_{s}.csv').exists()]
+    if statuses:
+        symbols, dropped = usable_symbols(statuses, symbols, history_from)
+        if dropped:
+            stage_event('symbols_excluded', excluded=dropped)
+    symbol_data = {s: {'rows': list(_csv.DictReader(open(out / f'nnfx_batch_extract_{s}.csv', encoding='utf-8', errors='replace')))}
+                   for s in symbols}
+    conn = connect(db)
+    names = dict(conn.execute('SELECT sha256, filename FROM indicators'))
+    conn.close()
+    rows = []
+    for j in job_json['jobs']:
+        fails = {sym: st for sym, st in failures.get(j['key'], {}).items() if sym in symbols}
+        if fails:  # listed with the reason, never scored on empty columns
+            rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'],
+                             status=failure_reason(fails), trades=0, sufficient_sample=False, expectancy_r=0.0))
+            continue
+        col_b = j['key'] + '_b' if j['buf_b'] >= 0 else None
+        r = score_candidate(symbol_data, symbols, j['role'], j['key'] + '_a', col_b, None, score_from=history_from)
+        ci = r['expectancy_r_ci95']
+        rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status='scored', trades=r['trades'],
+                         sufficient_sample=r['trades'] >= min_trades, expectancy_r=r['expectancy_r'],
+                         expectancy_r_ci95=ci,
+                         expectancy_r_low=round(r['expectancy_r'] - ci, 4) if ci is not None else None,
+                         expectancy_r_high=round(r['expectancy_r'] + ci, 4) if ci is not None else None,
+                         expectancy_pips=r['expectancy_pips'], expectancy_pips_breaker=r['expectancy_pips_breaker'],
+                         win_rate=r['win_rate'], profit_factor=r['profit_factor'], max_drawdown_pips=r['max_drawdown'],
+                         max_drawdown_pct=r['max_drawdown_pct'], dd_breaker_skips=r['dd_breaker_skips'],
+                         bridge_skips=r['bridge_skips'], continuation_trades=r['continuation_trades'],
+                         volume_skips=r['volume_skips'], news_skips=r['news_skips'],
+                         symbols_traded=sum(1 for n in r['per_symbol'].values() if n)))
+    rows = leaderboard_order(rows, min_trades)
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        w = _csv.DictWriter(f, fieldnames=LEADERBOARD_COLUMNS, restval='')
+        w.writeheader()
+        w.writerows(rows)
+    emit({'type': 'rescore_complete', 'csv': str(csv_path), 'symbols': len(symbols), 'candidates': len(rows)})
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -769,12 +1063,21 @@ def main():
     p.add_argument('--bed-symbols', default=DEFAULT_NNFX_BASKET)
     p.add_argument('--limit', type=int); p.add_argument('--min-trades', type=int, default=30)
     p.add_argument('--force', action='store_true')
+    p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM,
+                   help='score trades from this date (YYYY.MM.DD); history is fetched ~6 months earlier for warm-up')
+    p.add_argument('--job-timeout', type=float, default=JOB_TIMEOUT_SECONDS,
+                   help='seconds a candidate may take to calculate on one pair before it is marked too_slow')
+    p = sub.add_parser('rescore', help='re-score a saved extraction (no MT5) and write the leaderboard CSV')
+    p.add_argument('--db', required=True); p.add_argument('--out', required=True); p.add_argument('--csv', required=True)
+    p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM); p.add_argument('--min-trades', type=int, default=MIN_TRADES)
     args = ap.parse_args()
     if args.cmd == 'plan':
         plan(args.db, args.limit)
     elif args.cmd == 'run':
         run(args.db, args.out, [s.strip() for s in args.bed_symbols.split(',') if s.strip()],
-            args.limit, args.min_trades, args.force)
+            args.limit, args.min_trades, args.force, args.history_from, args.job_timeout)
+    elif args.cmd == 'rescore':
+        rescore(args.db, args.out, args.csv, args.history_from, args.min_trades)
 
 if __name__ == '__main__':
     try:

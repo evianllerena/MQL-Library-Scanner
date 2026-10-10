@@ -148,6 +148,7 @@ class Position:
     tp1_hit: bool = False
     is_continuation: bool = False
     trail_active: bool = False  # FIX 6: sticky once a close has reached trail_activate_atr beyond entry
+    realized_r: float = 0.0     # whole-trade result in R (both halves), reported on the closing record
 
 
 @dataclass
@@ -309,6 +310,7 @@ class NNFXEngine:
     def _realize(self, pos: Position, exit_price: float, fraction: float) -> None:
         """Book `fraction` of the position (0.5 = one half) closed at exit_price, in R."""
         r = (exit_price - pos.entry_price) * pos.direction / (self.params.sl_mult * pos.atr_at_entry)
+        pos.realized_r += fraction * r
         self.equity.realize(fraction * r, self.params.risk_pct, self._date)
 
     def _close_all(self, exit_price: float, reason: str) -> dict:
@@ -318,7 +320,8 @@ class NNFXEngine:
         self.last_exit_dir = pos.direction
         self.realized_pips += pips
         self.position = None
-        return {'action': 'exit', 'reason': reason, 'direction': pos.direction, 'pips': round(pips, 1)}
+        return {'action': 'exit', 'reason': reason, 'direction': pos.direction, 'pips': round(pips, 1),
+                'r': pos.realized_r}  # R = P/L in units of the 1.5xATR-at-entry stop, both halves
 
     def _reset_continuation_if_wrong_side(self, side: int) -> None:
         if self.trend_dir != 0 and side != 0 and side != self.trend_dir:
