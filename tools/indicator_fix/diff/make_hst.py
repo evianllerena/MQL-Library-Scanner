@@ -1,6 +1,8 @@
 r"""Write the frozen EURUSD D1 history (F:\MQLFIX_BUILD\DIFF\rates.csv, exported from MT5 by DiffDump5) into an
 MT4 portable copy as offline .hst files, so MT4 and MT5 compute on identical bars:
-  EURUSD = all bars (MT5 symbol DIFF), GBPUSD = the same bars minus the last CUT (MT5 symbol DIFFC).
+  DIFF = all bars, DIFFC = the same bars minus the last CUT -- the same symbol names as MT5's custom symbols, so
+  indicators that look at Symbol() (JPY detection, per-pair settings) behave the same on both sides.
+  They replace MT4's offline EURUSD / GBPUSD records in symbols.raw (keeping their contract settings).
 MT5's custom symbols store each D1 bar as one M1 bar at 00:00, so every intraday timeframe has one bar per
 day there; the same is written here for M1..H4. W1 (Sunday-stamped) and MN1 are aggregated.
 Both symbols are set to 5 digits / point 0.00001 like MT5's EURUSD (MT4's offline defaults are 4-digit).
@@ -26,11 +28,13 @@ def agg(rows, key):
 def month(t):
     g = time.gmtime(t); return calendar.timegm((g.tm_year, g.tm_mon, 1, 0, 0, 0))
 raw = dest / 'symbols.raw'; d = bytearray(raw.read_bytes())
-for sym, rows in (('EURUSD', ALL), ('GBPUSD', ALL[:-CUT])):
+for sym, src, rows in (('DIFF', 'EURUSD', ALL), ('DIFFC', 'GBPUSD', ALL[:-CUT])):
     for p in (1, 5, 15, 30, 60, 240, 1440): write(sym, p, rows)
     write(sym, 10080, agg(rows, lambda t: t - (t // 86400 + 4) % 7 * 86400))      # back to Sunday 00:00
     write(sym, 43200, agg(rows, month))
-    i = d.find(sym.encode() + b'\0')
+    i = d.find(src.encode() + b'\0')
+    if i < 0: i = d.find(sym.encode() + b'\0')
+    d[i:i + 12] = sym.encode().ljust(12, b'\0')
     struct.pack_into('<i', d, i + 104, 5); struct.pack_into('<d', d, i + 1776, 0.00001)
     print(sym, len(rows), 'bars, 5 digits')
 raw.write_bytes(bytes(d))

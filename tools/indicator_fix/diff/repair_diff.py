@@ -105,11 +105,12 @@ if __name__ == '__main__':
     vmap = json.load(open(Path(r'F:\MQLFIX_BUILD\V\map.json'), encoding='utf-8'))
     only = set(l.strip() for l in open(arg('--names', ''), encoding='utf-8') if l.strip()) if '--names' in sys.argv else None
     hist = done()
+    multi = json.load(open(D / 'multisymbol.json', encoding='utf-8'))   # read other symbols: no MT4 comparison possible
     jobs = []
     for a, v in verdicts.items():
         if v['verdict'] in ('verified', 'verified_near', 'no_reference_run', 'reference_has_no_values'): continue
         if only is not None and a not in only: continue
-        if a not in vmap or pairs[aliases[a]]['ref_kind'] != 'mq4': continue
+        if a not in vmap or pairs[aliases[a]]['ref_kind'] != 'mq4' or a in multi: continue
         h = hist.get(a, [])
         if any(r['passes'] for r in h) or len(h) >= MAX_ATT: continue
         jobs.append((a, vmap[a]['mq5'], pairs[aliases[a]]['ref'], len(h) + 1, h[-1]['agent'] if h else ''))

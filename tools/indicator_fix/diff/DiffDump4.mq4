@@ -33,13 +33,14 @@ string RunOne(string id,string name,string sym,string tag){
   return(r);
 }
 void OnStart(){
-  Out("{\"session\":\"start\",\"F\":"+IntegerToString(iBars("EURUSD",PERIOD_D1))+",\"C\":"+IntegerToString(iBars("GBPUSD",PERIOD_D1))+",\"digits\":"+IntegerToString((int)MarketInfo("GBPUSD",MODE_DIGITS))+"}");
+  SymbolSelect("DIFFC",true); SymbolSelect("DIFF",true); for(int w=0;w<50 && MarketInfo("DIFFC",MODE_DIGITS)==0;w++) Sleep(100);
+  Out("{\"session\":\"start\",\"F\":"+IntegerToString(iBars("DIFF",PERIOD_D1))+",\"C\":"+IntegerToString(iBars("DIFFC",PERIOD_D1))+",\"digits\":"+IntegerToString((int)MarketInfo("DIFFC",MODE_DIGITS))+",\"chart\":\""+Symbol()+"\",\"cdigits\":"+IntegerToString(Digits)+",\"point\":"+DoubleToString(Point,6)+",\"mi_point\":"+DoubleToString(MarketInfo("DIFF",MODE_POINT),6)+"}");
   int jf=FileOpen("diff_jobs.txt",FILE_READ|FILE_TXT|FILE_ANSI); if(jf==INVALID_HANDLE) return;
   while(!FileIsEnding(jf) && !IsStopped()){
     string p[]; if(StringSplit(FileReadString(jf),'|',p)<2) continue;
     Out("{\"id\":\""+p[0]+"\",\"phase\":\"begin\"}");
-    string res="{\"id\":\""+p[0]+"\","+RunOne(p[0],p[1],"EURUSD","F");
-    res+=","+RunOne(p[0],p[1],"GBPUSD","C");
+    string res="{\"id\":\""+p[0]+"\","+RunOne(p[0],p[1],"DIFF","F");
+    res+=","+RunOne(p[0],p[1],"DIFFC","C");
     Out(res+"}");
   }
   FileClose(jf);

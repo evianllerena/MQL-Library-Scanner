@@ -20,6 +20,7 @@ OLD = {'working': 'Working', 'repaints': 'Repaints', 'working (alignment untesta
 pairs = json.load(open(D / 'pairs.json', encoding='utf-8'))
 aliases = json.load(open(D / 'aliases.json', encoding='utf-8')); byname = {n: a for a, n in aliases.items()}
 verdicts = json.load(open(D / 'verdicts.json', encoding='utf-8'))
+multi = json.load(open(D / 'multisymbol.json', encoding='utf-8'))
 vmap = json.load(open(Path(r'F:\MQLFIX_BUILD\V\map.json'), encoding='utf-8'))
 rep = {}
 if (RD / 'results.jsonl').exists():
@@ -61,14 +62,14 @@ for name, v in pairs.items():
     elif k in ('verified', 'verified_near'):
         emit(name, 'Verified - repaints like the MT4 original' if vd.get('mt4_repaints') else 'Verified - matches MT4',
              f"F={vd.get('F', vd.get('objects_match'))} C={vd.get('C')} I={vd.get('I')}", vmap[a]['mq5'], vmap[a]['ex5'], v)
-    elif a and k and k not in ('no_reference_run', 'reference_has_no_values'):
+    elif a and k and k not in ('no_reference_run', 'reference_has_no_values') and a not in multi:
         last = h[-1] if h else None
         why = (last['agent'] if last else '') + ' | ' + json.dumps(vd.get('F_detail') or {k2: vd.get(k2) for k2 in ('objects_match', 'missing_in_mt5')})
         src = Path(last['path']) if last else Path(vmap.get(a, {}).get('mq5', ''))
         emit(name, 'Unfixable - differs from MT4' if len(h) >= 3 else 'Pending repair', f'{k}: {why}'[:500],
              src, src.with_suffix('.ex5'), v)
     else:
-        reason = {'no_reference_run': 'MT4 original hangs or fails to load in MT4',
+        reason = "reads other symbols' prices (the offline MT4 test has only one symbol)" if a in multi else {'no_reference_run': 'MT4 original hangs or fails to load in MT4',
                   'reference_has_no_values': 'MT4 original produces no values or objects'}.get(k, 'no MQL4 original on disk')
         folder = f"No MT4 original\\{OLD[v['status']]}"
         fixed = plots_fixed(name, v['mq5'])
