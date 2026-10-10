@@ -101,9 +101,9 @@ string RunOne(string id,string rel,string sym,string tag){
   return("\""+tag+"\":{\"status\":\""+st+"\",\"calc\":"+IntegerToString(calc)+",\"nbuf\":"+IntegerToString(nbuf)+",\"err\":"+IntegerToString(g_err)+",\"ms\":"+IntegerToString(GetTickCount()-t0)+"}");
 }
 void OnStart(){
-  uint c0=GetTickCount(); while(!TerminalInfoInteger(TERMINAL_CONNECTED) && GetTickCount()-c0<60000) Sleep(250);
+  if(!FileIsExist("diff_rates.csv")){ uint c0=GetTickCount(); while(!TerminalInfoInteger(TERMINAL_CONNECTED) && GetTickCount()-c0<60000) Sleep(250); }
   if(!FileIsExist("diff_rates.csv")){ Out(Export()?"{\"export\":\"ok\"}":"{\"export\":\"failed\"}"); TerminalClose(0); return; }
-  bool ok=LoadCsv() && MakeSym("DIFF",NB) && MakeSym("DIFFC",NB-CUT);
+  Out("{\"boot\":\"start\"}"); bool ok=LoadCsv(); Out("{\"boot\":\"csv\"}"); ok=ok && MakeSym("DIFF",NB); Out("{\"boot\":\"diff\",\"bars\":"+IntegerToString(Bars("DIFF",PERIOD_D1))+"}"); ok=ok && MakeSym("DIFFC",NB-CUT);
   Out("{\"session\":\"start\",\"ok\":"+(ok?"true":"false")+",\"bars\":"+IntegerToString(Bars("DIFF",PERIOD_D1))+",\"cut\":"+IntegerToString(Bars("DIFFC",PERIOD_D1))+"}");
   if(!ok){ TerminalClose(0); return; }
   int jf=FileOpen("diff_jobs.txt",FILE_READ|FILE_TXT|FILE_ANSI); if(jf==INVALID_HANDLE){ TerminalClose(0); return; }
