@@ -6,6 +6,7 @@ Dumps are moved to F:\MQLFIX_BUILD\DIFF\d4|d5\, result lines appended to DIFF\r<
 ids already in that file are skipped. A terminal silent for HANG_S seconds is killed; the indicator it was on
 is recorded as 'hang' and the next session continues after it."""
 import hashlib, json, os, shutil, subprocess, sys, time
+import rtproc
 from pathlib import Path
 def arg(flag, default=None):
     return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
@@ -50,7 +51,7 @@ def launch():
     ini = RT / 'diff.ini'
     ini.write_text('[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol=EURUSD\nPeriod=D1\n'
                    'Script=DiffDump5\nShutdownTerminal=0\n', encoding='utf-8')
-    return subprocess.Popen([str(RT / 'terminal64.exe'), '/portable', f'/config:{ini}'], cwd=str(RT))
+    return rtproc.launch(RT, ['/portable', f'/config:{ini}'])
 
 def run_session(batch):
     if SIDE == '5':
@@ -72,18 +73,30 @@ def run_session(batch):
     for chr_ in list(RT.glob('MQL5/Profiles/Charts/*/*.chr')) + list(RT.glob('profiles/*/*.chr')):
         try: chr_.unlink()
         except OSError: pass
+    if SIDE == '5': rtproc.kill(RT)
     proc = launch()
     res = FILES / 'diff_results.jsonl'
-    last_size, last_change = -1, time.time()
+    last_size, last_change, t0, gone = -1, time.time(), time.time(), 0
     while True:
-        time.sleep(1)
+        time.sleep(2)
         size = res.stat().st_size if res.exists() else 0
         if size != last_size: last_size, last_change = size, time.time()
-        if (FILES / 'diff_done.flag').exists() or proc.poll() is not None: break
-        if time.time() - last_change > HANG_S: break
-    subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)], capture_output=True)
-    try: proc.wait(timeout=60)
-    except Exception: pass
+        if (FILES / 'diff_done.flag').exists(): break
+        if SIDE == '4':
+            if proc.poll() is not None: break
+        else:
+            # MT5 may exit into the LiveUpdate cycle and come back as a relaunched process: follow the runtime,
+            # not the first PID, and learn its /skipupdate token for the next launches
+            if not (RT / 'skiptoken.txt').exists(): rtproc.learn(RT)
+            gone = gone + 1 if proc.poll() is not None and not rtproc.alive(RT) else 0
+            if gone >= 3: break
+        limit = HANG_S if size > 0 else 400        # first output can take minutes after an update cycle
+        if time.time() - last_change > limit: break
+    if SIDE == '5': rtproc.kill(RT)
+    else:
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)], capture_output=True)
+        try: proc.wait(timeout=60)
+        except Exception: pass
     lines = res.read_text(encoding='utf-8', errors='replace').splitlines() if res.exists() else []
     finished, begun = set(), None
     with open(OUT, 'a', encoding='utf-8') as o:
@@ -108,5 +121,5 @@ if __name__ == '__main__':
         n = run_session(todo[:SESSION])
         print(f'{SIDE}/{TAG}: session {n} done, ~{len(todo) - n} left, {round(time.time() - t0)} s', flush=True)
         stalls = stalls + 1 if n == 0 else 0
-        if stalls >= 3: print('no progress in 3 sessions -- stopping'); break
+        if stalls >= 10: print('no progress in 10 sessions -- stopping'); break
     print(SIDE, TAG, 'complete', round(time.time() - t0), 's')

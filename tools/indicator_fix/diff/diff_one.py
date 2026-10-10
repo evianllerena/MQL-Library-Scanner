@@ -6,7 +6,7 @@ Used by the repair agent (via c.py) and to re-verify its result independently.""
 import json, shutil, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import compare
+import compare, rtproc
 MQLC = r'F:\MQLFIX_BUILD\tools\mqlc.py'
 src, alias, n = Path(sys.argv[1]).resolve(), sys.argv[2], sys.argv[3]
 rt = Path(rf'F:\MQLFIX_RT\rt{n}'); files = rt / 'MQL5' / 'Files'
@@ -30,10 +30,12 @@ ini = rt / 'diff.ini'
 ini.write_text('[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol=EURUSD\nPeriod=D1\n'
                'Script=DiffDump5\nShutdownTerminal=0\n', encoding='utf-8')
 t0 = time.time()
-p = subprocess.Popen([str(rt / 'terminal64.exe'), '/portable', f'/config:{ini}'], cwd=str(rt))
-while time.time() - t0 < 180 and not (files / 'diff_done.flag').exists() and p.poll() is None:
+rtproc.kill(rt)
+p = rtproc.launch(rt, ['/portable', f'/config:{ini}'])
+while time.time() - t0 < 420 and not (files / 'diff_done.flag').exists() and (p.poll() is None or rtproc.alive(rt)):
+    if not (rt / 'skiptoken.txt').exists(): rtproc.learn(rt)
     time.sleep(1)
-subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)], capture_output=True)
+rtproc.kill(rt)
 for f in out.glob('*.bin'): f.unlink()
 for f in (files / 'd5').glob(f'one{n}.*.bin'):
     shutil.move(str(f), str(out / f.name.replace(f'one{n}.', f'{alias}.', 1)))
@@ -51,7 +53,7 @@ for log in (rt / 'MQL5' / 'Logs').glob('*.log'):
 v = compare.verdict(alias, out)
 ok = v['verdict'] in ('verified', 'verified_near')
 print('PASS' if ok else 'FAIL: ' + v['verdict'])
-print('MT5 run:', json.dumps({k: run.get(k) for k in 'FCI'}) if run else 'no result (crashed or hung > 180 s)')
+print('MT5 run:', json.dumps({k: run.get(k) for k in 'FCI'}) if run else 'no result (crashed or hung)')
 print('compare:', json.dumps(v))
 if errs: print('MT5 errors:', *sorted(set(errs))[:8], sep='\n  ')
 sys.exit(0 if ok else 1)

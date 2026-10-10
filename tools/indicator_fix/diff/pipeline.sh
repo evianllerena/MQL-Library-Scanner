@@ -9,7 +9,20 @@ cd /c/Users/Evision/MQL-Library-Scanner/tools/indicator_fix/diff
 L=/f/MQLFIX_BUILD/DIFF/pipeline.log
 log() { echo "$(date '+%m-%d %H:%M') $*" >> $L; }
 log "pipeline start"
-bash /f/MQLFIX_BUILD/DIFF/run_mt5.sh            # no-op if complete, finishes leftovers otherwise
+missing() { py -c "
+import json,glob
+m=json.load(open(r'F:\MQLFIX_BUILD\DIFF\ex5map_v.json',encoding='utf-8')); done=set()
+for f in glob.glob(r'F:\MQLFIX_BUILD\DIFF/r5_v*.jsonl'):
+    for l in open(f,encoding='utf-8',errors='replace'):
+        try: done.add(json.loads(l)['id'])
+        except Exception: pass
+print(len(set(m)-done))"; }
+for round in 1 2 3 4 5 6; do                     # the MT5 pass must be complete before anything is compared
+  bash /f/MQLFIX_BUILD/DIFF/run_mt5.sh
+  m=$(missing); log "MT5 pass round $round: $m indicators without a result"
+  [ "$m" = "0" ] && break
+done
+[ "$(missing)" = "0" ] || { log "MT5 pass incomplete - stopping"; exit 1; }
 py compare.py >> $L 2>&1; log "compare 1 done"
 py -c "
 import json; v=json.load(open(r'F:\MQLFIX_BUILD\DIFF\verdicts.json'))
