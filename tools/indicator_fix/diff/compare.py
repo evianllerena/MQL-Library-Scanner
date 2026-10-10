@@ -106,6 +106,7 @@ def verdict(alias, d5dir=None):
     if out['reordered']: worst = 0.0
     exact = worst == 1.0 and (out['C'] in (None, 1.0))
     near = worst >= NEAR and (out['C'] is None or out['C'] >= NEAR)
+    if out['I'] is None and (exact or near): out['verdict'] = 'fc_ok_needs_I'; return out
     inc_ok = out['I'] is not None and (out['I'] >= NEAR or out['mt4_repaints'])
     if (exact or near) and inc_ok:
         out['verdict'] = 'verified' if exact and (out['I'] == 1.0 or out['mt4_repaints']) else 'verified_near'

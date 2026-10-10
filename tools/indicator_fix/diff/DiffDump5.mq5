@@ -113,7 +113,8 @@ void OnStart(){
     string res="{\"id\":\""+id+"\","+RunOne(id,p[1],"DIFF","F");
     if(StringFind(res,"\"ok\"")>0){
       res+=","+RunOne(id,p[1],"DIFFC","C");
-      if(MakeSym("DIFFI",NB-CUT)) res+=","+RunOne(id,p[1],"DIFFI","I"); else res+=",\"I\":{\"status\":\"setup_failed\"}";
+      if(ArraySize(p)>2 && p[2]=="FC") {}         // main pass: bar-by-bar run only for indicators that pass F/C
+      else if(MakeSym("DIFFI",NB-CUT)) res+=","+RunOne(id,p[1],"DIFFI","I"); else res+=",\"I\":{\"status\":\"setup_failed\"}";
     }
     Out(res+"}");
   }

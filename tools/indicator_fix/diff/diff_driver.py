@@ -15,6 +15,7 @@ RT = Path(arg('--rt'))
 SESSION = int(arg('--session', 200))
 K, N = (int(x) for x in arg('--shard', '0/1').split('/'))
 TAG = arg('--tag', f's{K}')
+MODE = arg('--mode', 'FCI')              # MT5: FC = skip the bar-by-bar run
 HANG_S = 30 if SIDE == '4' else 90     # MT4 needs ~0.2 s per indicator; MT5 up to 3 x 10 s + the 40 s bar-by-bar run
 MQL = RT / ('MQL4' if SIDE == '4' else 'MQL5')
 FILES = MQL / 'Files'
@@ -56,7 +57,10 @@ def run_session(batch):
         dest = MQL / 'Indicators' / 'DIFF'; dest.mkdir(parents=True, exist_ok=True)
         for a, p in batch: shutil.copy2(p, dest / f'{a}.ex5')
     (FILES / f'd{SIDE}').mkdir(exist_ok=True)
-    (FILES / 'diff_jobs.txt').write_text(''.join(f'{a}|DIFF\\{a}\n' for a, _ in batch), encoding='ascii', errors='replace')
+    for _ in range(30):                       # a killed terminal can hold its files for a few seconds
+        try: (FILES / 'diff_jobs.txt').open('a').close(); break
+        except PermissionError: time.sleep(2)
+    (FILES / 'diff_jobs.txt').write_text(''.join(f'{a}|DIFF\\{a}|{MODE}\n' for a, _ in batch), encoding='ascii', errors='replace')
     for f in ('diff_results.jsonl', 'diff_done.flag'):
         try: (FILES / f).unlink()
         except FileNotFoundError: pass
@@ -78,6 +82,8 @@ def run_session(batch):
         if (FILES / 'diff_done.flag').exists() or proc.poll() is not None: break
         if time.time() - last_change > HANG_S: break
     subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)], capture_output=True)
+    try: proc.wait(timeout=60)
+    except Exception: pass
     lines = res.read_text(encoding='utf-8', errors='replace').splitlines() if res.exists() else []
     finished, begun = set(), None
     with open(OUT, 'a', encoding='utf-8') as o:
