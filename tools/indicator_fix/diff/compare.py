@@ -65,8 +65,16 @@ def objects(path):
     from collections import Counter
     if not path.exists(): return Counter()
     rows = path.read_text(encoding='cp1252', errors='replace').splitlines()
-    # x/y pixel offsets depend on the chart window size, not on the indicator: not compared
-    return Counter('|'.join(f[:5] + f[7:]) for f in (r.split('|', 7) for r in rows if r.count('|') >= 7))
+    # x/y pixel offsets depend on the chart window size, not on the indicator: not compared; coordinates an object
+    # type does not use (an HLINE's time, a label's time/price, a text's second point) are blanked too
+    def norm(f):
+        t = f[0]
+        if t in ('OBJ_LABEL', 'OBJ_BUTTON', 'OBJ_RECTANGLE_LABEL', 'OBJ_BITMAP_LABEL', 'OBJ_EDIT'): f[1:5] = ['0', '0.00000', '0', '0.00000']
+        elif t == 'OBJ_HLINE': f[1], f[3], f[4] = '0', '0', '0.00000'
+        elif t == 'OBJ_VLINE': f[2], f[3], f[4] = '0.00000', '0', '0.00000'
+        elif t in ('OBJ_TEXT', 'OBJ_ARROW') or t.startswith('OBJ_ARROW_'): f[3], f[4] = '0', '0.00000'
+        return '|'.join(f[:5] + f[7:])
+    return Counter(norm(r.split('|', 7)) for r in rows if r.count('|') >= 7)
 
 def verdict(alias, d5dir=None):
     d5 = Path(d5dir) if d5dir else D / 'd5'
