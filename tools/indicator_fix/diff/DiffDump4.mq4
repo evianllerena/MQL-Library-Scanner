@@ -8,7 +8,16 @@
 #property strict
 #define MAXBUF 16
 void Out(string s){ int h=FileOpen("diff_results.jsonl",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI); if(h==INVALID_HANDLE) return; FileSeek(h,0,SEEK_END); FileWriteString(h,s+"\n"); FileClose(h); }
+void DumpObj(string file){
+  int n=ObjectsTotal(); if(n<=0) return;
+  int fh=FileOpen(file,FILE_WRITE|FILE_TXT|FILE_ANSI); if(fh==INVALID_HANDLE) return;
+  for(int i=0;i<n;i++){ string nm=ObjectName(i);
+    FileWriteString(fh,StringFormat("%d|%d|%.5f|%d|%.5f|%d|%d|%s\n",ObjectType(nm),(int)ObjectGet(nm,OBJPROP_TIME1),ObjectGet(nm,OBJPROP_PRICE1),
+      (int)ObjectGet(nm,OBJPROP_TIME2),ObjectGet(nm,OBJPROP_PRICE2),(int)ObjectGet(nm,OBJPROP_XDISTANCE),(int)ObjectGet(nm,OBJPROP_YDISTANCE),ObjectDescription(nm))); }
+  FileClose(fh);
+}
 string RunOne(string id,string name,string sym,string tag){
+  if(tag=="F") ObjectsDeleteAll();
   uint t0=GetTickCount(); int nb=iBars(sym,PERIOD_D1); double m[]; ArrayResize(m,nb*MAXBUF);
   ResetLastError(); iCustom(sym,PERIOD_D1,name,0,0); int err=GetLastError();
   int nbuf=0;
@@ -19,6 +28,7 @@ string RunOne(string id,string name,string sym,string tag){
   }
   int fh=FileOpen("d4\\"+id+"."+tag+".bin",FILE_WRITE|FILE_BIN); if(fh!=INVALID_HANDLE){ FileWriteInteger(fh,nb); FileWriteInteger(fh,nbuf); FileWriteArray(fh,m); FileClose(fh); }
   string r="\""+tag+"\":{\"status\":\""+(err==4072||err==4802?"load_failed":"ok")+"\",\"err\":"+IntegerToString(err)+",\"nbuf\":"+IntegerToString(nbuf)+",\"objects\":"+IntegerToString(ObjectsTotal())+",\"ms\":"+IntegerToString(GetTickCount()-t0)+"}";
+  if(tag=="F") DumpObj("d4\\"+id+".F.obj");
   ObjectsDeleteAll();
   return(r);
 }

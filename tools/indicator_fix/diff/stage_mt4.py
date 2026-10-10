@@ -34,3 +34,13 @@ for folder in (IND, DST):
     log = (M4 / 'compile.log').read_text(encoding='utf-16', errors='replace')
     print(folder, [l for l in log.splitlines() if l.startswith('Result')][-1:])
 print('ex4 in DIFF:', len(list(DST.glob('*.ex4'))))
+# visible buffer count of each .mq4 reference (MT4 iCustom exposes only these) -> DIFF\visible.json
+vis = {}
+for a, name in aliases.items():
+    v = pairs[name]
+    if v['ref_kind'] == 'mq4':
+        t = text(v['ref']); m = re.search(r'^\s*#property\s+indicator_buffers\s+(\d+)', t, re.M)
+        ib = [int(x) for x in re.findall(r'IndicatorBuffers\s*\(\s*(\d+)\s*\)', t)]
+        sib = {int(x) for x in re.findall(r'SetIndexBuffer\s*\(\s*(\d+)\s*,', t)}
+        vis[a] = int(m.group(1)) if m else (max(ib) if ib else (max(sib) + 1 if sib else 0))
+json.dump(vis, open(os.path.join(D, 'visible.json'), 'w', encoding='utf-8'), indent=0)

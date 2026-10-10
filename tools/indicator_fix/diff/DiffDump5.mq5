@@ -69,20 +69,33 @@ int Dump(int h,string sym,string file){
   int fh=FileOpen(file,FILE_WRITE|FILE_BIN); if(fh!=INVALID_HANDLE){ FileWriteInteger(fh,n); FileWriteInteger(fh,nbuf); FileWriteArray(fh,m); FileClose(fh); }
   return(nbuf);
 }
+// objects the indicator drew (on this script's chart): type|time1|price1|time2|price2|x|y|text, one per line
+void DumpObj(string file){
+  int n=ObjectsTotal(0); if(n<=0) return;
+  int fh=FileOpen(file,FILE_WRITE|FILE_TXT|FILE_ANSI); if(fh==INVALID_HANDLE) return;
+  for(int i=0;i<n;i++){ string nm=ObjectName(0,i);
+    FileWriteString(fh,StringFormat("%d|%I64d|%.5f|%I64d|%.5f|%d|%d|%s\n",(int)ObjectGetInteger(0,nm,OBJPROP_TYPE),
+      ObjectGetInteger(0,nm,OBJPROP_TIME,0),ObjectGetDouble(0,nm,OBJPROP_PRICE,0),ObjectGetInteger(0,nm,OBJPROP_TIME,1),ObjectGetDouble(0,nm,OBJPROP_PRICE,1),
+      (int)ObjectGetInteger(0,nm,OBJPROP_XDISTANCE),(int)ObjectGetInteger(0,nm,OBJPROP_YDISTANCE),ObjectGetString(0,nm,OBJPROP_TEXT))); }
+  FileClose(fh);
+}
 string RunOne(string id,string rel,string sym,string tag){
   uint t0=GetTickCount(); string st; int calc=-1,nbuf=0; g_err=0;
+  if(tag=="F") ObjectsDeleteAll(0);
   int h=iCustom(sym,PERIOD_D1,rel);
   if(h==INVALID_HANDLE) st="load_failed";
   else{
     calc=Calc(h,sym,st);
     if(st=="ok" && tag=="I"){                      // append the cut bars one at a time
       for(int k=NB-CUT;k<NB && st=="ok";k++){
+        if(GetTickCount()-t0>40000){ st="too_slow"; break; }   // bar-by-bar budget
         MqlRates one[1]; one[0]=g_r[k];
         if(CustomRatesUpdate(sym,one)<=0 || !WaitBars(sym,k+1)){ st="append_failed"; break; }
         calc=Calc(h,sym,st);
       }
     }
     if(st=="ok") nbuf=Dump(h,sym,"d5\\"+id+"."+tag+".bin");
+    if(tag=="F"){ Sleep(300); DumpObj("d5\\"+id+".F.obj"); ObjectsDeleteAll(0); }
     IndicatorRelease(h);
   }
   return("\""+tag+"\":{\"status\":\""+st+"\",\"calc\":"+IntegerToString(calc)+",\"nbuf\":"+IntegerToString(nbuf)+",\"err\":"+IntegerToString(g_err)+",\"ms\":"+IntegerToString(GetTickCount()-t0)+"}");

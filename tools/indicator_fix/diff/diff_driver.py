@@ -15,7 +15,7 @@ RT = Path(arg('--rt'))
 SESSION = int(arg('--session', 200))
 K, N = (int(x) for x in arg('--shard', '0/1').split('/'))
 TAG = arg('--tag', f's{K}')
-HANG_S = 120
+HANG_S = 30 if SIDE == '4' else 90     # MT4 needs ~0.2 s per indicator; MT5 up to 3 x 10 s + the 40 s bar-by-bar run
 MQL = RT / ('MQL4' if SIDE == '4' else 'MQL5')
 FILES = MQL / 'Files'
 OUT = D / f'r{SIDE}_{TAG}.jsonl'
@@ -64,6 +64,10 @@ def run_session(batch):
         try:
             if old.stat().st_size > 50_000_000: old.unlink()
         except OSError: pass
+    # every launch adds a chart to the saved profile (objects included); start from an empty profile
+    for chr_ in list(RT.glob('MQL5/Profiles/Charts/*/*.chr')) + list(RT.glob('profiles/*/*.chr')):
+        try: chr_.unlink()
+        except OSError: pass
     proc = launch()
     res = FILES / 'diff_results.jsonl'
     last_size, last_change = -1, time.time()
@@ -85,7 +89,7 @@ def run_session(batch):
                 finished.add(r['id']); o.write(json.dumps(r) + '\n')
         if begun and begun not in finished:
             o.write(json.dumps({'id': begun, 'F': {'status': 'hang'}}) + '\n'); finished.add(begun)
-    for f in (FILES / f'd{SIDE}').glob('*.bin'):
+    for f in list((FILES / f'd{SIDE}').glob('*.bin')) + list((FILES / f'd{SIDE}').glob('*.obj')):
         shutil.move(str(f), str(DUMPS / f.name))
     return len(finished)
 

@@ -30,14 +30,24 @@ def match(a, b):
     ok |= (ea & eb) | (ea & (b == 0)) | (eb & (a == 0))
     return ok
 
-def pairing(m4, m5, lo, hi):
-    """best MT5 buffer for each MT4 buffer with values in [lo, hi) -> {b4: (b5, score, first_bad)}"""
+_vis = None
+def visible(alias):
+    """MT4 '#property indicator_buffers' of the reference (what iCustom exposes); 16 when unknown (.ex4)"""
+    global _vis
+    if _vis is None:
+        p = D / 'visible.json'
+        _vis = json.load(open(p, encoding='utf-8')) if p.exists() else {}
+    return _vis.get(alias, 16)
+
+def pairing(m4, m5, lo, hi, nvis=16):
+    """best MT5 buffer for each MT4 buffer with values in [lo, hi) -> {b4: (b5, score, first_bad)}.
+    The same index is tried first; a different index only counts as 'reordered' (an EA reads buffers by index)."""
     out = {}
-    for b in range(16):
+    for b in range(min(16, nvis)):
         col = m4[lo:hi, b]
         if np.all(np.isnan(col) | (col == 0)): continue
         best = (None, -1.0, None)
-        for c in range(16):
+        for c in [b] + [x for x in range(16) if x != b]:
             ok = match(col, m5[lo:hi, c]); s = ok.mean()
             if s > best[1]:
                 bad = np.flatnonzero(~ok)
@@ -50,6 +60,13 @@ def sample(m4, m5, b4, b5, at):
     return [(i, None if np.isnan(m4[i, b4]) else round(float(m4[i, b4]), 8), None if np.isnan(m5[i, b5]) else round(float(m5[i, b5]), 8))
             for i in range(at, min(at + 3, len(m4)))]
 
+def objects(path):
+    """multiset of drawn objects: type|time1|price1|time2|price2|x|y|text (object names ignored)"""
+    from collections import Counter
+    if not path.exists(): return Counter()
+    rows = path.read_text(encoding='cp1252', errors='replace').splitlines()
+    return Counter('|'.join(r.split('|', 7)) for r in rows if r.count('|') >= 7)
+
 def verdict(alias, d5dir=None):
     d5 = Path(d5dir) if d5dir else D / 'd5'
     f4, c4 = load(D / 'd4' / f'{alias}.F.bin'), load(D / 'd4' / f'{alias}.C.bin')
@@ -57,8 +74,17 @@ def verdict(alias, d5dir=None):
     if f4 is None: return {'verdict': 'no_reference_run'}
     if f5 is None: return {'verdict': 'mt5_failed'}
     n = len(f4)
-    pf = pairing(f4, f5, WARM, n - 1)
-    if not pf: return {'verdict': 'reference_has_no_values'}
+    nvis = visible(alias)
+    pf = pairing(f4, f5, WARM, n - 1, nvis)
+    if not pf:                                    # object-drawing indicator: compare the objects it drew on F
+        o4, o5 = objects(D / 'd4' / f'{alias}.F.obj'), objects(d5 / f'{alias}.F.obj')
+        if not o4: return {'verdict': 'reference_has_no_values'}
+        common = sum((o4 & o5).values()); s = common / max(sum(o4.values()), sum(o5.values()))
+        out = {'objects4': sum(o4.values()), 'objects5': sum(o5.values()), 'objects_match': round(s, 4)}
+        if s < 1.0:
+            out['missing_in_mt5'] = list((o4 - o5).elements())[:3]; out['extra_in_mt5'] = list((o5 - o4).elements())[:3]
+        out['verdict'] = 'verified' if s == 1.0 else 'verified_near' if s >= NEAR else 'object_mismatch'
+        return out
     out = {'buffers4': len(pf)}
     # MT4 original repaints / looks ahead by design: same bars differ between its F and C runs
     out['mt4_repaints'] = bool(c4 is not None and any(not match(f4[WARM:n - CUT - 1, b], c4[WARM:n - CUT - 1, b]).all() for b in pf))
@@ -70,12 +96,14 @@ def verdict(alias, d5dir=None):
         out['F_detail'] = {'mt4_buffer': b4, 'best_mt5_buffer': b5, 'match': round(s, 4), 'first_bad_bar': at,
                            'bars_total': n, 'sample(bar, mt4, mt5)': sample(f4, f5, b4, b5, at)}
     if c4 is not None and c5 is not None:
-        pc = pairing(c4, c5, WARM, len(c4) - 1); out['C'] = round(min((s for _, s, _ in pc.values()), default=1.0), 4)
+        pc = pairing(c4, c5, WARM, len(c4) - 1, nvis); out['C'] = round(min((s for _, s, _ in pc.values()), default=1.0), 4)
     else: out['C'] = None
     if i5 is not None:
         si = [match(f4[WARM:n - 1, b], i5[WARM:n - 1, c]).mean() for b, (c, _, _) in pf.items() if c is not None]
         out['I'] = round(float(min(si)) if si else 0.0, 4)
     else: out['I'] = None
+    out['reordered'] = sorted(b for b, (c, s, _) in pf.items() if c != b and s >= NEAR)
+    if out['reordered']: worst = 0.0
     exact = worst == 1.0 and (out['C'] in (None, 1.0))
     near = worst >= NEAR and (out['C'] is None or out['C'] >= NEAR)
     inc_ok = out['I'] is not None and (out['I'] >= NEAR or out['mt4_repaints'])
