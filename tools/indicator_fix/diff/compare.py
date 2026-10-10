@@ -65,7 +65,8 @@ def objects(path):
     from collections import Counter
     if not path.exists(): return Counter()
     rows = path.read_text(encoding='cp1252', errors='replace').splitlines()
-    return Counter('|'.join(r.split('|', 7)) for r in rows if r.count('|') >= 7)
+    # x/y pixel offsets depend on the chart window size, not on the indicator: not compared
+    return Counter('|'.join(f[:5] + f[7:]) for f in (r.split('|', 7) for r in rows if r.count('|') >= 7))
 
 def verdict(alias, d5dir=None):
     d5 = Path(d5dir) if d5dir else D / 'd5'

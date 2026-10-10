@@ -12,7 +12,7 @@ void DumpObj(string file){
   int n=ObjectsTotal(); if(n<=0) return;
   int fh=FileOpen(file,FILE_WRITE|FILE_TXT|FILE_ANSI); if(fh==INVALID_HANDLE) return;
   for(int i=0;i<n;i++){ string nm=ObjectName(i);
-    FileWriteString(fh,StringFormat("%d|%d|%.5f|%d|%.5f|%d|%d|%s\n",ObjectType(nm),(int)ObjectGet(nm,OBJPROP_TIME1),ObjectGet(nm,OBJPROP_PRICE1),
+    FileWriteString(fh,StringFormat("%s|%d|%.5f|%d|%.5f|%d|%d|%s\n",EnumToString((ENUM_OBJECT)ObjectType(nm)),(int)ObjectGet(nm,OBJPROP_TIME1),ObjectGet(nm,OBJPROP_PRICE1),
       (int)ObjectGet(nm,OBJPROP_TIME2),ObjectGet(nm,OBJPROP_PRICE2),(int)ObjectGet(nm,OBJPROP_XDISTANCE),(int)ObjectGet(nm,OBJPROP_YDISTANCE),ObjectDescription(nm))); }
   FileClose(fh);
 }

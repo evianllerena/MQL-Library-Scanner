@@ -21,6 +21,7 @@ pairs = json.load(open(D / 'pairs.json', encoding='utf-8'))
 aliases = json.load(open(D / 'aliases.json', encoding='utf-8')); byname = {n: a for a, n in aliases.items()}
 verdicts = json.load(open(D / 'verdicts.json', encoding='utf-8'))
 multi = json.load(open(D / 'multisymbol.json', encoding='utf-8'))
+live = json.load(open(D / 'livedisplay.json', encoding='utf-8')); multi.update(live)
 vmap = json.load(open(Path(r'F:\MQLFIX_BUILD\V\map.json'), encoding='utf-8'))
 rep = {}
 if (RD / 'results.jsonl').exists():
@@ -69,7 +70,7 @@ for name, v in pairs.items():
         emit(name, 'Unfixable - differs from MT4' if len(h) >= 3 else 'Pending repair', f'{k}: {why}'[:500],
              src, src.with_suffix('.ex5'), v)
     else:
-        reason = "reads other symbols' prices (the offline MT4 test has only one symbol)" if a in multi else {'no_reference_run': 'MT4 original hangs or fails to load in MT4',
+        reason = ('shows live quotes/time (dashboard): not comparable offline' if a in live else "reads other symbols' prices (the offline MT4 test has only one symbol)") if a in multi else {'no_reference_run': 'MT4 original hangs or fails to load in MT4',
                   'reference_has_no_values': 'MT4 original produces no values or objects'}.get(k, 'no MQL4 original on disk')
         folder = f"No MT4 original\\{OLD[v['status']]}"
         fixed = plots_fixed(name, v['mq5'])

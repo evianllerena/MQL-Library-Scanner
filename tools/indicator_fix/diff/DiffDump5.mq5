@@ -64,7 +64,7 @@ int Calc(int h,string sym,string &st){
 int g_err=0;
 int Dump(int h,string sym,string file){
   int n=Bars(sym,PERIOD_D1),nbuf=0; double m[]; ArrayResize(m,n*MAXBUF); ArrayInitialize(m,EMPTY_VALUE);
-  for(int b=0;b<MAXBUF;b++){ double v[]; ArraySetAsSeries(v,false); ResetLastError(); int g=CopyBuffer(h,b,0,n,v); if(g<=0){ g_err=GetLastError(); break; } nbuf++;
+  for(int b=0;b<MAXBUF;b++){ double v[]; ArraySetAsSeries(v,false); ResetLastError(); int g=CopyBuffer(h,b,0,n,v); if(g<=0){ if(b==0) g_err=GetLastError(); break; }   // past the last buffer the error is expected nbuf++;
     int off=n-g; for(int i=0;i<g;i++) m[(off+i)*MAXBUF+b]=v[i]; }
   int fh=FileOpen(file,FILE_WRITE|FILE_BIN); if(fh!=INVALID_HANDLE){ FileWriteInteger(fh,n); FileWriteInteger(fh,nbuf); FileWriteArray(fh,m); FileClose(fh); }
   return(nbuf);
@@ -74,7 +74,7 @@ void DumpObj(string file){
   int n=ObjectsTotal(0); if(n<=0) return;
   int fh=FileOpen(file,FILE_WRITE|FILE_TXT|FILE_ANSI); if(fh==INVALID_HANDLE) return;
   for(int i=0;i<n;i++){ string nm=ObjectName(0,i);
-    FileWriteString(fh,StringFormat("%d|%I64d|%.5f|%I64d|%.5f|%d|%d|%s\n",(int)ObjectGetInteger(0,nm,OBJPROP_TYPE),
+    FileWriteString(fh,StringFormat("%s|%I64d|%.5f|%I64d|%.5f|%d|%d|%s\n",EnumToString((ENUM_OBJECT)ObjectGetInteger(0,nm,OBJPROP_TYPE)),
       ObjectGetInteger(0,nm,OBJPROP_TIME,0),ObjectGetDouble(0,nm,OBJPROP_PRICE,0),ObjectGetInteger(0,nm,OBJPROP_TIME,1),ObjectGetDouble(0,nm,OBJPROP_PRICE,1),
       (int)ObjectGetInteger(0,nm,OBJPROP_XDISTANCE),(int)ObjectGetInteger(0,nm,OBJPROP_YDISTANCE),ObjectGetString(0,nm,OBJPROP_TEXT))); }
   FileClose(fh);
@@ -83,6 +83,12 @@ string RunOne(string id,string rel,string sym,string tag){
   uint t0=GetTickCount(); string st; int calc=-1,nbuf=0; g_err=0;
   if(tag=="F") ObjectsDeleteAll(0);
   int h=iCustom(sym,PERIOD_D1,rel);
+  bool onchart=false;
+  // F run: attach to this script's chart (symbol DIFF) so chart objects are drawn as on a real chart
+  if(h!=INVALID_HANDLE && tag=="F" && _Symbol==sym){
+    onchart=ChartIndicatorAdd(0,0,h);
+    if(!onchart) onchart=ChartIndicatorAdd(0,(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL),h);
+  }
   if(h==INVALID_HANDLE) st="load_failed";
   else{
     calc=Calc(h,sym,st);
@@ -95,7 +101,13 @@ string RunOne(string id,string rel,string sym,string tag){
       }
     }
     if(st=="ok") nbuf=Dump(h,sym,"d5\\"+id+"."+tag+".bin");
-    if(tag=="F"){ Sleep(300); DumpObj("d5\\"+id+".F.obj"); ObjectsDeleteAll(0); }
+    if(tag=="F"){
+      for(int k=0;k<3;k++){ PumpTick(sym); Sleep(200); }
+      DumpObj("d5\\"+id+".F.obj");
+      for(int w=(int)ChartGetInteger(0,CHART_WINDOWS_TOTAL)-1;w>=0;w--)
+        for(int i=ChartIndicatorsTotal(0,w)-1;i>=0;i--) ChartIndicatorDelete(0,w,ChartIndicatorName(0,w,i));
+      ObjectsDeleteAll(0);
+    }
     IndicatorRelease(h);
   }
   return("\""+tag+"\":{\"status\":\""+st+"\",\"calc\":"+IntegerToString(calc)+",\"nbuf\":"+IntegerToString(nbuf)+",\"err\":"+IntegerToString(g_err)+",\"ms\":"+IntegerToString(GetTickCount()-t0)+"}");

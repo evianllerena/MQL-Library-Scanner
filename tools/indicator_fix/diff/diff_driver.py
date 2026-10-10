@@ -49,7 +49,7 @@ def launch():
         ini.write_text('ExpertsEnable=true\nExpertsDllImport=false\nSymbol=DIFF\nPeriod=D1\nScript=DiffDump4\n', encoding='ascii')
         return subprocess.Popen([str(RT / 'terminal.exe'), '/portable', str(ini)], cwd=str(RT))
     ini = RT / 'diff.ini'
-    ini.write_text('[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol=EURUSD\nPeriod=D1\n'
+    ini.write_text('[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n[StartUp]\nSymbol=DIFF\nPeriod=D1\n'
                    'Script=DiffDump5\nShutdownTerminal=0\n', encoding='utf-8')
     return rtproc.launch(RT, ['/portable', f'/config:{ini}'])
 

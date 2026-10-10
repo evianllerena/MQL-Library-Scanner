@@ -106,6 +106,7 @@ if __name__ == '__main__':
     only = set(l.strip() for l in open(arg('--names', ''), encoding='utf-8') if l.strip()) if '--names' in sys.argv else None
     hist = done()
     multi = json.load(open(D / 'multisymbol.json', encoding='utf-8'))   # read other symbols: no MT4 comparison possible
+    multi.update(json.load(open(D / 'livedisplay.json', encoding='utf-8')))   # live-quote dashboards: same
     jobs = []
     for a, v in verdicts.items():
         if v['verdict'] in ('verified', 'verified_near', 'no_reference_run', 'reference_has_no_values'): continue
