@@ -32,7 +32,7 @@ wait
 py compare.py >> $L 2>&1; log "compare 2 done"
 powershell -NoProfile -c "Get-CimInstance Win32_Process | ? { \$_.CommandLine -match 'repair_diff.py' } | % { Stop-Process -Id \$_.ProcessId -Force }" >/dev/null 2>&1; sleep 5
 while true; do
-  out=$(cd /f/MQLFIX_BUILD/RD && py /c/Users/Evision/MQL-Library-Scanner/tools/indicator_fix/diff/repair_diff.py --rts 1,2,3,4,5 --workers 5 2>&1 | tee -a /f/MQLFIX_BUILD/RD/repair.log)
+  out=$(cd /f/MQLFIX_BUILD/RD && py /c/Users/Evision/MQL-Library-Scanner/tools/indicator_fix/diff/repair_diff.py --rts 1,2,3,4 --workers 4 2>&1 | tee -a /f/MQLFIX_BUILD/RD/repair.log)
   jobs=$(echo "$out" | head -1)
   log "repair pass: $jobs; passes so far: $(grep -c '"passes": true' /f/MQLFIX_BUILD/RD/results.jsonl)"
   if echo "$out" | grep -q "USAGE LIMIT"; then log "usage limit - sleeping 30 min"; sleep 1800; continue; fi
