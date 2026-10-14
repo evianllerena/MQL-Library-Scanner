@@ -149,6 +149,7 @@ MIN_TRADES = 30  # below this a result is an insufficient sample (same default a
 
 
 BOOTSTRAP_SAMPLES = 2000
+MIN_CLUSTERS = 12  # fewer entry-months than this -> no range (a 2-3 month range is meaningless)
 
 
 def r_interval(trades, samples=BOOTSTRAP_SAMPLES, seed=0):
@@ -157,8 +158,8 @@ def r_interval(trades, samples=BOOTSTRAP_SAMPLES, seed=0):
     P1.4: the range is a CLUSTER bootstrap -- trades are grouped by entry month across all pairs and
     whole months are resampled -- because 28 pairs share 8 currencies: trades opened in the same
     month are correlated, and treating them as independent (1.96 x stdev / sqrt(n)) made the range
-    far too narrow. trades = [{'entry_date': 'YYYY.MM.DD', 'r': float}, ...]. Fewer than 2 months
-    -> no range (None, None). Seeded, so a rescore is reproducible."""
+    far too narrow. trades = [{'entry_date': 'YYYY.MM.DD', 'r': float}, ...]. Fewer than MIN_CLUSTERS
+    months -> no range (None, None). Seeded, so a rescore is reproducible."""
     import random
     n = len(trades)
     if n == 0:
@@ -169,7 +170,7 @@ def r_interval(trades, samples=BOOTSTRAP_SAMPLES, seed=0):
         s = months.setdefault(t['entry_date'][:7], [0.0, 0])
         s[0] += t['r']; s[1] += 1
     clusters = list(months.values())
-    if len(clusters) < 2:
+    if len(clusters) < MIN_CLUSTERS:
         return mean, None, None
     rng = random.Random(seed)
     k = len(clusters)
@@ -185,9 +186,10 @@ def r_interval(trades, samples=BOOTSTRAP_SAMPLES, seed=0):
 
 
 HOLDOUT_FROM = '2024.01.01'  # P1.4 / owner choice 2A: trades entered from here on are out-of-sample
+MIN_OOS_TRADES = 20         # oos_pass needs at least this many out-of-sample trades (one lucky trade is not a test)
 
 
-def holdout_stats(trades, holdout_from=HOLDOUT_FROM):
+def holdout_stats(trades, holdout_from=HOLDOUT_FROM, min_oos_trades=MIN_OOS_TRADES):
     """Split whole trades by entry date: in-sample (ranked) vs out-of-sample (held out, only checked).
     Picking the best of hundreds of candidates on one window mostly finds luck; a candidate counts only
     if it ALSO made money on trades it was never ranked on (oos_pass)."""
@@ -198,7 +200,7 @@ def holdout_stats(trades, holdout_from=HOLDOUT_FROM):
     return dict(is_trades=len(ins), is_expectancy_r=round(is_r, 4),
                 is_r_low=round(is_lo, 4) if is_lo is not None else None,
                 oos_trades=len(oos), oos_expectancy_r=round(oos_r, 4) if oos_r is not None else None,
-                oos_pass=oos_r is not None and oos_r > 0)
+                oos_pass=len(oos) >= min_oos_trades and oos_r > 0)
 
 
 def leaderboard_order(rows, min_trades=MIN_TRADES):
@@ -754,7 +756,7 @@ def max_drawdown_pips(dated):
 
 
 def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_FROM, costs=True,
-               holdout_from=HOLDOUT_FROM):
+               holdout_from=HOLDOUT_FROM, stats=True):
     """One scoring pass over prepared bars at a given breaker setting. Fresh engines + a fresh
     shared account each call, so the two runs (off/on) are independent."""
     per_symbol = {}
@@ -799,7 +801,8 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
     expectancy = round(sum(pooled_trades) / n, 2) if n else 0.0
     profit_factor = profit_factor_of(pooled_trades)
     maxdd = max_drawdown_pips(dated)
-    exp_r, lo_r, hi_r = r_interval(pooled_rt)
+    # the breaker-ON run only reports expectancy_pips and skips: no bootstrap for it (stats=False)
+    exp_r, lo_r, hi_r = r_interval(pooled_rt) if stats else (0.0, None, None)
     return dict(trades=n, wins=wins, losses=losses, win_rate=win_rate, expectancy_pips=expectancy,
                 expectancy_r=round(exp_r, 4),
                 expectancy_r_ci95=round((hi_r - lo_r) / 2, 4) if lo_r is not None else None,  # half-width
@@ -809,7 +812,8 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
                 continuation_trades=continuation_trades, volume_skips=volume_skips,
                 max_drawdown_pct=round(account.max_dd_pct, 2), dd_breaker_skips=dd_breaker_skips, news_skips=news_skips,
                 per_symbol=per_symbol, fingerprints=fingerprints, fill_model=model,
-                cost_model=COST_MODEL if costs else 'none', **holdout_stats(pooled_rt, holdout_from))
+                cost_model=COST_MODEL if costs else 'none',
+                **(holdout_stats(pooled_rt, holdout_from) if stats else {}))
 
 
 def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_from=DEFAULT_HISTORY_FROM,
@@ -823,7 +827,7 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_fr
     off = _score_run(symbols, prepared, enable_dd_breaker=False, score_from=score_from,  # ranking metric + true risk
                      holdout_from=holdout_from)
     on = _score_run(symbols, prepared, enable_dd_breaker=True, score_from=score_from,    # reference + real breaker skips
-                    holdout_from=holdout_from)
+                    holdout_from=holdout_from, stats=False)
     off['expectancy_pips_breaker'] = on['expectancy_pips']
     off['dd_breaker_skips'] = on['dd_breaker_skips']
     return off
@@ -1100,7 +1104,11 @@ def write_status_row(conn, it, bed, status, reason):
             win_rate, expectancy_pips, profit_factor, max_drawdown, bridge_skips, continuation_trades,
             mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b)
         VALUES (?,?,?,?,1,0,0,0,0,0,0,0,0,0,'batch',?,datetime('now'),?,?,?)
-        ON CONFLICT(sha256, slot, bed) DO UPDATE SET mapping_reason=excluded.mapping_reason, tested_at=excluded.tested_at
+        ON CONFLICT(sha256, slot, bed) DO UPDATE SET mapping_reason=excluded.mapping_reason, tested_at=excluded.tested_at,
+            trades=0, wins=0, losses=0, win_rate=0, expectancy_pips=0, profit_factor=NULL, max_drawdown=0,
+            expectancy_pips_breaker=NULL, expectancy_r=NULL, expectancy_r_ci95=NULL, max_drawdown_pct=NULL,
+            expectancy_r_low=NULL, expectancy_r_high=NULL, is_trades=NULL, is_expectancy_r=NULL, is_r_low=NULL,
+            oos_trades=NULL, oos_expectancy_r=NULL, oos_pass=0  -- a failed rescore must not leave old scores ranked
     """, (it['sha256'], it['slot'], it['signal_type'], bed, f'[{status}] {reason} :: {it["filename"]}',
           it['zero_reference'], it['buf_a'], it['buf_b']))
     conn.commit()  # per-candidate, not batched to the end -- a later candidate's
@@ -1192,6 +1200,14 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
     emit({'type': 'rescore_complete', 'csv': str(csv_path), 'symbols': len(symbols), 'candidates': len(rows)})
 
 
+def ymd_dots(text):
+    """argparse type: 'YYYY.MM.DD' (or YYYY-MM-DD, normalised). Dates are compared as strings, so a
+    '-'-separated value would silently put the wrong trades out-of-sample."""
+    value = text.strip().replace('-', '.')
+    datetime.strptime(value, '%Y.%m.%d')
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -1205,11 +1221,13 @@ def main():
                    help='score trades from this date (YYYY.MM.DD); history is fetched ~6 months earlier for warm-up')
     p.add_argument('--job-timeout', type=float, default=JOB_TIMEOUT_SECONDS,
                    help='seconds a candidate may take to calculate on one pair before it is marked too_slow')
-    p.add_argument('--holdout-from', default=HOLDOUT_FROM, help='trades entered from this date on are out-of-sample')
+    p.add_argument('--holdout-from', default=HOLDOUT_FROM, type=ymd_dots,
+                   help='YYYY.MM.DD: trades entered from this date on are out-of-sample')
     p = sub.add_parser('rescore', help='re-score a saved extraction (no MT5) and write the leaderboard CSV')
     p.add_argument('--db', required=True); p.add_argument('--out', required=True); p.add_argument('--csv', required=True)
     p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM); p.add_argument('--min-trades', type=int, default=MIN_TRADES)
-    p.add_argument('--holdout-from', default=HOLDOUT_FROM, help='trades entered from this date on are out-of-sample')
+    p.add_argument('--holdout-from', default=HOLDOUT_FROM, type=ymd_dots,
+                   help='YYYY.MM.DD: trades entered from this date on are out-of-sample')
     args = ap.parse_args()
     if args.cmd == 'plan':
         plan(args.db, args.limit)

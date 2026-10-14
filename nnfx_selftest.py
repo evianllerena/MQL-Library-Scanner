@@ -916,6 +916,33 @@ def unit_tests() -> Check:
            and nb.profit_factor_of([5.0, 7.0]) is None and nb.profit_factor_of([]) is None)
     c.that('P1.7 fill_model never claims a model it did not use: no usable bars on any pair -> "none", not '
            'next_open+gaps', nb.fill_model({'EURUSD': [], 'GBPUSD': []}) == 'none (no usable bars)')
+    few = [{'entry_date': '2023.01.10', 'r': 1.0}] * 30 + [{'entry_date': '2023.02.10', 'r': -0.5}]
+    c.that('P1.4 R range needs >= 12 entry-months: 31 trades in 2 months give no range (a 2-month bootstrap '
+           'has only 3 possible outcomes)', nb.r_interval(few)[1:] == (None, None))
+    oos_few = nb.holdout_stats([{'entry_date': '2024.02.01', 'r': 0.5}] * 3)
+    oos_ok = nb.holdout_stats([{'entry_date': '2024.02.01', 'r': 0.5}] * 25)
+    c.that('P1.4 oos_pass needs >= 20 out-of-sample trades: 3 winning OOS trades do not pass, 25 do',
+           not oos_few['oos_pass'] and oos_ok['oos_pass'], detail=f"{oos_few['oos_pass']} {oos_ok['oos_pass']}")
+    try:
+        nb.ymd_dots('2024/06/01'); bad_date_rejected = False
+    except ValueError:
+        bad_date_rejected = True
+    c.that("P1.4 --holdout-from: '2024-06-01' is normalised to '2024.06.01' (dates compare as strings) and an "
+           "unparseable date is rejected", nb.ymd_dots('2024-06-01') == '2024.06.01' and bad_date_rejected)
+    import sqlite3
+    db = sqlite3.connect(':memory:')
+    db.row_factory = sqlite3.Row
+    nb.ensure_backtest_table(db)
+    it = dict(sha256='s', slot='BASELINE', signal_type='', zero_reference=None, buf_a=0, buf_b=None, filename='x.mq5')
+    nb.write_score_row(db, it, 'bed', dict(trades=100, wins=60, losses=40, win_rate=60.0, expectancy_pips=3.0,
+                                            expectancy_r=0.1, expectancy_r_ci95=0.05, profit_factor=1.5, max_drawdown=-50.0,
+                                            max_drawdown_pct=4.0, bridge_skips=0, continuation_trades=0, per_symbol={},
+                                            is_trades=80, is_r_low=0.02, oos_trades=20, oos_pass=True))
+    nb.write_status_row(db, it, 'bed', 'EXTRACT_GARBAGE', 'later rescore found corrupt columns')
+    row = dict(db.execute("SELECT trades, expectancy_r, is_r_low, oos_pass, mapping_reason FROM backtest_results").fetchone())
+    c.that('P1.4 DB: a later failure row clears the earlier scores (trades 0, R/range NULL, oos_pass 0) instead of '
+           'leaving a stale score ranked under a failure reason', (row['trades'], row['expectancy_r'], row['is_r_low'],
+           row['oos_pass']) == (0, None, None, 0) and 'EXTRACT_GARBAGE' in row['mapping_reason'], detail=str(row))
     c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
            'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
            and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)

@@ -62,7 +62,11 @@ Conventions: additive only; `nnfx_engine.py` is the source of truth; MQL5 harnes
   candidates that ALSO made money out-of-sample (`oos_pass`); then by the BOTTOM of the in-sample 95%
   R range (`is_r_low`). The R range is a cluster bootstrap by entry month (correlated pairs), not
   1.96 x stdev / sqrt(n). Pips drawdown is chronological across the basket; profit factor is blank
-  (not 999) with no losing trades.
+  (not 999) with no losing trades. A range needs >= 12 entry-months; `oos_pass` needs >= 20
+  out-of-sample trades (PROVISIONAL default, awaiting owner confirmation).
+  FOLLOW-UP (P2, app): the desktop app's board (lib.rs db_query) still orders by trades >= 30 then
+  expectancy_pips and does not read is_trades / oos_pass / is_r_low -- the CSV leaderboard is the
+  reference until that is changed.
 
 ## Open / STUB-TO-CONFIRM (working defaults in place; confirm against VP's videos)
 - E4 scope: implemented C1-OR-C2 symmetric. Source unclear; revisit if VP restricts it.
