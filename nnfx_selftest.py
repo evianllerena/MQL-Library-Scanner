@@ -770,9 +770,18 @@ def unit_tests() -> Check:
     c.that('R per trade: a full stop-out is exactly -1R; a wrong-side close at 99.5 from 100.6 is -1.1/1.5 = -0.7333R; '
            'TP1 (+1xATR on half) plus the runner closed +3xATR on the same bar is 0.5x(1/1.5) + 0.5x(3/1.5) = +1.3333R',
            exit_rs == {'EURUSD': [-1.0, -1.0, -0.7333], 'GBPUSD': [1.3333]}, detail=str(exit_rs))
-    mean, ci = nb.r_stats([1.0, -1.0, 1.0, -1.0])
-    c.that('R stats: mean 0 with a 95% margin of 1.96 x stdev(1.1547) / sqrt(4) = 1.1316',
-           mean == 0.0 and abs(ci - 1.13161) < 1e-4 and nb.r_stats([]) == (0.0, None), detail=f'{mean} {ci}')
+    # P1.4: 20 months x 10 trades; every trade in a month has the same R (+1 or -1 by month), i.e.
+    # perfectly correlated within the month, as trades on pairs sharing a currency are.
+    corr = [{'entry_date': f'{2010 + m // 12}.{m % 12 + 1:02d}.15', 'r': 1.0 if m % 2 else -1.0}
+            for m in range(20) for _ in range(10)]
+    mean, lo, hi = nb.r_interval(corr)
+    iid_half = 1.96 * 1.0025 / 200 ** 0.5            # what treating the 200 trades as independent gives
+    c.that('R range (P1.4 cluster bootstrap): correlated trades in the same month are resampled together, so the '
+           'range is at least twice as wide as the i.i.d. 1.96 x stdev / sqrt(200) (+-0.139) that made edges look '
+           'significant', mean == 0.0 and lo < 0 < hi and (hi - lo) / 2 > 2 * iid_half, detail=f'{mean} [{lo}, {hi}]')
+    c.that('R range: seeded and reproducible; no range from a single month or no trades',
+           nb.r_interval(corr) == (mean, lo, hi) and nb.r_interval(corr[:10])[1:] == (None, None)
+           and nb.r_interval([]) == (0.0, None, None))
     board = nb.leaderboard_order([
         dict(slot='BASELINE', trades=11, expectancy_r=0.096),   # higher R, but only 11 trades
         dict(slot='BASELINE', trades=1272, expectancy_r=0.015),

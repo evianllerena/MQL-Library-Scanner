@@ -148,19 +148,40 @@ def failure_reason(fails: dict) -> str:
 MIN_TRADES = 30  # below this a result is an insufficient sample (same default as the app's board)
 
 
-def r_stats(trade_rs):
-    """Expectancy in R (P/L / the 1.5xATR-at-entry stop) and its 95% margin of error.
-    R puts every pair on one scale (pips are not comparable: a GBPNZD day moves ~3x an EURCHF
-    day). The margin is 1.96 x sample stdev / sqrt(n): an edge is only distinguishable from zero
-    -- or from another candidate -- when the ranges do not overlap."""
-    n = len(trade_rs)
+BOOTSTRAP_SAMPLES = 2000
+
+
+def r_interval(trades, samples=BOOTSTRAP_SAMPLES, seed=0):
+    """Expectancy in R (P/L / the 1.5xATR-at-entry stop) and its 95% range (low, high).
+    R puts every pair on one scale (pips are not comparable: a GBPNZD day moves ~3x an EURCHF day).
+    P1.4: the range is a CLUSTER bootstrap -- trades are grouped by entry month across all pairs and
+    whole months are resampled -- because 28 pairs share 8 currencies: trades opened in the same
+    month are correlated, and treating them as independent (1.96 x stdev / sqrt(n)) made the range
+    far too narrow. trades = [{'entry_date': 'YYYY.MM.DD', 'r': float}, ...]. Fewer than 2 months
+    -> no range (None, None). Seeded, so a rescore is reproducible."""
+    import random
+    n = len(trades)
     if n == 0:
-        return 0.0, None
-    mean = sum(trade_rs) / n
-    if n < 2:
-        return mean, None
-    var = sum((x - mean) ** 2 for x in trade_rs) / (n - 1)
-    return mean, 1.96 * (var ** 0.5) / n ** 0.5
+        return 0.0, None, None
+    mean = sum(t['r'] for t in trades) / n
+    months = {}
+    for t in trades:
+        s = months.setdefault(t['entry_date'][:7], [0.0, 0])
+        s[0] += t['r']; s[1] += 1
+    clusters = list(months.values())
+    if len(clusters) < 2:
+        return mean, None, None
+    rng = random.Random(seed)
+    k = len(clusters)
+    means = []
+    for _ in range(samples):
+        tot = cnt = 0
+        for _ in range(k):
+            s = clusters[rng.randrange(k)]
+            tot += s[0]; cnt += s[1]
+        means.append(tot / cnt)
+    means.sort()
+    return mean, means[int(0.025 * samples)], means[int(0.975 * samples) - 1]
 
 
 def leaderboard_order(rows, min_trades=MIN_TRADES):
@@ -705,7 +726,7 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
     shared account each call, so the two runs (off/on) are independent."""
     per_symbol = {}
     pooled_trades = []
-    pooled_r = []  # whole-trade results in R, from the engine's closing records
+    pooled_rt = []  # whole trades (entry date + R) for the clustered R range
     dated = []     # (exit date, symbol, pips) for the chronological pips drawdown
     bridge_skips = continuation_trades = volume_skips = dd_breaker_skips = news_skips = 0
     fingerprints = {}
@@ -735,7 +756,7 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
         per_symbol[sym] = len(trades)
         dated.extend((t['exit_date'], sym, t['pips']) for t in trades)
         pooled_trades.extend(t['pips'] for t in trades)
-        pooled_r.extend(t['r'] for t in trades)
+        pooled_rt.extend(trades)
         fingerprints[sym] = tuple((r['date'], r['action'], r['reason']) for r in window)
 
     n = len(pooled_trades)
@@ -745,9 +766,12 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
     expectancy = round(sum(pooled_trades) / n, 2) if n else 0.0
     profit_factor = profit_factor_of(pooled_trades)
     maxdd = max_drawdown_pips(dated)
-    exp_r, ci_r = r_stats(pooled_r)
+    exp_r, lo_r, hi_r = r_interval(pooled_rt)
     return dict(trades=n, wins=wins, losses=losses, win_rate=win_rate, expectancy_pips=expectancy,
-                expectancy_r=round(exp_r, 4), expectancy_r_ci95=round(ci_r, 4) if ci_r is not None else None,
+                expectancy_r=round(exp_r, 4),
+                expectancy_r_ci95=round((hi_r - lo_r) / 2, 4) if lo_r is not None else None,  # half-width
+                expectancy_r_low=round(lo_r, 4) if lo_r is not None else None,
+                expectancy_r_high=round(hi_r, 4) if hi_r is not None else None,
                 profit_factor=profit_factor, max_drawdown=round(maxdd, 1), bridge_skips=bridge_skips,
                 continuation_trades=continuation_trades, volume_skips=volume_skips,
                 max_drawdown_pct=round(account.max_dd_pct, 2), dd_breaker_skips=dd_breaker_skips, news_skips=news_skips,
@@ -1103,12 +1127,10 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
             continue
         col_b = j['key'] + '_b' if j['buf_b'] >= 0 else None
         r = score_candidate(symbol_data, symbols, j['role'], j['key'] + '_a', col_b, None, score_from=history_from)
-        ci = r['expectancy_r_ci95']
         rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status='scored', trades=r['trades'],
                          sufficient_sample=r['trades'] >= min_trades, expectancy_r=r['expectancy_r'],
-                         expectancy_r_ci95=ci,
-                         expectancy_r_low=round(r['expectancy_r'] - ci, 4) if ci is not None else None,
-                         expectancy_r_high=round(r['expectancy_r'] + ci, 4) if ci is not None else None,
+                         expectancy_r_ci95=r['expectancy_r_ci95'],
+                         expectancy_r_low=r['expectancy_r_low'], expectancy_r_high=r['expectancy_r_high'],
                          expectancy_pips=r['expectancy_pips'], expectancy_pips_breaker=r['expectancy_pips_breaker'],
                          win_rate=r['win_rate'], profit_factor=r['profit_factor'], max_drawdown_pips=r['max_drawdown'],
                          max_drawdown_pct=r['max_drawdown_pct'], dd_breaker_skips=r['dd_breaker_skips'],
