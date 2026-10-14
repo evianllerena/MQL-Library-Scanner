@@ -176,7 +176,7 @@ class DriversRunningTest(unittest.TestCase):
             try:
                 self.assertTrue(orchestrate.drivers_running())     # a real python driver is still seen
             finally:
-                driver.kill()
+                driver.kill(); driver.wait()
         finally:
             subprocess.run(['taskkill', '/F', '/T', '/PID', str(bystander.pid)], capture_output=True)
 
