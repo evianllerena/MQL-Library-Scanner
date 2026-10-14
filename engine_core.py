@@ -50,8 +50,10 @@ class Analysis:
     evidence: list[dict] = field(default_factory=list)
     classification_status: str = 'Unknown'
     review_reason: str = ''
-    classifier_version: str = 'evidence-v5'  # v5: adds line_buffer_indices (NNFX Part B needs real
+    classifier_version: str = 'evidence-v6'  # v5: adds line_buffer_indices (NNFX Part B needs real
                                               # buffer indices, not a 0/1 guess -- see nnfx_slot_signal)
+                                              # v6 (P2): volume/OB-OS evidence and string-aware comment
+                                              # stripping changed, so every file is re-analyzed once
     confidence: int = 0
     warnings: list[str] = field(default_factory=list)
     duplicate_of: str | None = None
@@ -318,16 +320,20 @@ def uses_volume(logic: str) -> bool:
     function. The bare names used to count, so the `const long &tick_volume[]` parameter of every
     MQL5 OnCalculate signature scored Volume +14 on nearly every indicator."""
     return _has(logic, r'\b(?:Volume|tick_volume|real_volume)\s*\[\s*[^\]\s]') or \
-        _has(logic, r'\b(?:iVolume|iTickVolume|iRealVolume|CopyTickVolume|CopyRealVolume|iVolumes|iOBV|iMFI|iAD)\s*\(')
+        _has(logic, r'\.(?:tick_volume|real_volume)\b') or \
+        _has(logic, r'\b(?:VOLUME_TICK|VOLUME_REAL)\b', 0) or \
+        _has(logic, r'\b(?:iVolume|iTickVolume|iRealVolume|CopyTickVolume|CopyRealVolume|iVolumes|iOBV|iMFI|iAD|iForce|iBWMFI)\s*\(')
 
 
 def has_ob_os_levels(logic: str) -> bool:
     """Overbought/oversold levels (P2): 70/80 or 30/20 as a LEVEL (indicator_levelN, SetLevelValue,
     INDICATOR_LEVELVALUE) or the words overbought/oversold. `70|80 ... 30|20` anywhere in the file
-    (any period, shift or colour constant) used to count."""
+    (any period, shift or colour constant) used to count. A high AND a low level are both required
+    (a lone 20 is usually an ADX/trend-strength line); the words also match inside identifiers
+    (Overbought_Level, InpOversold)."""
     level = r'(?:indicator_level\d+|SetLevelValue\s*\(|INDICATOR_LEVELVALUE)[^;\n]*?\b'
-    return _has(logic, level + r'(?:70|80)(?:\.0+)?\b') or _has(logic, level + r'(?:30|20)(?:\.0+)?\b') or \
-        _has(logic, r'\b(?:overbought|oversold)\b')
+    return (_has(logic, level + r'(?:70|80)(?:\.0+)?\b') and _has(logic, level + r'(?:30|20)(?:\.0+)?\b')) or \
+        _has(logic, r'overbought|oversold')
 
 def classify(filename: str, logic: str, stds: list[str], a: Analysis):
     scores={k:0.0 for k in CATEGORIES if k not in ('Unknown','Custom / Specialized','Composite / Multi-Purpose')}

@@ -20,6 +20,13 @@ class VolumeEvidence(unittest.TestCase):
         self.assertTrue(engine_core.uses_volume('double v=Volume[i+1];'))           # MQL4 series
         self.assertTrue(engine_core.uses_volume('long v=iVolume(NULL,0,i);'))
 
+    def test_mqlrates_fields_applied_volume_and_volume_handles_are(self):
+        self.assertTrue(engine_core.uses_volume('double v=(double)rates[i].tick_volume;'))
+        self.assertTrue(engine_core.uses_volume('long v=r.real_volume;'))
+        self.assertTrue(engine_core.uses_volume('input ENUM_APPLIED_VOLUME InpVol=VOLUME_TICK;'))
+        self.assertTrue(engine_core.uses_volume('h=iForce(_Symbol,_Period,13,MODE_SMA,PRICE_CLOSE);'))
+        self.assertTrue(engine_core.uses_volume('h=iBWMFI(_Symbol,_Period,0);'))
+
 
 class OverboughtOversold(unittest.TestCase):
     def test_unrelated_numbers_are_not_levels(self):
@@ -27,8 +34,25 @@ class OverboughtOversold(unittest.TestCase):
 
     def test_level_contexts_are(self):
         self.assertTrue(engine_core.has_ob_os_levels('#property indicator_level1 70\n#property indicator_level2 30\n'))
-        self.assertTrue(engine_core.has_ob_os_levels('IndicatorSetDouble(INDICATOR_LEVELVALUE,0,80);'))
+        self.assertTrue(engine_core.has_ob_os_levels('IndicatorSetDouble(INDICATOR_LEVELVALUE,0,80);\n'
+                                                     'IndicatorSetDouble(INDICATOR_LEVELVALUE,1,20);'))
         self.assertTrue(engine_core.has_ob_os_levels('if(rsi>Overbought) x=1;'))
+
+    def test_a_single_level_is_not(self):
+        # a lone 20 is usually an ADX / trend-strength line
+        self.assertFalse(engine_core.has_ob_os_levels('#property indicator_level1 20\n'))
+        self.assertFalse(engine_core.has_ob_os_levels('#property indicator_level1 80\n'))
+
+    def test_words_inside_identifiers_are(self):
+        self.assertTrue(engine_core.has_ob_os_levels('input double Overbought_Level=75;'))
+        self.assertTrue(engine_core.has_ob_os_levels('input double OverboughtLevel=75;'))
+        self.assertTrue(engine_core.has_ob_os_levels('input double InpOversold=25;'))
+
+
+class ClassifierVersion(unittest.TestCase):
+    def test_bumped_so_existing_libraries_are_reanalyzed(self):
+        # engine.unchanged() skips files whose stored classifier_version matches
+        self.assertEqual(engine_core.Analysis.classifier_version, 'evidence-v6')
 
 
 class StripComments(unittest.TestCase):
