@@ -80,5 +80,65 @@ class PrePy312SyntaxTest(unittest.TestCase):
         self.assertEqual(hits, [])
 
 
+class RepairPoolTest(unittest.TestCase):
+    """repair_ai.run_job must hand its MT5 runtime token back to RT_POOL however the job ends."""
+
+    def setUp(self):
+        import subprocess
+        import tempfile
+        from unittest import mock
+        import repair_ai
+        self.ra, self.mock, self.subprocess = repair_ai, mock, subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        tmp = Path(self.tmp.name)
+        src = tmp / 'src.mq5'
+        src.write_text('int OnInit(){return 0;}\n', encoding='utf-8')
+        self.job = {'name': 'demo', 'source': str(src), 'problem': 'runtime'}
+        self.patches = [mock.patch.object(repair_ai, 'R', tmp / 'R'),
+                        mock.patch.object(repair_ai, 'OUT', tmp / 'out.jsonl')]
+        for p in self.patches:
+            p.start()
+        self.size = repair_ai.RT_POOL.qsize()
+        repair_ai.STOP.clear()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.ra.STOP.clear()
+        self.tmp.cleanup()
+
+    def run_with(self, fake_run):
+        with self.mock.patch.object(self.ra.subprocess, 'run', side_effect=fake_run):
+            return self.ra.run_job(self.job)
+
+    def test_token_returned_when_claude_cannot_start(self):
+        def fake_run(cmd, **kw):
+            raise FileNotFoundError(cmd[0])
+        with self.assertRaises(FileNotFoundError):
+            self.run_with(fake_run)
+        self.assertEqual(self.ra.RT_POOL.qsize(), self.size)
+
+    def test_token_returned_when_verification_cannot_start(self):
+        def fake_run(cmd, **kw):
+            if cmd[0] == self.ra.CLAUDE:
+                return self.subprocess.CompletedProcess(cmd, 0, stdout='DONE\n')
+            raise PermissionError(cmd[0])
+        with self.assertRaises(PermissionError):
+            self.run_with(fake_run)
+        self.assertEqual(self.ra.RT_POOL.qsize(), self.size)
+
+    def test_token_returned_exactly_once_on_usage_limit_and_success(self):
+        def limit(cmd, **kw):
+            return self.subprocess.CompletedProcess(cmd, 0, stdout="You've hit your usage limit\n")
+        self.assertTrue(self.run_with(limit)['skipped'])
+        self.assertEqual(self.ra.RT_POOL.qsize(), self.size)
+        self.ra.STOP.clear()
+
+        def ok(cmd, **kw):
+            return self.subprocess.CompletedProcess(cmd, 0, stdout='DONE\nPASS\n')
+        self.assertTrue(self.run_with(ok)['passes'])
+        self.assertEqual(self.ra.RT_POOL.qsize(), self.size)
+
+
 if __name__ == '__main__':
     unittest.main()

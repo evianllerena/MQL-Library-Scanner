@@ -80,32 +80,34 @@ def run_job(job):
     for inc in local_includes(text, job.get('original', job['source'])):
         shutil.copy2(inc, d / inc.name)
     rt = RT_POOL.get()
-    (d / 'c.py').write_text('import subprocess, sys\n'
-                            f'sys.exit(subprocess.run([sys.executable, r"{QA_ONE}", r"{target}", "{rt}"]).returncode)\n',
-                            encoding='utf-8')
-    prompt = PROMPT.format(file=target.name, problem=job['problem'], detail=job.get('detail', ''),
-                           mqlc=MQLC, path=str(target))
-    t0 = time.time()
-    try:
-        cp = subprocess.run([CLAUDE, '-p', prompt, '--model', arg('--model', 'sonnet'), '--effort', arg('--effort', 'low'),
-                             '--permission-mode', 'acceptEdits',
-                             '--allowedTools', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash(python c.py)', 'Bash(python c.py:*)',
-                             '--output-format', 'text'],
-                            cwd=str(d), capture_output=True, text=True, encoding='utf-8', errors='replace',
-                            timeout=int(arg('--timeout', 1200)))
-        answer = (cp.stdout or '').strip().splitlines()[-1:] or ['']
-    except subprocess.TimeoutExpired:
-        answer = ['FAILED: timeout']
-    low = answer[0].lower()
-    if 'limit' in low and ('hit your' in low or 'usage' in low or 'resets' in low):
-        STOP.append(True); RT_POOL.put(rt)
-        return {'name': name, 'skipped': True}        # not recorded: retried on the next run
-    try:
-        verify = subprocess.run([sys.executable, QA_ONE, str(target), str(rt)], capture_output=True, text=True, timeout=400)
-        vout, vcode = verify.stdout, verify.returncode
-    except subprocess.TimeoutExpired:
-        vout, vcode = 'verification timeout', 1
-    RT_POOL.put(rt)
+    try:                                           # the token goes back however the job ends
+        (d / 'c.py').write_text('import subprocess, sys\n'
+                                f'sys.exit(subprocess.run([sys.executable, r"{QA_ONE}", r"{target}", "{rt}"]).returncode)\n',
+                                encoding='utf-8')
+        prompt = PROMPT.format(file=target.name, problem=job['problem'], detail=job.get('detail', ''),
+                               mqlc=MQLC, path=str(target))
+        t0 = time.time()
+        try:
+            cp = subprocess.run([CLAUDE, '-p', prompt, '--model', arg('--model', 'sonnet'), '--effort', arg('--effort', 'low'),
+                                 '--permission-mode', 'acceptEdits',
+                                 '--allowedTools', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash(python c.py)', 'Bash(python c.py:*)',
+                                 '--output-format', 'text'],
+                                cwd=str(d), capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                timeout=int(arg('--timeout', 1200)))
+            answer = (cp.stdout or '').strip().splitlines()[-1:] or ['']
+        except subprocess.TimeoutExpired:
+            answer = ['FAILED: timeout']
+        low = answer[0].lower()
+        if 'limit' in low and ('hit your' in low or 'usage' in low or 'resets' in low):
+            STOP.append(True)
+            return {'name': name, 'skipped': True}        # not recorded: retried on the next run
+        try:
+            verify = subprocess.run([sys.executable, QA_ONE, str(target), str(rt)], capture_output=True, text=True, timeout=400)
+            vout, vcode = verify.stdout, verify.returncode
+        except subprocess.TimeoutExpired:
+            vout, vcode = 'verification timeout', 1
+    finally:
+        RT_POOL.put(rt)
     rec = {'name': name, 'problem': job['problem'], 'agent': answer[0][:300],
            'passes': vcode == 0, 'compiles': 'COMPILE FAILED' not in vout, 'check': vout.splitlines()[-3:],
            'seconds': round(time.time() - t0), 'path': str(target)}
