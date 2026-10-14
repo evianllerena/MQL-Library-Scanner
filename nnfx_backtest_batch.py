@@ -682,12 +682,23 @@ def closed_trades(records):
     return out
 
 
+def max_drawdown_pips(dated):
+    """Largest peak-to-trough fall (<= 0) of cumulative pips over the basket's trades in EXIT-DATE
+    order (ties by symbol). Concatenating each symbol's trades, as before P1.4, is not a curve anyone
+    could have traded."""
+    equity = peak = maxdd = 0.0
+    for _date, _sym, pips in sorted(dated):
+        equity += pips; peak = max(peak, equity); maxdd = min(maxdd, equity - peak)
+    return maxdd
+
+
 def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_FROM, costs=True):
     """One scoring pass over prepared bars at a given breaker setting. Fresh engines + a fresh
     shared account each call, so the two runs (off/on) are independent."""
     per_symbol = {}
     pooled_trades = []
     pooled_r = []  # whole-trade results in R, from the engine's closing records
+    dated = []     # (exit date, symbol, pips) for the chronological pips drawdown
     bridge_skips = continuation_trades = volume_skips = dd_breaker_skips = news_skips = 0
     fingerprints = {}
     # R1 (FIX 7b): ONE equity tracker shared by every symbol's engine, driven in date order
@@ -714,6 +725,7 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
         # (a TP1 half before score_from and the runner after it used to lose the half-pairing)
         trades = [t for t in closed_trades(all_records[sym]) if t['entry_date'] >= score_from]
         per_symbol[sym] = len(trades)
+        dated.extend((t['exit_date'], sym, t['pips']) for t in trades)
         pooled_trades.extend(t['pips'] for t in trades)
         pooled_r.extend(t['r'] for t in trades)
         fingerprints[sym] = tuple((r['date'], r['action'], r['reason']) for r in window)
@@ -726,9 +738,7 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
     gains = sum(t for t in pooled_trades if t > 0)
     loss_sum = -sum(t for t in pooled_trades if t < 0)
     profit_factor = round(gains / loss_sum, 2) if loss_sum > 0 else (999.0 if gains > 0 else 0.0)
-    equity = peak = maxdd = 0.0
-    for t in pooled_trades:
-        equity += t; peak = max(peak, equity); maxdd = min(maxdd, equity - peak)
+    maxdd = max_drawdown_pips(dated)
     exp_r, ci_r = r_stats(pooled_r)
     return dict(trades=n, wins=wins, losses=losses, win_rate=win_rate, expectancy_pips=expectancy,
                 expectancy_r=round(exp_r, 4), expectancy_r_ci95=round(ci_r, 4) if ci_r is not None else None,

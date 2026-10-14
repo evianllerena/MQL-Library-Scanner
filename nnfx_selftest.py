@@ -888,6 +888,10 @@ def unit_tests() -> Check:
            'paired -- the 03.29 trade (TP1 half before 04.01, runner after) is out, not counted as a lone '
            '+20 runner; the 04.03 trade averages its halves (+3.0); an open trade is not a trade',
            tr == [{'entry_date': '2024.04.03', 'exit_date': '2024.04.05', 'pips': 3.0, 'r': 0.1}], detail=str(tr))
+    dd = nb.max_drawdown_pips([('2024.01.03', 'AUDUSD', 10.0), ('2024.01.01', 'AUDUSD', 10.0),
+                               ('2024.01.02', 'EURUSD', -15.0), ('2024.01.04', 'EURUSD', -15.0)])
+    c.that('P1.4 pips drawdown in date order: +10, -15, +10, -15 across two pairs is -20 from the +10 peak '
+           '(per-pair concatenation +10, +10, -15, -15 would say -30)', dd == -20.0, detail=str(dd))
     c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
            'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
            and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)
