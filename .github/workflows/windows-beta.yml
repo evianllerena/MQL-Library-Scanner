@@ -258,6 +258,7 @@ jobs:
           'keep' | Set-Content "$foreign/keep.txt"
           $refused=& 'build-sidecar/mql-preview-control.exe' clear-app --db "$foreign/library.sqlite3" 2>&1
           if($LASTEXITCODE -eq 0 -or -not(Test-Path "$foreign/keep.txt")){throw 'Clear application must refuse a folder that is not the app data folder'}
+          $global:LASTEXITCODE=0  # the refusal above exits 1 on purpose; GitHub ends the step with 'exit $LASTEXITCODE'
 
       - name: Install frontend dependencies
         shell: pwsh
