@@ -922,6 +922,29 @@ def unit_tests() -> Check:
            'bridge-too-far after the same 8-bar C1 run', r_e2[1]['reason'] == 'skip:beyond_1xATR'
            and r_e2[-1]['action'] != 'enter', detail=str([x['reason'] for x in r_e2]))
 
+    # R1 deadlock (P1.5): two 6% stop-outs while FLAT take the account 11.64% below its peak; nothing is
+    # open, so no close can lift it back under 10%. 22 quiet bars later a valid setup arrives.
+    def flat_deadlock(**kw):
+        e = NNFXEngine(P(risk_pct=6.0, **kw))
+        setup = lambda d: _bar(d, 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)
+        stop = lambda d: _bar(d, 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.7, low=99.0)
+        seq = [setup('d01'), stop('d02'), setup('d03'), stop('d04')]
+        seq += [_bar(f'q{i:02d}', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0) for i in range(22)]
+        seq += [setup('d27')]
+        recs = [e.process_bar(b) for b in seq]
+        return recs, e.equity
+    recs_dl, acct_dl = flat_deadlock()
+    c.that('P1.5 R1 deadlock fixed (default below_threshold_or_cooldown): tripped while flat at 11.64%, the breaker '
+           'resumes after 20 trading days and the next valid setup ENTERS; one trip, one resume',
+           [r['reason'] for r in recs_dl[:4]] == ['enter:standard', 'exit:stop_loss', 'enter:standard', 'exit:stop_loss']
+           and recs_dl[-1]['reason'] == 'enter:standard' and (acct_dl.trips, acct_dl.resumes) == (1, 1)
+           and round(acct_dl.max_dd_pct, 2) == 11.64, detail=f"{recs_dl[-1]['reason']} trips={acct_dl.trips} resumes={acct_dl.resumes}")
+    recs_old, acct_old = flat_deadlock(dd_resume_rule='below_threshold')
+    c.that('P1.5 R1 deadlock control: with the old rule (below_threshold) the same flat account never resumes -- '
+           'the setup is skipped (skip:dd_breaker) and the breaker is still tripped at the end',
+           recs_old[-1]['reason'] == 'skip:dd_breaker' and acct_old.tripped_at is not None and acct_old.resumes == 0,
+           detail=str(recs_old[-1]['reason']))
+
     # --- P1.4 statistics --------------------------------------------------------------------
     straddle = [dict(date='2024.03.29', action='enter', pips=''), dict(date='2024.03.30', action='exit_half', pips=10.0),
                 dict(date='2024.04.02', action='exit', pips=20.0, r=0.9),

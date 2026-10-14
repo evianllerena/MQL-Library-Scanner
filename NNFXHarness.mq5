@@ -140,10 +140,13 @@ input double ServerUTCOffsetHours = 0.0;       // broker server time - UTC (e.g.
 
 // --- FIX 7b R1 drawdown circuit breaker (mirrors NNFXParams enable_dd_breaker/dd_*) ------------
 // Once REALIZED balance is >= DDBreakerPct below its peak, open no new trades (any entry type);
-// open trades keep their stops. "below_threshold" (default, flagged) = resume once back under.
+// open trades keep their stops. P1.5 default "below_threshold_or_cooldown": resume once back under
+// the threshold OR after DDCooldownBars closed bars, re-basing the breaker's reference to the balance
+// then (realized balance cannot recover while flat, so "below_threshold" alone can halt for good).
 input bool   EnableDDBreaker      = true;
 input double DDBreakerPct         = 10.0;
-input string DDResumeRule         = "below_threshold";
+input string DDResumeRule         = "below_threshold_or_cooldown";
+input int    DDCooldownBars       = 20;
 
 // --- chart layout: each role in its OWN subwindow, never shared -----
 #define WIN_MAIN   0
@@ -214,6 +217,9 @@ string   g_newsCur[];         // FIX 7: High-impact events (currency, UTC time),
 datetime g_newsTime[];
 long     g_summaryNewsSkips=0;
 double   g_peakBalance=0.0;   // FIX 7b: realized-balance peak
+double   g_breakerRef=0.0;    // P1.5: the level the breaker measures from (peak until a cooldown re-base)
+int      g_ddTrippedAt=-1;    // g_barIndex when the breaker tripped; -1 = not tripped
+long     g_ddTrips=0, g_ddResumes=0;
 long     g_summaryDDSkips=0;
 double g_atrAtEntry = 0.0;   // FIX 6: T4 reference ATR (TrailATRRef="entry")
 bool   g_trailActive = false; // FIX 6: sticky once a close reached TrailActivateATR beyond entry
@@ -503,10 +509,14 @@ bool NewsAhead(int shift)
 // Rules that veto ANY new trade (every entry type, continuation included). Logs the skip.
 bool EntryBlocked(int dir,double atrVal)
 {
-   if(EnableDDBreaker && g_peakBalance>0)
+   if(EnableDDBreaker && g_ddTrippedAt>=0)
    {
-      double dd=(g_peakBalance-AccountInfoDouble(ACCOUNT_BALANCE))/g_peakBalance*100.0;
-      if(dd>=DDBreakerPct) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:dd_breaker"); g_summaryDDSkips++; return(true); }
+      double bal=AccountInfoDouble(ACCOUNT_BALANCE);
+      double dd=(g_breakerRef-bal)/g_breakerRef*100.0;
+      if(dd<DDBreakerPct) { g_ddTrippedAt=-1; g_ddResumes++; }                       // recovered
+      else if(DDResumeRule=="below_threshold_or_cooldown" && g_barIndex-g_ddTrippedAt>=DDCooldownBars)
+         { g_breakerRef=bal; g_ddTrippedAt=-1; g_ddResumes++; }                       // flat deadlock: re-base
+      else { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:dd_breaker"); g_summaryDDSkips++; return(true); }
    }
    if(NewsAhead(1)) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:news"); g_summaryNewsSkips++; return(true); }
    return(false);
@@ -718,6 +728,9 @@ void OnNewDailyBar()
 {
    int shift=1; // last CLOSED bar; shift 0 is the still-forming bar, never read
    g_barIndex++; // one per closed bar, like the engine's idx -- so E4's "next bar" is exactly +1
+   if(EnableDDBreaker && g_ddTrippedAt<0 && g_breakerRef>0 &&
+      (g_breakerRef-AccountInfoDouble(ACCOUNT_BALANCE))/g_breakerRef*100.0>=DDBreakerPct)
+      { g_ddTrippedAt=g_barIndex; g_ddTrips++; }  // R1 trips on the first bar after the breach (engine: same)
    double atrVal;
    if(!BufVal(h_atr,0,shift,atrVal) || atrVal<=0) return;
 
@@ -940,6 +953,7 @@ void OnTick()
 {
    double atrVal;
    g_peakBalance = MathMax(g_peakBalance, AccountInfoDouble(ACCOUNT_BALANCE)); // R1: realized peak
+   g_breakerRef  = MathMax(g_breakerRef,  AccountInfoDouble(ACCOUNT_BALANCE));
    datetime t0 = iTime(_Symbol,PERIOD_D1,0);
    bool newBar = (t0!=g_lastBarTime);
    if(BufVal(h_atr,0,1,atrVal)) ManageOpenPosition(atrVal,newBar); // fills every tick; T4 trail on newBar only
@@ -973,6 +987,8 @@ double OnTester()
                 "bridge_skips", DoubleToString((double)g_summaryContinuationTrades,0), "continuation_trades",
                 DoubleToString((double)g_summaryNewsSkips,0), "news_skips",
                 DoubleToString((double)g_summaryDDSkips,0), "dd_breaker_skips",
+                DoubleToString((double)g_ddTrips,0), "dd_breaker_trips",
+                (g_ddTrippedAt>=0?"1":"0"), "dd_breaker_halted_at_end",
                 DoubleToString(TesterStatistics(STAT_BALANCE_DDREL_PERCENT),2), "max_drawdown_pct_balance");
       FileClose(h);
    }

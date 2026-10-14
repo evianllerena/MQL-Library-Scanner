@@ -70,7 +70,10 @@ Conventions: additive only; `nnfx_engine.py` is the source of truth; MQL5 harnes
 
 ## Open / STUB-TO-CONFIRM (working defaults in place; confirm against VP's videos)
 - E4 scope: implemented C1-OR-C2 symmetric. Source unclear; revisit if VP restricts it.
-- dd_resume_rule: `below_threshold` (resume when drawdown back under 10%). Confirm.
+- dd_resume_rule: DECIDED 2026-10-14 (owner delegated it to the agent): `below_threshold_or_cooldown`
+  -- resume when the drawdown is back under 10% OR after 20 trading days, re-basing the breaker's
+  reference to the balance then. `below_threshold` alone halted a flat account for good (realized
+  equity cannot recover without trades). Results report dd_breaker_trips / dd_breaker_halted_at_end.
 (X5 cutoff and Decision #5 are now confirmed above.)
 
 ## Out of scope (recorded so they're not mistaken for missing work)

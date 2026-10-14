@@ -161,13 +161,31 @@ class EquityTracker:
     peak: float = 100.0
     max_dd_pct: float = 0.0
     curve: list = field(default_factory=list)  # (date, equity) after each realized result
+    # R1 breaker state (P1.5). breaker_ref is the level the breaker measures from: the peak, until a
+    # cooldown resume re-bases it to the equity at that moment (max_dd_pct keeps using the true peak).
+    breaker_ref: float = 100.0
+    tripped_at: Optional[int] = None  # dates_seen when the breaker tripped; None = not tripped
+    trips: int = 0
+    resumes: int = 0
+    dates_seen: int = 0
+    _last_date: str = ''
 
     def drawdown_pct(self) -> float:
         return (self.peak - self.equity) / self.peak * 100.0
 
+    def breaker_dd_pct(self) -> float:
+        return (self.breaker_ref - self.equity) / self.breaker_ref * 100.0
+
+    def note_date(self, date: str) -> None:
+        """Count distinct trading dates (engines sharing the tracker each report every bar)."""
+        if date != self._last_date:
+            self._last_date = date
+            self.dates_seen += 1
+
     def realize(self, r_multiple: float, risk_pct: float, date: str) -> None:
         self.equity *= 1.0 + r_multiple * risk_pct / 100.0
         self.peak = max(self.peak, self.equity)
+        self.breaker_ref = max(self.breaker_ref, self.equity)
         self.max_dd_pct = max(self.max_dd_pct, self.drawdown_pct())
         self.curve.append((date, self.equity))
 
@@ -266,12 +284,17 @@ class NNFXParams:
     # --- FIX 7b R1 drawdown circuit breaker (MASTER_HANDOFF Section 0 / Decision #12) -------
     # Once REALIZED equity is >= dd_breaker_pct below its peak, open NO new trades (every entry
     # type, continuation included); open trades keep their stops and exits. dd_resume_rule:
-    # 'below_threshold' (DEFAULT, FLAGGED for user confirm) = resume as soon as the drawdown is
+    # 'below_threshold_or_cooldown' (DEFAULT since P1.5, the agent's call delegated by the owner on
+    # 2026-10-14): resume when the drawdown is back under dd_breaker_pct (open trades recovered it) OR
+    # after dd_cooldown_bars trading dates, re-basing the breaker's reference to the equity then -- the
+    # deadlock below otherwise halts the account for the rest of the test. Previous default:
+    # 'below_threshold' (still selectable) = resume as soon as the drawdown is
     # back under dd_breaker_pct. NB: realized equity only moves when a trade closes, so once every
     # position is flat while tripped, nothing can lift the drawdown back under the threshold.
     enable_dd_breaker: bool = True
     dd_breaker_pct: float = 10.0
-    dd_resume_rule: str = 'below_threshold'
+    dd_resume_rule: str = 'below_threshold_or_cooldown'
+    dd_cooldown_bars: int = 20
     volume_threshold_mult: float = 1.0
     pip_size: float = 0.0001
     # --- Execution model (P1.1 / P1.3 / P1.7; owner decisions 2026-10-14: 1B costs, 3A next open) ---
@@ -413,8 +436,16 @@ class NNFXEngine:
     def _entry_block_reason(self, bar: dict) -> Optional[str]:
         """Rules that veto ANY new trade (every entry type, continuation included)."""
         p = self.params
-        if p.enable_dd_breaker and self.equity.drawdown_pct() >= p.dd_breaker_pct:
-            return 'skip:dd_breaker'  # R1; resumes once back under the threshold ('below_threshold')
+        eq = self.equity
+        if p.enable_dd_breaker and eq.tripped_at is not None:  # R1
+            if eq.breaker_dd_pct() < p.dd_breaker_pct:
+                eq.tripped_at = None; eq.resumes += 1                    # recovered by closing trades
+            elif p.dd_resume_rule == 'below_threshold_or_cooldown' and \
+                    eq.dates_seen - eq.tripped_at >= p.dd_cooldown_bars:
+                eq.breaker_ref = eq.equity                               # flat deadlock: re-base, resume
+                eq.tripped_at = None; eq.resumes += 1
+            else:
+                return 'skip:dd_breaker'
         if self._news_ahead(bar):
             return 'skip:news'
         return None
@@ -452,9 +483,13 @@ class NNFXEngine:
         Optional: exit_value + exit_zero_reference (X2 exit indicator)."""
         p = self.params
         self._date = bar['date']
+        self.equity.note_date(bar['date'])
         for r in self._deferred_r:  # exits decided on the previous close filled at this bar's open
             self.equity.realize(r, p.risk_pct, self._date)
         self._deferred_r.clear()
+        eq = self.equity
+        if p.enable_dd_breaker and eq.tripped_at is None and eq.breaker_dd_pct() >= p.dd_breaker_pct:
+            eq.tripped_at = eq.dates_seen; eq.trips += 1                 # R1 trips on the first bar after the breach
         self.c1_history.append((bar['c1_fast'], bar['c1_slow']))
         idx = len(self.c1_history) - 1
 

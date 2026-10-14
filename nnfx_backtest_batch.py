@@ -260,7 +260,8 @@ def ensure_backtest_table(conn):
             conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} TEXT')
     for col, typ in (('expectancy_r_low', 'REAL'), ('expectancy_r_high', 'REAL'), ('is_trades', 'INTEGER'),
                      ('is_expectancy_r', 'REAL'), ('is_r_low', 'REAL'), ('oos_trades', 'INTEGER'),
-                     ('oos_expectancy_r', 'REAL'), ('oos_pass', 'INTEGER')):  # P1.4 holdout + range
+                     ('oos_expectancy_r', 'REAL'), ('oos_pass', 'INTEGER'),  # P1.4 holdout + range
+                     ('dd_breaker_trips', 'INTEGER'), ('dd_breaker_halted_at_end', 'INTEGER')):  # P1.5
         if col not in cols:
             conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} {typ}')
     conn.commit()
@@ -1041,6 +1042,7 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
                 profit_factor=profit_factor, max_drawdown=round(maxdd, 1), bridge_skips=bridge_skips,
                 continuation_trades=continuation_trades, volume_skips=volume_skips,
                 max_drawdown_pct=round(account.max_dd_pct, 2), dd_breaker_skips=dd_breaker_skips, news_skips=news_skips,
+                dd_breaker_trips=account.trips, dd_breaker_halted_at_end=account.tripped_at is not None,
                 per_symbol=per_symbol, fingerprints=fingerprints, fill_model=model,
                 cost_model=COST_MODEL if costs else 'none',
                 **(holdout_stats(pooled_rt, holdout_from) if stats else {}))
@@ -1060,6 +1062,8 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_fr
                     holdout_from=holdout_from, stats=False)
     off['expectancy_pips_breaker'] = on['expectancy_pips']
     off['dd_breaker_skips'] = on['dd_breaker_skips']
+    off['dd_breaker_trips'] = on['dd_breaker_trips']                    # P1.5: how often it tripped, and
+    off['dd_breaker_halted_at_end'] = on['dd_breaker_halted_at_end']    # whether it was still halted at the end
     return off
 
 # ---- run ----------------------------------------------------------------------
@@ -1424,8 +1428,8 @@ def write_score_row(conn, it, bed, r):
             win_rate, expectancy_pips, expectancy_pips_breaker, expectancy_r, expectancy_r_ci95, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
             mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b, fill_model, cost_model,
             expectancy_r_low, expectancy_r_high, is_trades, is_expectancy_r, is_r_low, oos_trades, oos_expectancy_r, oos_pass,
-            repaint_test)
-        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            repaint_test, dd_breaker_trips, dd_breaker_halted_at_end)
+        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(sha256, slot, bed) DO UPDATE SET trades=excluded.trades, wins=excluded.wins,
             losses=excluded.losses, win_rate=excluded.win_rate, expectancy_pips=excluded.expectancy_pips,
             expectancy_pips_breaker=excluded.expectancy_pips_breaker,
@@ -1436,13 +1440,15 @@ def write_score_row(conn, it, bed, r):
             expectancy_r_low=excluded.expectancy_r_low, expectancy_r_high=excluded.expectancy_r_high,
             is_trades=excluded.is_trades, is_expectancy_r=excluded.is_expectancy_r, is_r_low=excluded.is_r_low,
             oos_trades=excluded.oos_trades, oos_expectancy_r=excluded.oos_expectancy_r, oos_pass=excluded.oos_pass,
-            repaint_test=excluded.repaint_test
+            repaint_test=excluded.repaint_test, dd_breaker_trips=excluded.dd_breaker_trips,
+            dd_breaker_halted_at_end=excluded.dd_breaker_halted_at_end
     """, (it['sha256'], it['slot'], it['signal_type'], bed, r['trades'], r['wins'], r['losses'], r['win_rate'],
           r['expectancy_pips'], r.get('expectancy_pips_breaker'), r['expectancy_r'], r['expectancy_r_ci95'], r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
           f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b'],
           r.get('fill_model'), r.get('cost_model'), r.get('expectancy_r_low'), r.get('expectancy_r_high'),
           r.get('is_trades'), r.get('is_expectancy_r'), r.get('is_r_low'), r.get('oos_trades'),
-          r.get('oos_expectancy_r'), int(bool(r.get('oos_pass'))), r.get('repaint_test')))
+          r.get('oos_expectancy_r'), int(bool(r.get('oos_pass'))), r.get('repaint_test'),
+          r.get('dd_breaker_trips'), int(bool(r.get('dd_breaker_halted_at_end')))))
     conn.commit()
 
 LEADERBOARD_COLUMNS = (
@@ -1450,7 +1456,8 @@ LEADERBOARD_COLUMNS = (
     'oos_trades', 'oos_expectancy_r', 'oos_pass', 'expectancy_r', 'expectancy_r_ci95', 'expectancy_r_low',
     'expectancy_r_high', 'expectancy_pips', 'expectancy_pips_breaker', 'win_rate', 'profit_factor',
     'max_drawdown_pips', 'max_drawdown_pct', 'dd_breaker_skips', 'bridge_skips', 'continuation_trades',
-    'volume_skips', 'news_skips', 'symbols_traded', 'fill_model', 'cost_model', 'repaint_test')
+    'volume_skips', 'news_skips', 'symbols_traded', 'fill_model', 'cost_model', 'repaint_test',
+    'dd_breaker_trips', 'dd_breaker_halted_at_end')
 
 
 def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN_TRADES, holdout_from=HOLDOUT_FROM):
@@ -1506,7 +1513,8 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
                          bridge_skips=r['bridge_skips'], continuation_trades=r['continuation_trades'],
                          volume_skips=r['volume_skips'], news_skips=r['news_skips'],
                          symbols_traded=sum(1 for n in r['per_symbol'].values() if n),
-                         fill_model=r['fill_model'], cost_model=r['cost_model'], repaint_test=rp))
+                         fill_model=r['fill_model'], cost_model=r['cost_model'], repaint_test=rp,
+                         dd_breaker_trips=r['dd_breaker_trips'], dd_breaker_halted_at_end=r['dd_breaker_halted_at_end']))
     rows = leaderboard_order(rows, min_trades)
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = _csv.DictWriter(f, fieldnames=LEADERBOARD_COLUMNS, restval='')
