@@ -47,5 +47,21 @@ class StripComments(unittest.TestCase):
         self.assertNotIn('gone', out)
 
 
+class BuiltinCalls(unittest.TestCase):
+    def test_prefilter_keeps_exact_semantics(self):
+        import tempfile
+        code = ('double iRSI(int p){ return 0; }\n'            # a DEFINITION named like a built-in: not a call
+                'int OnInit(){ int h=iMA(NULL,0,14,0,MODE_SMA,PRICE_CLOSE); double c=MQL4_iCCI(NULL,0,14,0,0);'
+                ' double r=iRSI(5); return 0; }\n')
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / 'x.mq5'
+            f.write_text(code, encoding='utf-8')
+            stds = engine_core.analyze(f).standard_indicators
+        self.assertIn('iMA', stds)
+        self.assertIn('MQL4_iCCI', stds)
+        self.assertIn('iRSI', stds)            # called once besides its own definition
+        self.assertNotIn('iStochastic', stds)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -103,10 +103,17 @@ def logic_code(code: str) -> tuple[str,bool]:
     parts.append(code[pos:])
     return '\n'.join(parts), True
 
+def _builtin_call_regex():
+    names = sorted({n for base in BUILTINS for n in (base, 'MQL4_' + base)}, key=len, reverse=True)
+    return re.compile(r'\b(' + '|'.join(map(re.escape, names)) + r')\s*\(')
+
+
 def count_actual_calls(code: str, name: str) -> int:
     total=len(re.findall(r'\b'+re.escape(name)+r'\s*\(', code))
     defs=len(re.findall(r'(?m)^\s*(?:[\w:<>&*\[\]]+\s+)+'+re.escape(name)+r'\s*\([^;{}]*\)\s*\{', code))
     return max(0,total-defs)
+
+_BUILTIN_CALL = _builtin_call_regex()  # every built-in name and its MQL4_ twin, one alternation
 
 def extract_int_property(code: str, prop: str) -> int:
     m=re.search(r'#property\s+'+re.escape(prop)+r'\s+(\d+)', code, re.I)
@@ -471,9 +478,12 @@ def analyze(path: Path) -> Analysis:
     a.line_buffer_indices=sorted(line_idx)
     a.object_usage=bool(re.search(r'ObjectCreate\s*\(|OBJ_(?:HLINE|VLINE|TREND|RECTANGLE|TEXT|LABEL|ARROW|FIBO)',logic,re.I))
     stds=[]
+    # one pass finds which built-in names are called at all (P2 perf: the per-name scan over the whole file
+    # was ~60% of analysis time); the exact calls-minus-definitions count then runs only for those
+    called=set(_BUILTIN_CALL.findall(logic))
     for base in BUILTINS:
         for nm in (base,'MQL4_'+base):
-            if count_actual_calls(logic,nm)>0: stds.append(nm)
+            if nm in called and count_actual_calls(logic,nm)>0: stds.append(nm)
     a.standard_indicators=sorted(set(stds))
     deps=[]
     for m in re.finditer(r'\biCustom\s*\((.*?)\)',logic,re.I|re.S):
