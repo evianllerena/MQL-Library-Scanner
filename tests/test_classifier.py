@@ -24,6 +24,7 @@ class VolumeEvidence(unittest.TestCase):
         # Offline Converter rewrites MQL4 Volume[i] as MQL4_iVolume(i)
         self.assertTrue(engine_core.uses_volume('double v=(double)MQL4_iVolume(i);'))
         self.assertTrue(engine_core.uses_volume('x=MQL4_iOBV(NULL,0,PRICE_CLOSE,i);'))
+        self.assertTrue(engine_core.uses_volume('x=MQL4_iAD(NULL,0,i);'))
         self.assertFalse(engine_core.uses_volume('x=MQL4_iADX(NULL,0,14,PRICE_CLOSE,MODE_MAIN,i);'))
 
     def test_mqlrates_fields_applied_volume_and_volume_handles_are(self):
