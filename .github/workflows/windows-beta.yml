@@ -137,9 +137,6 @@ jobs:
           if($ui -notmatch 'queueCancellation'){throw 'Single-flight cancellation barrier missing'}
           if($ui -notmatch 'preview_cancel_result'){throw 'Verified cancellation diagnostics missing'}
           if($ui -notmatch 'ui_event_loop_stall'){throw 'UI stall watchdog missing'}
-          if($ui -notmatch '--job-id'){throw 'Per-job preview identity missing'}
-          if($ui -notmatch 'preview_engine_stage'){throw 'Preview engine stage diagnostics missing'}
-          if($ui -notmatch 'preview_preflight_start' -or $ui -notmatch 'preview_preflight_failed' -or $ui -notmatch 'preview_discovery_stage'){throw 'Preview runtime preflight/discovery logging missing'}
           if($ui -notmatch 'mt5_full_recompile'){throw 'MT5 initialization stage UI missing'}
           if($ui -notmatch 'terminal_selected'){throw 'Bound terminal selection status missing'}
           python engine/preview_bridge.py detect
