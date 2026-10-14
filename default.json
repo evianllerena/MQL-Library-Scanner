@@ -26,12 +26,6 @@
           "cmd": "binaries/mql-preview-control",
           "sidecar": true,
           "args": true
-        },
-        {
-          "name": "binaries/mql-preview-batch",
-          "cmd": "binaries/mql-preview-batch",
-          "sidecar": true,
-          "args": true
         }
       ]
     },
@@ -53,12 +47,6 @@
         {
           "name": "binaries/mql-preview-control",
           "cmd": "binaries/mql-preview-control",
-          "sidecar": true,
-          "args": true
-        },
-        {
-          "name": "binaries/mql-preview-batch",
-          "cmd": "binaries/mql-preview-batch",
           "sidecar": true,
           "args": true
         }

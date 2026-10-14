@@ -35,7 +35,8 @@ Conventions: additive only; `nnfx_engine.py` is the source of truth; MQL5 harnes
 - Continuation E6 default `vp_c2`: C2 flips back to the trade direction AND C1 currently on-side;
   ignores volume + 1xATR; sequence must be unbroken since entry. [USER-CONFIRMED]. Also `lesson11`
   (exit indicator as the signal) and `c1_signal` (legacy) as settings.
-- Exits: X1 (SL 1.5xATR, TP1 1xATR on half, breakeven, then trail) · X2 (exit indicator vs own
+- Exits: X1 (SL 1.5xATR, TP1 1xATR on half, breakeven, then trail; a D1 bar touching both SL and TP1
+  is resolved stop-first, the worse case, since the intrabar order is unknown) · X2 (exit indicator vs own
   zero_reference) · X3 (C1 flip) · X4 (wrong-side baseline close) · X5 (news; close if losing OR
   profit < 1xATR). [X5 cutoff USER-CONFIRMED]
 - Trailing T4: activates once a close is >= 2xATR beyond entry (ATR fixed at entry), then trails
@@ -47,9 +48,33 @@ Conventions: additive only; `nnfx_engine.py` is the source of truth; MQL5 harnes
   circuit breaker (resume when back under threshold). RANK with breaker OFF; show both
   breaker-off and breaker-on expectancy + max_drawdown_pct as a risk column. [USER-CONFIRMED]
 
+- Execution model (P1.1 / P1.3 / P1.7, owner decisions 2026-10-14: 1B, 3A): every order decided on a
+  close (entries; C1-flip / X2 / X4 / X5 exits) fills at the NEXT bar's open, like the MQL5 harness;
+  SL/TP1 are measured from that fill with the signal bar's ATR. An entry on the last bar cannot fill
+  (`skip:no_next_bar`). A stop the bar opens through fills at the open (gap); TP1 is a limit and fills
+  at its level. Costs: flat round trip = spread + 0.7 pip commission (spread 1.0 majors / 2.0 crosses),
+  half charged on every fill, against the trade. Extracts without an `open` column (pre-P1) are scored
+  with the legacy close fill and labelled `fill_model=close (legacy extract...)`. Part C fixtures keep
+  the legacy fill explicitly (`P()`); the model has its own checks (142/142).
+
+- Leaderboard statistics (P1.4, owner decision 2026-10-14: 2A holdout). Trades belong to the scoring
+  window by entry date (halves paired). Trades entered before 2024-01-01 are in-sample, from it on
+  out-of-sample (`--holdout-from`). Ranking per slot: enough in-sample trades (>= 30) first; then
+  candidates that ALSO made money out-of-sample (`oos_pass`); then by the BOTTOM of the in-sample 95%
+  R range (`is_r_low`). The R range is a cluster bootstrap by entry month (correlated pairs), not
+  1.96 x stdev / sqrt(n). Pips drawdown is chronological across the basket; profit factor is blank
+  (not 999) with no losing trades. A range needs >= 12 entry-months; `oos_pass` needs >= 20
+  out-of-sample trades (PROVISIONAL default, awaiting owner confirmation).
+  FOLLOW-UP (P2, app): the desktop app's board (lib.rs db_query) still orders by trades >= 30 then
+  expectancy_pips and does not read is_trades / oos_pass / is_r_low -- the CSV leaderboard is the
+  reference until that is changed.
+
 ## Open / STUB-TO-CONFIRM (working defaults in place; confirm against VP's videos)
 - E4 scope: implemented C1-OR-C2 symmetric. Source unclear; revisit if VP restricts it.
-- dd_resume_rule: `below_threshold` (resume when drawdown back under 10%). Confirm.
+- dd_resume_rule: DECIDED 2026-10-14 (owner delegated it to the agent): `below_threshold_or_cooldown`
+  -- resume when the drawdown is back under 10% OR after 20 trading days, re-basing the breaker's
+  reference to the balance then. `below_threshold` alone halted a flat account for good (realized
+  equity cannot recover without trades). Results report dd_breaker_trips / dd_breaker_halted_at_end.
 (X5 cutoff and Decision #5 are now confirmed above.)
 
 ## Out of scope (recorded so they're not mistaken for missing work)
@@ -57,8 +82,14 @@ Multi-timeframe (we are Daily only), rollover windows, M6/M7 shared exposure, D1
 filter, three-EA architecture, broker lot rounding, hedging/netting. EA-only; do not build.
 
 ## Known divergences (see BACKLOG.md)
-- MQL5 harness can re-enter on the same bar it exits; Python never does. Align in Fix 8.
+- Same-bar re-entry: ALIGNED (Fix 8) -- the harness no longer enters on a bar a position closed on.
+- Harness trade safety (P0.5): both halves or nothing, failed closes retried, no forced min-lot
+  halves, hedging-account check, restart recovery by MagicNumber, TP1 only on a real TP fill, pip
+  size per symbol. Compiles 0/0; a Strategy Tester run is still to be done.
 - MQL5 harness breaker/`max_drawdown_pct` is per-symbol; Python is one account across symbols.
+- Entry price: ALIGNED (P1.7). Python used to enter at the signal close; it now fills at the next open
+  like the harness. The harness needs no change: it already trades at the new bar's first tick, and the
+  Strategy Tester applies spread, commission and gaps natively.
 
 ## Biggest open workstream (NOT a code fix)
 Data history: MT5 serves ~455 daily bars/symbol => 5-40 trades per candidate => rankings are

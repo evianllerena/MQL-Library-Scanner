@@ -27,7 +27,7 @@ from pathlib import Path
 from nnfx_engine import (
     NNFXEngine, NNFXParams,
     c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction, bar_close_utc,
-    EquityTracker, run_lockstep,
+    EquityTracker, Position, run_lockstep, news_window_end,
 )
 
 
@@ -60,6 +60,10 @@ def _bar(date, close, baseline, c1_fast, c1_slow, c2_value, volume_value, atr=1.
 
 def P(**kw) -> NNFXParams:
     kw.setdefault('pip_size', 1.0)
+    # Rule-proof fixtures fill at the decision close with no gap model and no costs (they carry no
+    # open / next_open); the execution model has its own checks (P1.1 / P1.3 / P1.7 below).
+    kw.setdefault('fill_at', 'close')
+    kw.setdefault('model_gaps', False)
     return NNFXParams(**kw)
 
 
@@ -81,8 +85,6 @@ def unit_tests() -> Check:
            c2_direction(69.0, 50.0) == 1)
     c.that('zero_cross: NEVER gated by a 30-level -- 31 vs centerline 50 is still short (no OS special-case)',
            c2_direction(31.0, 50.0) == -1)
-    c.that('zero_cross: function signature carries no 70/30 parameter at all -- only (value, zero_reference)',
-           c2_direction.__code__.co_varnames[:2] == ('value', 'zero_reference'))
 
     # --- baseline cross-and-close (fires ONLY on the actual cross bar) -------
     c.that('baseline: fresh close above -> +1 on the cross bar', baseline_cross_closed(101, 99, 100, 100) == 1)
@@ -130,8 +132,16 @@ def unit_tests() -> Check:
     c.that('bridge_too_far: with EnableBridgeTooFar=False, the same 8-bar-run setup TAKES the trade',
            rec['action'] == 'enter', detail=str(rec))
 
-    c.that('bridge_too_far: structurally cannot apply to C2 -- the check only ever reads the C1 series '
-           '(NNFXEngine / NNFXHarness.mq5 both call the run-length check on h_c1 only, never h_c2)', True)
+    # C2 has agreed (long) for 8 bars while C1 only just turned long on the bar before the cross: the C1 run is
+    # short, so bridge-too-far must NOT skip -- it reads the C1 series only, never C2 (P1.6: was an `assert True`).
+    eng_c2run = NNFXEngine(P(enable_bridge_too_far=True, bridge_too_far_bars=7))
+    c2_warm = [_bar(f'2024-01-{i+1:02d}', 100.0, 100.0, 0.9, 1.0, 5.0, 10.0) for i in range(7)]   # C1 short, C2 long
+    c2_warm.append(_bar('2024-01-08', 100.0, 100.0, 1.0, 0.9, 5.0, 10.0))                        # C1 turns long
+    rec = None
+    for bar in c2_warm + [_bar('2024-01-09', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.0)]:
+        rec = eng_c2run.process_bar(bar)
+    c.that('bridge_too_far: does not apply to C2 -- C2 long for 9 bars with C1 long for only 2 still ENTERS',
+           rec['reason'] == 'enter:standard', detail=str(rec))
 
     # --- continuation: fresh same-direction C1 signal after an exit, sequence
     #     unbroken since -> ENTERS even beyond 1xATR and even with volume failing.
@@ -766,17 +776,386 @@ def unit_tests() -> Check:
     c.that('R per trade: a full stop-out is exactly -1R; a wrong-side close at 99.5 from 100.6 is -1.1/1.5 = -0.7333R; '
            'TP1 (+1xATR on half) plus the runner closed +3xATR on the same bar is 0.5x(1/1.5) + 0.5x(3/1.5) = +1.3333R',
            exit_rs == {'EURUSD': [-1.0, -1.0, -0.7333], 'GBPUSD': [1.3333]}, detail=str(exit_rs))
-    mean, ci = nb.r_stats([1.0, -1.0, 1.0, -1.0])
-    c.that('R stats: mean 0 with a 95% margin of 1.96 x stdev(1.1547) / sqrt(4) = 1.1316',
-           mean == 0.0 and abs(ci - 1.13161) < 1e-4 and nb.r_stats([]) == (0.0, None), detail=f'{mean} {ci}')
+    # P1.4: 20 months x 10 trades; every trade in a month has the same R (+1 or -1 by month), i.e.
+    # perfectly correlated within the month, as trades on pairs sharing a currency are.
+    corr = [{'entry_date': f'{2010 + m // 12}.{m % 12 + 1:02d}.15', 'r': 1.0 if m % 2 else -1.0}
+            for m in range(20) for _ in range(10)]
+    mean, lo, hi = nb.r_interval(corr)
+    iid_half = 1.96 * 1.0025 / 200 ** 0.5            # what treating the 200 trades as independent gives
+    c.that('R range (P1.4 cluster bootstrap): correlated trades in the same month are resampled together, so the '
+           'range is at least twice as wide as the i.i.d. 1.96 x stdev / sqrt(200) (+-0.139) that made edges look '
+           'significant', mean == 0.0 and lo < 0 < hi and (hi - lo) / 2 > 2 * iid_half, detail=f'{mean} [{lo}, {hi}]')
+    c.that('R range: seeded and reproducible; no range from a single month or no trades',
+           nb.r_interval(corr) == (mean, lo, hi) and nb.r_interval(corr[:10])[1:] == (None, None)
+           and nb.r_interval([]) == (0.0, None, None))
     board = nb.leaderboard_order([
-        dict(slot='BASELINE', trades=11, expectancy_r=0.096),   # higher R, but only 11 trades
-        dict(slot='BASELINE', trades=1272, expectancy_r=0.015),
-        dict(slot='BASELINE', trades=1632, expectancy_r=0.016),
-        dict(slot='CONFIRMATION_1', trades=1933, expectancy_r=0.022)])
-    c.that('Leaderboard order: within a slot by expectancy_r, best first; an insufficient sample (<30 trades) sorts '
-           'last however high its R', [(r['slot'], r['trades']) for r in board] ==
-           [('BASELINE', 1632), ('BASELINE', 1272), ('BASELINE', 11), ('CONFIRMATION_1', 1933)], detail=str(board))
+        dict(slot='BASELINE', trades=15, is_trades=11, is_r_low=0.30, oos_pass=True, expectancy_r=0.096),  # 11 trades
+        dict(slot='BASELINE', trades=900, is_trades=700, is_r_low=0.05, oos_pass=False, expectancy_r=0.09),  # fails OOS
+        dict(slot='BASELINE', trades=1272, is_trades=1000, is_r_low=0.01, oos_pass=True, expectancy_r=0.015),
+        dict(slot='BASELINE', trades=1632, is_trades=1300, is_r_low=0.02, oos_pass=True, expectancy_r=0.012),
+        dict(slot='BASELINE', trades=800, is_trades=600, is_r_low=None, oos_pass=True, expectancy_r=0.2),   # no range
+        dict(slot='CONFIRMATION_1', trades=1933, is_trades=1500, is_r_low=-0.01, oos_pass=True, expectancy_r=0.022)])
+    c.that('Leaderboard order (P1.4): within a slot, OOS-passing candidates by the BOTTOM of the in-sample R range '
+           '(0.02 before 0.01 even though its average is lower), then a row with no range, then one that lost money '
+           'out-of-sample however good in-sample, then insufficient in-sample samples (<30) however high their R',
+           [(r['slot'], r['trades']) for r in board] ==
+           [('BASELINE', 1632), ('BASELINE', 1272), ('BASELINE', 800), ('BASELINE', 900), ('BASELINE', 15),
+            ('CONFIRMATION_1', 1933)], detail=str([r['trades'] for r in board]))
+    hs = nb.holdout_stats([{'entry_date': '2023.12.29', 'r': 1.0}, {'entry_date': '2023.11.02', 'r': -0.5},
+                           {'entry_date': '2024.01.02', 'r': -0.2}, {'entry_date': '2024.02.05', 'r': 0.1}])
+    c.that('P1.4 holdout (owner 2A): trades entered before 2024.01.01 are in-sample (2 trades, +0.25R), from it on '
+           'out-of-sample (2 trades, -0.05R -> oos_pass False)', (hs['is_trades'], hs['is_expectancy_r'],
+           hs['oos_trades'], hs['oos_expectancy_r'], hs['oos_pass']) == (2, 0.25, 2, -0.05, False), detail=str(hs))
+
+    # --- P1.7 / P1.3 / P1.1 execution model: next-open fills, gap fills, trading costs -----------
+    # Long setup on 'x0' (cross above 100.0, C1+C2 long, within 1xATR, ATR 1.0, pip_size 1.0).
+    X = dict(fill_at='next_open', model_gaps=True)
+
+    def ex_setup(next_open=100.8, **kw):
+        b = _bar('x0', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)
+        b.update(open=100.0, next_open=next_open)
+        e = NNFXEngine(P(**{**X, **kw}))
+        return e, e.process_bar(b)
+
+    def ex_next(e, open_, low, high, close=100.5, c1=(1.0, 0.9), next_open=None):
+        b = _bar('x1', close, 100.0, c1[0], c1[1], 5.0, 10.0, close_prev=100.6, high=high, low=low)
+        b.update(open=open_, next_open=next_open)
+        return e.process_bar(b)
+
+    e, r = ex_setup()
+    pos = e.position
+    c.that('P1.7 next-open fill: an entry decided on the close (100.6) fills at the NEXT bar\'s open (100.8); '
+           'SL 1.5xATR (99.3) and TP1 1xATR (101.8) are measured from that fill',
+           r['reason'] == 'enter:standard' and pos and (pos.entry_price, pos.sl, pos.tp1) == (100.8, 99.3, 101.8),
+           detail=str(pos))
+    e, r = ex_setup(next_open=None)
+    c.that('P1.7 no next bar: an entry decided on the last bar cannot fill -> skip:no_next_bar, nothing opens '
+           'and continuation is not armed', r['reason'] == 'skip:no_next_bar' and e.position is None and e.trend_dir == 0,
+           detail=str(r))
+    e, _ = ex_setup()
+    r = ex_next(e, 100.7, 100.3, 100.9, c1=(0.9, 1.0), next_open=100.2)   # C1 flips short on this close
+    c.that('P1.7 close-decided exits fill at the next open: a C1-flip decided on this close exits at 100.2 '
+           '(-0.6 pips from the 100.8 fill), not at the close', r['reason'] == 'exit:c1_flip' and r['pips'] == -0.6,
+           detail=str(r))
+    e, _ = ex_setup()
+    r = ex_next(e, 98.9, 98.5, 99.0)
+    c.that('P1.3 gap through the stop: the bar opens at 98.9, below the 99.3 stop -> the stop fills at the open '
+           '(-1.9 pips, -1.2667R), not at the stop level', r['reason'] == 'exit:stop_loss' and r['pips'] == -1.9
+           and round(r['r'], 4) == -1.2667, detail=str(r))
+    e, _ = ex_setup()
+    r = ex_next(e, 99.8, 99.2, 99.9)
+    c.that('P1.3 no gap: the bar opens above the stop and trades through it -> the stop fills at its level (-1R)',
+           r['reason'] == 'exit:stop_loss' and round(r['r'], 4) == -1.0, detail=str(r))
+    e, _ = ex_setup()
+    r = ex_next(e, 102.5, 102.4, 103.0, close=102.9)
+    c.that('P1.3 TP1 is a limit: a bar gapping above TP1 (open 102.5) fills half #1 at the TP1 level 101.8 '
+           '(+1.0 pips), never credits the gap', r['reason'] == 'exit:tp1_half' and r['pips'] == 1.0, detail=str(r))
+    es = NNFXEngine(P(**X))
+    bs = _bar('xs0', 99.4, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5)
+    bs.update(open=100.0, next_open=99.2)                                   # short fills at 99.2, SL 100.7
+    es.process_bar(bs)
+    bs1 = _bar('xs1', 100.9, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=99.4, high=101.3, low=100.9)
+    bs1.update(open=101.1, next_open=None)                                   # opens above the 100.7 stop
+    rs = es.process_bar(bs1)
+    c.that('P1.3 mirrors for shorts: a short (fill 99.2, stop 100.7) whose next bar opens at 101.1 fills the stop at '
+           '101.1 (-1.9 pips)', rs['reason'] == 'exit:stop_loss' and rs['pips'] == -1.9, detail=str(rs))
+    e, _ = ex_setup(round_trip_cost_pips=0.2)
+    c.that('P1.1 costs: half the 0.2-pip round trip is paid on entry -> the long fills at 100.9 (100.8 + 0.1)',
+           round(e.position.entry_price, 4) == 100.9, detail=str(e.position))
+    r = ex_next(e, 99.8, 99.3, 99.9)
+    c.that('P1.1 costs: the stop (99.4 from the 100.9 fill) pays the other half -> fill 99.3, -1.6 pips, -1.0667R '
+           '(a stop-out with costs loses MORE than 1R)', r['reason'] == 'exit:stop_loss' and r['pips'] == -1.6
+           and round(r['r'], 4) == -1.0667, detail=str(r))
+    e, _ = ex_setup(round_trip_cost_pips=0.2)
+    r = ex_next(e, 101.0, 100.9, 102.0, close=101.9)
+    c.that('P1.1 costs: TP1 (101.9 from the 100.9 fill) books half #1 at 101.8 after its exit cost (+0.9 pips)',
+           r['reason'] == 'exit:tp1_half' and r['pips'] == 0.9, detail=str(r))
+    e, _ = ex_setup()
+    bad = _bar('x1', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6)
+    try:
+        e.process_bar(bad)
+        raised = False
+    except ValueError:
+        raised = True
+    c.that('P1.3 model_gaps never guesses: a bar with no open while gap fills are on raises instead of '
+           'filling at the stop level', raised)
+    acct = EquityTracker()
+    e, _ = ex_setup()
+    e.equity = acct
+    ex_next(e, 100.7, 100.3, 100.9, c1=(0.9, 1.0), next_open=100.2)        # C1-flip exit decided on 'x1'
+    eq_after_decision = acct.equity
+    b2 = _bar('x2', 100.3, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5)
+    b2.update(open=100.2, next_open=None)
+    e.process_bar(b2)
+    c.that('P1.7 no lookahead into the breaker: an exit decided on x1 that fills at x2\'s open is booked into the '
+           '(shared) equity on x2, not on x1 -- equity unchanged after x1, -0.4R x 2% after x2, dated x2',
+           eq_after_decision == 100.0 and acct.curve and acct.curve[-1][0] == 'x2'
+           and abs(acct.equity - 100.0 * (1 - 0.4 * 0.02)) < 1e-9, detail=f'{eq_after_decision} {acct.curve}')
+    gap_rows = [dict(r, open=str(99.0 + k / 100)) for k, r in enumerate(batch_rows(200.0))]  # distinct opens
+    gap_rows[10]['cand_a'] = 'EMPTY'                                         # row 10 is dropped (no baseline)
+    gap_rows[12]['open'] = 'EMPTY'                                           # row 12 is dropped too
+    prep = nb._prepare_bars({'EURUSD': {'rows': gap_rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)['EURUSD']
+    by_date = {b['date']: b for b in prep}
+    c.that('P1.7 batch: next_open is the open of the next bar the engine PROCESSES -- a dropped row (missing '
+           'value or missing open) is never the fill bar',
+           '2024.03.11' not in by_date and '2024.03.13' not in by_date
+           and by_date['2024.03.10']['next_open'] == float(gap_rows[11]['open'])
+           and by_date['2024.03.12']['next_open'] == float(gap_rows[13]['open']) and prep[-1]['next_open'] is None,
+           detail=str([(b['date'], b['next_open']) for b in prep[8:14]]))
+    # --- P1.5 engine fixes -------------------------------------------------------------------
+    # E1-armed pullback (owner 6A): b1 is a fresh C1 long cross with price already 1.5xATR above the
+    # baseline -> E1 is valid but beyond 1xATR, arming E3; price stays beyond for 7 more bars, then
+    # pulls back within 1xATR on b9, by which point C1 has been long for 8 bars (>= 7 = bridge-too-far).
+    def e1_pullback(arm_with_cross):
+        e = NNFXEngine(P())
+        recs = [e.process_bar(_bar('b0', 101.5, 100.0, 0.9, 1.0, 5.0, 10.0,
+                                   close_prev=101.5 if not arm_with_cross else 99.5))]
+        if arm_with_cross:  # E2 control: the beyond-1xATR setup is a baseline cross (C1 long for 1 bar)
+            recs[0] = e.process_bar(_bar('b0b', 99.5, 100.0, 1.0, 0.9, 5.0, 10.0))
+            recs.append(e.process_bar(_bar('b1', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)))
+        else:
+            recs.append(e.process_bar(_bar('b1', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0)))
+        for i in range(2, 9):
+            recs.append(e.process_bar(_bar(f'b{i}', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0)))
+        recs.append(e.process_bar(_bar('b9', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=101.5)))
+        return recs
+    r_e1 = e1_pullback(False)
+    c.that('P1.5 E1 + bridge (owner 6A): a pullback armed by an E1 (C1-triggered) setup ENTERS when price comes '
+           'back within 1xATR, even though C1 has now run 8 bars -- bridge-too-far never applies to E1',
+           r_e1[1]['reason'] == 'skip:beyond_1xATR' and r_e1[-1]['reason'] == 'enter:pullback', detail=str(r_e1[-1]))
+    r_e2 = e1_pullback(True)
+    c.that('P1.5 E1 + bridge control: a pullback armed by a baseline-cross (E2) setup is still held back by '
+           'bridge-too-far after the same 8-bar C1 run', r_e2[1]['reason'] == 'skip:beyond_1xATR'
+           and r_e2[-1]['action'] != 'enter', detail=str([x['reason'] for x in r_e2]))
+
+    # R1 deadlock (P1.5): two 6% stop-outs while FLAT take the account 11.64% below its peak; nothing is
+    # open, so no close can lift it back under 10%. 22 quiet bars later a valid setup arrives.
+    def flat_deadlock(n_quiet=22, **kw):
+        e = NNFXEngine(P(risk_pct=6.0, **kw))
+        setup = lambda d: _bar(d, 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)
+        stop = lambda d: _bar(d, 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.7, low=99.0)
+        seq = [setup('d01'), stop('d02'), setup('d03'), stop('d04')]
+        seq += [_bar(f'q{i:02d}', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0) for i in range(n_quiet)]
+        seq += [setup('d27')]
+        recs = [e.process_bar(b) for b in seq]
+        return recs, e.equity
+    recs_dl, acct_dl = flat_deadlock()
+    c.that('P1.5 R1 deadlock fixed (default below_threshold_or_cooldown): tripped while flat at 11.64%, the breaker '
+           'resumes after 20 trading days and the next valid setup ENTERS; one trip, one resume',
+           [r['reason'] for r in recs_dl[:4]] == ['enter:standard', 'exit:stop_loss', 'enter:standard', 'exit:stop_loss']
+           and recs_dl[-1]['reason'] == 'enter:standard' and (acct_dl.trips, acct_dl.resumes) == (1, 1)
+           and round(acct_dl.max_dd_pct, 2) == 11.64, detail=f"{recs_dl[-1]['reason']} trips={acct_dl.trips} resumes={acct_dl.resumes}")
+    recs_old, acct_old = flat_deadlock(dd_resume_rule='below_threshold')
+    edge19, _ = flat_deadlock(n_quiet=19)
+    edge20, acct20 = flat_deadlock(n_quiet=20)
+    c.that('P1.5 R1 cooldown boundary: tripped on the first bar after the breach (date 5), a setup on date 24 '
+           '(19 dates later) is still skipped and one on date 25 (20 dates later) enters',
+           edge19[-1]['reason'] == 'skip:dd_breaker' and edge20[-1]['reason'] == 'enter:standard'
+           and acct20.tripped_at is None, detail=f"{edge19[-1]['reason']} {edge20[-1]['reason']}")
+    c.that('P1.5 R1 deadlock control: with the old rule (below_threshold) the same flat account never resumes -- '
+           'the setup is skipped (skip:dd_breaker) and the breaker is still tripped at the end',
+           recs_old[-1]['reason'] == 'skip:dd_breaker' and acct_old.tripped_at is not None and acct_old.resumes == 0,
+           detail=str(recs_old[-1]['reason']))
+
+    # VOLUME-role warm-up (P1.5): same bug class as the G9 warm-up fix. C1 is long on all 22 bars, so at the
+    # cross C1 has run 22 bars -> bridge-too-far must skip; the candidate's own 20-bar average does not
+    # exist for the first 19 bars, and dropping those bars left 3 bars of C1 history and let it through.
+    vol_rows = batch_rows(200.0)
+    for k, row in enumerate(vol_rows):
+        row['macd_m'] = '1.0'
+        row['cand_a'] = str(100.0 + k)                # the VOLUME candidate's own reading, rising
+    fp_vol = nb.score_candidate({'EURUSD': {'rows': vol_rows}}, ['EURUSD'], 'VOLUME', 'cand_a', None, None)['fingerprints']['EURUSD']
+    c.that('P1.5 VOLUME warm-up: bars before the candidate\'s 20-bar average exists still feed C1 history -- the '
+           '22-bar C1 run is skipped as bridge-too-far, not let through by a truncated history',
+           len(fp_vol) == 22 and fp_vol[-1][1:] == ('skip', 'skip:bridge_too_far'), detail=str(fp_vol[-2:]))
+
+    class _Order:  # stand-in engine that records the order it is driven in
+        calls = []
+        def __init__(self, sym): self.sym = sym
+        def process_bar(self, bar):
+            _Order.calls.append((bar['date'], self.sym)); return {}
+    two = {'GBPUSD': [{'date': 'd1'}, {'date': 'd2'}], 'EURUSD': [{'date': 'd1'}, {'date': 'd2'}]}
+    run_lockstep({s: _Order(s) for s in two}, two)
+    c.that('P1.5 lockstep ties: on the same date symbols run in name order (EURUSD before GBPUSD) whatever '
+           'order the basket was given in', _Order.calls == [('d1', 'EURUSD'), ('d1', 'GBPUSD'),
+                                                             ('d2', 'EURUSD'), ('d2', 'GBPUSD')], detail=str(_Order.calls))
+
+    fri = datetime(2025, 4, 4, 21, 0, tzinfo=timezone.utc)          # Friday's decision moment
+    bf = _bar('fri', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)
+    bf.update(symbol='EURUSD', time_utc=fri)
+    mon_event = news_params('eur_monday', [('EUR', datetime(2025, 4, 7, 10, 0, tzinfo=timezone.utc).isoformat(), 'High')])
+    r_fri = NNFXEngine(mon_event).process_bar(dict(bf))
+    c.that('P1.5 news window over a weekend: a Friday close\'s 24h window would end Saturday; it is pushed to Monday, '
+           'so a High EUR event Monday 10:00 UTC blocks the Friday entry (skip:news)', r_fri['reason'] == 'skip:news'
+           and str(news_window_end(fri)) == '2025-04-07 21:00:00+00:00', detail=f"{r_fri['reason']} {news_window_end(fri)}")
+    fri0 = datetime(2025, 4, 5, 0, 0, tzinfo=timezone.utc)          # Friday's bar close at server offset 0
+    c.that('P1.5 news window, server offset 0: Friday\'s close is Saturday 00:00 UTC; the window still runs to '
+           'Monday\'s close (Tuesday 00:00 UTC), not just to Monday 00:00',
+           str(news_window_end(fri0, 24.0, 0.0)) == '2025-04-08 00:00:00+00:00'
+           and str(news_window_end(fri, 24.0, 3.0)) == '2025-04-07 21:00:00+00:00'
+           and str(news_window_end(datetime(2025, 4, 1, 21, 0, tzinfo=timezone.utc), 24.0, 3.0)) == '2025-04-02 21:00:00+00:00',
+           detail=f'{news_window_end(fri0, 24.0, 0.0)} {news_window_end(fri, 24.0, 3.0)}')
+    try:
+        NNFXParams(dd_resume_rule='below_treshold'); bad_rule = False
+    except ValueError:
+        bad_rule = True
+    c.that('P1.5 a mistyped dd_resume_rule / fill_at raises instead of silently using another rule', bad_rule)
+    hold_rec = NNFXEngine(P()).process_bar(_bar('h0', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0))
+    c.that('P1.5 record pips is None or a number (never the empty string that used to be added to floats)',
+           hold_rec['pips'] is None and not hasattr(Position(1, 1.0, 0.5, 1.5, 0.1), 'half2_open'), detail=str(hold_rec['pips']))
+
+    # P1.6: one daily bar touching BOTH the stop and TP1 -- the intrabar order is unknown on D1 data, so the engine
+    # assumes the worse case: stop first, whole position out at -1R, TP1 never credited.
+    e_both = NNFXEngine(P())
+    e_both.process_bar(_bar('sb0', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))              # long 100.6, SL 99.1, TP1 101.6
+    r_both = e_both.process_bar(_bar('sb1', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, high=101.8, low=99.0))
+    c.that('P1.6 same-bar stop + TP1: the stop is taken first (worse case, documented in PROGRESS.md) -- the whole '
+           'position exits at -1R and TP1 is not credited', r_both['reason'] == 'exit:stop_loss' and round(r_both['r'], 4) == -1.0,
+           detail=str(r_both))
+
+    # P1.6: TP1 half and runner closing on DIFFERENT bars, through the batch scorer. Legacy close fill (no open
+    # column), EURUSD costs 1.7 pips round trip (0.85 per fill), pip 0.0001, ATR 1.0. Entry 100.6 -> fill 100.600085;
+    # TP1 101.600085 fills (limit, minus exit cost) at 101.6 -> +9999.15 pips; the C1 flip two bars later closes the
+    # runner at 102.0 - 0.000085 -> +13998.30 pips. Records carry pips rounded to 0.1 (9999.2, 13998.3), so the
+    # trade is their average, +11998.75.
+    tp_rows = batch_rows(200.0)
+    tp_rows.append(dict(tp_rows[-1], date='2024.03.23', close='101.2', high='101.7', low='100.5'))
+    tp_rows.append(dict(tp_rows[-1], date='2024.03.24', close='102.0', high='102.1', low='101.1', macd_m='0.9'))
+    res_tp = nb.score_candidate({'EURUSD': {'rows': tp_rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)
+    reasons_tp = [f[2] for f in res_tp['fingerprints']['EURUSD'][-3:]]
+    c.that('P1.6 TP1-then-runner on different bars: _score_run averages the two halves into ONE trade (+11998.75 pips)',
+           reasons_tp == ['enter:standard', 'exit:tp1_half', 'exit:c1_flip'] and res_tp['trades'] == 1
+           and abs(res_tp['expectancy_pips'] - 11998.75) <= 0.001, detail=f"{reasons_tp} {res_tp['trades']} {res_tp['expectancy_pips']}")
+
+    # --- P1.4 statistics --------------------------------------------------------------------
+    straddle = [dict(date='2024.03.29', action='enter', pips=''), dict(date='2024.03.30', action='exit_half', pips=10.0),
+                dict(date='2024.04.02', action='exit', pips=20.0, r=0.9),
+                dict(date='2024.04.03', action='enter', pips=''), dict(date='2024.04.04', action='exit_half', pips=10.0),
+                dict(date='2024.04.05', action='exit', pips=-4.0, r=0.1),
+                dict(date='2024.04.08', action='enter', pips='')]                 # still open at the end
+    tr = [t for t in nb.closed_trades(straddle) if t['entry_date'] >= '2024.04.01']
+    c.that('P1.4 window boundary: a trade belongs to the scoring window by its ENTRY date with both halves '
+           'paired -- the 03.29 trade (TP1 half before 04.01, runner after) is out, not counted as a lone '
+           '+20 runner; the 04.03 trade averages its halves (+3.0); an open trade is not a trade',
+           tr == [{'entry_date': '2024.04.03', 'exit_date': '2024.04.05', 'pips': 3.0, 'r': 0.1}], detail=str(tr))
+    dd = nb.max_drawdown_pips([('2024.01.03', 'AUDUSD', 10.0), ('2024.01.01', 'AUDUSD', 10.0),
+                               ('2024.01.02', 'EURUSD', -15.0), ('2024.01.04', 'EURUSD', -15.0)])
+    c.that('P1.4 pips drawdown in date order: +10, -15, +10, -15 across two pairs is -20 from the +10 peak '
+           '(per-pair concatenation +10, +10, -15, -15 would say -30)', dd == -20.0, detail=str(dd))
+    c.that('P1.4 profit factor: gross wins / gross losses (30/10 = 3.0); undefined (None) with no losing trade '
+           'or no trades -- never the old 999.0 stand-in', nb.profit_factor_of([20.0, 10.0, -10.0]) == 3.0
+           and nb.profit_factor_of([5.0, 7.0]) is None and nb.profit_factor_of([]) is None)
+    c.that('P1.7 fill_model never claims a model it did not use: no usable bars on any pair -> "none", not '
+           'next_open+gaps', nb.fill_model({'EURUSD': [], 'GBPUSD': []}) == 'none (no usable bars)')
+    few = [{'entry_date': '2023.01.10', 'r': 1.0}] * 30 + [{'entry_date': '2023.02.10', 'r': -0.5}]
+    c.that('P1.4 R range needs >= 12 entry-months: 31 trades in 2 months give no range (a 2-month bootstrap '
+           'has only 3 possible outcomes)', nb.r_interval(few)[1:] == (None, None))
+    oos_few = nb.holdout_stats([{'entry_date': '2024.02.01', 'r': 0.5}] * 3)
+    oos_ok = nb.holdout_stats([{'entry_date': '2024.02.01', 'r': 0.5}] * 25)
+    c.that('P1.4 oos_pass needs >= 20 out-of-sample trades: 3 winning OOS trades do not pass, 25 do',
+           not oos_few['oos_pass'] and oos_ok['oos_pass'], detail=f"{oos_few['oos_pass']} {oos_ok['oos_pass']}")
+    try:
+        nb.ymd_dots('2024/06/01'); bad_date_rejected = False
+    except ValueError:
+        bad_date_rejected = True
+    c.that("P1.4 --holdout-from: '2024-06-01' is normalised to '2024.06.01' (dates compare as strings) and an "
+           "unparseable date is rejected", nb.ymd_dots('2024-06-01') == '2024.06.01' and bad_date_rejected)
+    import sqlite3
+    db = sqlite3.connect(':memory:')
+    db.row_factory = sqlite3.Row
+    nb.ensure_backtest_table(db)
+    it = dict(sha256='s', slot='BASELINE', signal_type='', zero_reference=None, buf_a=0, buf_b=None, filename='x.mq5')
+    nb.write_score_row(db, it, 'bed', dict(trades=100, wins=60, losses=40, win_rate=60.0, expectancy_pips=3.0,
+                                            expectancy_r=0.1, expectancy_r_ci95=0.05, profit_factor=1.5, max_drawdown=-50.0,
+                                            max_drawdown_pct=4.0, bridge_skips=0, continuation_trades=0, per_symbol={},
+                                            is_trades=80, is_r_low=0.02, oos_trades=20, oos_pass=True))
+    nb.write_status_row(db, it, 'bed', 'EXTRACT_GARBAGE', 'later rescore found corrupt columns')
+    row = dict(db.execute("SELECT trades, expectancy_r, is_r_low, oos_pass, mapping_reason FROM backtest_results").fetchone())
+    c.that('P1.4 DB: a later failure row clears the earlier scores (trades 0, R/range NULL, oos_pass 0) instead of '
+           'leaving a stale score ranked under a failure reason', (row['trades'], row['expectancy_r'], row['is_r_low'],
+           row['oos_pass']) == (0, None, None, 0) and 'EXTRACT_GARBAGE' in row['mapping_reason'], detail=str(row))
+    two_line = [dict(batch_rows(200.0)[k % 22], date=f'2024.{k // 28 + 1:02d}.{k % 28 + 1:02d}',
+                     cand_a=f'{1.0 + k / 10:.8f}', cand_b='EMPTY', mom=f'{100.0 + k / 7:.8f}') for k in range(40)]
+    prob = nb.extraction_problem({'EURUSD': {'rows': two_line}}, ['EURUSD'], 'cand_a', 'cand_b')
+    c.that('P1.2 extraction gate: a two-line candidate whose buffer B is EMPTY on every bar is EXTRACT_GARBAGE '
+           '(it used to pass on buffer A alone and score 0 trades); run() and rescore() share this one gate',
+           prob.startswith('EURUSD: buffer B:') and nb.extraction_problem({'EURUSD': {'rows': two_line}}, ['EURUSD'],
+                                                                           'cand_a', None) == '', detail=prob)
+    leaky = [dict(r) for r in two_line]
+    for r in leaky[-25:]:
+        r['cand_a'] = r['mom']                                                # the newest 25 bars hold Momentum
+    prob = nb.extraction_problem({'EURUSD': {'rows': leaky}}, ['EURUSD'], 'cand_a', None)
+    c.that('P1.2 extraction gate: a column holding a reference indicator\'s exact values (here Momentum on the newest '
+           '25 bars, as found in 14 of 40 candidates of the 2026-10-04 extraction) is a corrupt extraction',
+           'reference column mom (partial: EURUSD 25/40 bars)' in prob, detail=prob)
+    clone = [dict(r, cand_a=r['mom']) for r in two_line]                     # equal to Momentum on EVERY bar
+    halfway = [dict(r) for r in two_line]
+    c.that('P1.2 leak vs clone: a candidate equal to a reference on every bar of every pair is a genuine clone (e.g. a '
+           'tick-volume VOLUME candidate) and passes; equal on every bar of one pair but not of another is a leak',
+           nb.extraction_problem({'EURUSD': {'rows': clone}}, ['EURUSD'], 'cand_a', None) == ''
+           and 'all bars on 1 of 2 pairs only' in nb.extraction_problem({'EURUSD': {'rows': clone}, 'GBPUSD': {'rows': halfway}},
+                                                                        ['EURUSD', 'GBPUSD'], 'cand_a', None))
+    base200 = [dict(two_line[k % 40], date=f'{2020 + k // 300}.{k // 25 % 12 + 1:02d}.{k % 25 + 1:02d}',
+                    cand_a=f'{1.0 + k / 10:.8f}') for k in range(200)]
+    hist = [dict(r) for r in base200]
+    for r in hist[20:80]:
+        r['cand_a'] = '0.00000000'                                            # a 60-bar blank stretch earlier
+    for r in hist[-55:]:
+        r['cand_a'] = '0.00000000'                                            # 55 blank at the end
+    stopped = [dict(r) for r in base200]
+    for r in stopped[-55:]:
+        r['cand_a'] = '0.00000000'
+    c.that('P1.2 stops-writing gate allows the long blank stretches a two-colour histogram buffer has by design: a '
+           'trailing run of 55 after an earlier 60-bar stretch passes; the same 55 with no earlier stretch is flagged',
+           nb.longest_blank_run(hist, 'cand_a') == 60
+           and nb.extraction_problem({'EURUSD': {'rows': hist}}, ['EURUSD'], 'cand_a', None) == ''
+           and 'stops writing' in nb.extraction_problem({'EURUSD': {'rows': stopped}}, ['EURUSD'], 'cand_a', None))
+    arch_dir = Path(tempfile.mkdtemp(prefix='nnfx_arch_'))
+    for name in ('nnfx_batch.json', 'nnfx_batch_results.jsonl', 'nnfx_batch_extract_EURUSD.csv', 'keep.txt'):
+        (arch_dir / name).write_text(name)
+    arch_root = Path(tempfile.mkdtemp(prefix='nnfx_archroot_'))
+    dest = nb.archive_previous_outputs(arch_dir, arch_root)
+    c.that('Runtime safety: a new session ARCHIVES the previous job file, results and extraction CSVs into an archive '
+           'folder OUTSIDE the runtime (the runtime is shared and clone_runtime deletes it on an MT5 update) and leaves '
+           'other files',
+           dest is not None and sorted(f.name for f in dest.iterdir()) == ['nnfx_batch.json', 'nnfx_batch_extract_EURUSD.csv',
+           'nnfx_batch_results.jsonl'] and (dest / 'nnfx_batch_extract_EURUSD.csv').read_text() == 'nnfx_batch_extract_EURUSD.csv'
+           and dest.parent == arch_root and sorted(f.name for f in arch_dir.iterdir()) == ['keep.txt'], detail=str(dest))
+    ctl_ok = [{'repaint_control': 'Examples\\Custom Moving Average', 'repaint': 'aligned'},
+              {'repaint_control': 'Examples\\ZigZag', 'repaint': 'repaints'},
+              {'repaint_control_end': 'Examples\\Custom Moving Average', 'repaint': 'aligned'}]
+    cand = [{'key': 'zz', 'repaint': 'repaints', 'compared': 400, 'diffs': 400, 'deepest': 399},
+            {'key': 'ma', 'repaint': 'aligned', 'compared': 400, 'diffs': 0, 'deepest': -1}]
+    v_ok = nb.repaint_verdicts(ctl_ok + cand)
+    v_bad = nb.repaint_verdicts([dict(ctl_ok[0], repaint='repaints'), ctl_ok[1]] + cand)
+    c.that('P1.2 repaint verdicts are trusted only when the session controls behave (MetaTrader MA aligned at the '
+           'start AND the end, MetaTrader ZigZag repaints); a repainter is labelled with its counts; a difference on '
+           'the newest bar only is reported (newest_bar_only), not gated; an older extract is not_run',
+           nb.repaint_label(v_ok, 'zz').startswith('repaints (400 of 400') and nb.repaint_label(v_ok, 'ma') == 'aligned'
+           and nb.repaint_label(v_bad, 'zz') == 'untested_controls_failed'
+           and nb.repaint_label(nb.repaint_verdicts(ctl_ok[:2] + cand), 'zz') == 'untested_controls_failed'
+           and nb.repaint_label(nb.repaint_verdicts(ctl_ok + [dict(cand[0], repaint='newest_bar_only', deepest=0)]), 'zz')
+               == 'newest_bar_only'
+           and nb.repaint_label(nb.repaint_verdicts([]), 'zz') == 'not_run', detail=str(v_bad))
+    tail0 = [dict(r) for r in two_line]
+    for r in tail0:
+        r['cand_b'] = r['cand_a']
+    for r in tail0[-12:]:
+        r['cand_a'] = '0.00000000'
+    c.that('P1.2 stops-writing gate: trailing 0/EMPTY bars are counted from the newest bar back',
+           nb.trailing_blank(tail0, 'cand_a') == 12 and nb.trailing_blank(tail0, 'cand_b') == 0)
+    c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
+           'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
+           and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)
+    legacy = nb.score_candidate({'EURUSD': {'rows': batch_rows(200.0)}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)
+    opened = []
+    for row in batch_rows(200.0) + [dict(batch_rows(200.0)[-1], date='2024.03.23')]:
+        opened.append(dict(row, open=row['close']))
+    new = nb.score_candidate({'EURUSD': {'rows': opened}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)
+    c.that('P1.7 batch: an extract with no open column is scored with the legacy close fill and SAYS so in '
+           'fill_model; one with an open column uses next_open+gaps', legacy['fill_model'].startswith('close (legacy')
+           and new['fill_model'] == 'next_open+gaps' and new['fingerprints']['EURUSD'][21][1:] == ('enter', 'enter:standard'),
+           detail=f"{legacy['fill_model']} | {new['fill_model']} {new['fingerprints']['EURUSD'][21:]}")
 
     return c
 

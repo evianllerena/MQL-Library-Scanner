@@ -2,7 +2,9 @@
 
 ## Known divergences
 
-- **Same-bar re-entry (MQL5 harness only).** `NNFXHarness.mq5` can open a new trade on the
+- **Same-bar re-entry (MQL5 harness only).** RESOLVED (P1.7 / Fix 8, 2026-10-14): the harness now
+  returns on any bar a position closed on (decision exits, and stops filled during that bar).
+  Original note: `NNFXHarness.mq5` can open a new trade on the
   SAME bar it exits: its exit branches (X3 C1-flip, X2 exit indicator, X4 baseline) close the
   position and then fall through to the entry logic. `nnfx_engine.py` returns on every exit bar,
   so it never does. The harness is reference-only, so this does not affect the leaderboard.
@@ -12,3 +14,8 @@
   `max_drawdown_pct` use ONE account across every symbol, in date order (`run_lockstep`). The
   harness runs one symbol per Strategy Tester pass, so its breaker only sees that symbol's
   balance. Reference-only; does not affect the leaderboard.
+
+- **Minimum lot (MQL5 harness only).** When 2% risk sizes each half below the broker's minimum lot,
+  the harness skips the trade (`skip:lots_below_min`) instead of oversizing it; the Python engine has
+  no lot concept and takes it. A skip arms no continuation, so the following bars can differ too.
+  Shows up only on small accounts / wide stops; reference-only.

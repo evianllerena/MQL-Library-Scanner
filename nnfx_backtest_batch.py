@@ -1,7 +1,7 @@
 """
 NNFX backtest batch engine for the MQL Indicator Library.
 
-Mirrors preview_batch.py's architecture exactly (same JSONL stdout protocol,
+Mirrors the former preview_batch.py's architecture (removed in P1.8) (same JSONL stdout protocol,
 same PRAGMA-guarded migration idiom, same `import preview_bridge as pb` reuse
 of runtime discovery/clone/compile/prime helpers, same bulk-stage ->
 bulk-compile -> one controller script -> one MT5 session -> JSONL
@@ -9,7 +9,7 @@ results + done-flag pattern used by render_shard/MT5_BATCH_SRC) so the two
 batch engines stay consistent instead of diverging into two MT5 automation
 styles.
 
-What's different from preview_batch.py: instead of screenshotting each
+What was different from preview_batch.py: instead of screenshotting each
 indicator, the controller script extracts REAL per-bar buffer values (via
 iCustom + CopyBuffer -- proven throughout the NNFX pilot work this session,
 never the Strategy Tester, which was unreliable for headless automation) for
@@ -24,18 +24,29 @@ Commands (JSONL on stdout, like the other sidecars):
   run  --db <db> --out <dir> --bed-symbols EURUSD,GBPUSD,USDJPY [--limit N]
        [--min-trades 30] [--force] [--history-from 2015.01.01]
   rescore --db <db> --out <dir of an earlier run> --csv <leaderboard.csv> [--history-from 2015.01.01]
+  reextract --out <dir with nnfx_batch.json> --source-runtime <runtime with compiled candidates>
+       [--symbols EURUSD,...] [--keys sha-prefix,...]
 """
 from __future__ import annotations
 import argparse, json, os, shutil, sqlite3, sys, time, hashlib, threading, tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import preview_bridge as pb  # discovery, clone_runtime, compile_file, stage, mql_dir_name, ...
+class _LazyPreviewBridge:
+    """preview_bridge (discovery, clone_runtime, compile_file, stage, mql_dir_name, ...), imported on first
+    use (P1.6): the pure scoring path and the no-MT5 self-test must not load the MT5 preview bridge. The
+    import stays a plain statement so PyInstaller still bundles preview_bridge into the sidecar."""
+    def __getattr__(self, name):
+        import preview_bridge
+        return getattr(preview_bridge, name)
+
+
+pb = _LazyPreviewBridge()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from nnfx_engine import NNFXEngine, NNFXParams, EquityTracker, bar_close_utc, run_lockstep
 
-# ---- output (identical protocol to preview_batch.py) ------------------------
+# ---- output (the JSONL protocol the other sidecars use) ------------------------
 
 _emit_lock = threading.Lock()
 
@@ -148,24 +159,71 @@ def failure_reason(fails: dict) -> str:
 MIN_TRADES = 30  # below this a result is an insufficient sample (same default as the app's board)
 
 
-def r_stats(trade_rs):
-    """Expectancy in R (P/L / the 1.5xATR-at-entry stop) and its 95% margin of error.
-    R puts every pair on one scale (pips are not comparable: a GBPNZD day moves ~3x an EURCHF
-    day). The margin is 1.96 x sample stdev / sqrt(n): an edge is only distinguishable from zero
-    -- or from another candidate -- when the ranges do not overlap."""
-    n = len(trade_rs)
+BOOTSTRAP_SAMPLES = 2000
+MIN_CLUSTERS = 12  # fewer entry-months than this -> no range (a 2-3 month range is meaningless)
+
+
+def r_interval(trades, samples=BOOTSTRAP_SAMPLES, seed=0):
+    """Expectancy in R (P/L / the 1.5xATR-at-entry stop) and its 95% range (low, high).
+    R puts every pair on one scale (pips are not comparable: a GBPNZD day moves ~3x an EURCHF day).
+    P1.4: the range is a CLUSTER bootstrap -- trades are grouped by entry month across all pairs and
+    whole months are resampled -- because 28 pairs share 8 currencies: trades opened in the same
+    month are correlated, and treating them as independent (1.96 x stdev / sqrt(n)) made the range
+    far too narrow. trades = [{'entry_date': 'YYYY.MM.DD', 'r': float}, ...]. Fewer than MIN_CLUSTERS
+    months -> no range (None, None). Seeded, so a rescore is reproducible."""
+    import random
+    n = len(trades)
     if n == 0:
-        return 0.0, None
-    mean = sum(trade_rs) / n
-    if n < 2:
-        return mean, None
-    var = sum((x - mean) ** 2 for x in trade_rs) / (n - 1)
-    return mean, 1.96 * (var ** 0.5) / n ** 0.5
+        return 0.0, None, None
+    mean = sum(t['r'] for t in trades) / n
+    months = {}
+    for t in trades:
+        s = months.setdefault(t['entry_date'][:7], [0.0, 0])
+        s[0] += t['r']; s[1] += 1
+    clusters = list(months.values())
+    if len(clusters) < MIN_CLUSTERS:
+        return mean, None, None
+    rng = random.Random(seed)
+    k = len(clusters)
+    means = []
+    for _ in range(samples):
+        tot = cnt = 0
+        for _ in range(k):
+            s = clusters[rng.randrange(k)]
+            tot += s[0]; cnt += s[1]
+        means.append(tot / cnt)
+    means.sort()
+    return mean, means[int(0.025 * samples)], means[int(0.975 * samples) - 1]
+
+
+HOLDOUT_FROM = '2024.01.01'  # P1.4 / owner choice 2A: trades entered from here on are out-of-sample
+MIN_OOS_TRADES = 20         # oos_pass needs at least this many out-of-sample trades (one lucky trade is not a test)
+
+
+def holdout_stats(trades, holdout_from=HOLDOUT_FROM, min_oos_trades=MIN_OOS_TRADES):
+    """Split whole trades by entry date: in-sample (ranked) vs out-of-sample (held out, only checked).
+    Picking the best of hundreds of candidates on one window mostly finds luck; a candidate counts only
+    if it ALSO made money on trades it was never ranked on (oos_pass)."""
+    ins = [t for t in trades if t['entry_date'] < holdout_from]
+    oos = [t for t in trades if t['entry_date'] >= holdout_from]
+    is_r, is_lo, _ = r_interval(ins)
+    oos_r = sum(t['r'] for t in oos) / len(oos) if oos else None
+    return dict(is_trades=len(ins), is_expectancy_r=round(is_r, 4),
+                is_r_low=round(is_lo, 4) if is_lo is not None else None,
+                oos_trades=len(oos), oos_expectancy_r=round(oos_r, 4) if oos_r is not None else None,
+                oos_pass=len(oos) >= min_oos_trades and oos_r > 0)
 
 
 def leaderboard_order(rows, min_trades=MIN_TRADES):
-    """Rank within each slot on expectancy_r (best first); insufficient samples always sort last."""
-    return sorted(rows, key=lambda r: (r['slot'], r['trades'] < min_trades, -r['expectancy_r']))
+    """Rank within each slot (P1.4): insufficient in-sample samples last; then candidates that also
+    made money out-of-sample (oos_pass) before those that did not; then by the BOTTOM of the
+    in-sample 95% R range (is_r_low), best first -- a high average with a range reaching below zero is
+    not an edge. A row without a range sorts after every row with one."""
+    def key(r):
+        low = r.get('is_r_low')
+        return (r['slot'], r.get('is_trades', r['trades']) < min_trades, not r.get('oos_pass', False),
+                low is None, -(low or 0.0))
+    return sorted(rows, key=key)
 
 # ---- DB ----------------------------------------------------------------------
 
@@ -178,7 +236,7 @@ def connect(db):
     return conn
 
 def ensure_backtest_table(conn):
-    """Defensive, idempotent guard mirroring preview_batch.py's
+    """Defensive, idempotent guard mirroring the former preview_batch.py's
     ensure_preview_columns -- the table already exists in engine.py's
     migrate() (STEP 1 of NNFX_INTEGRATION_PLAN.txt), but a batch engine
     should never assume it's talking to an up-to-date DB."""
@@ -206,6 +264,15 @@ def ensure_backtest_table(conn):
     for col in ('expectancy_r', 'expectancy_r_ci95'):  # ranking metric in R + its 95% margin
         if col not in cols:
             conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} REAL')
+    for col in ('fill_model', 'cost_model', 'repaint_test'):  # which execution model scored the row; P1.2 verdict
+        if col not in cols:
+            conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} TEXT')
+    for col, typ in (('expectancy_r_low', 'REAL'), ('expectancy_r_high', 'REAL'), ('is_trades', 'INTEGER'),
+                     ('is_expectancy_r', 'REAL'), ('is_r_low', 'REAL'), ('oos_trades', 'INTEGER'),
+                     ('oos_expectancy_r', 'REAL'), ('oos_pass', 'INTEGER'),  # P1.4 holdout + range
+                     ('dd_breaker_trips', 'INTEGER'), ('dd_breaker_halted_at_end', 'INTEGER')):  # P1.5
+        if col not in cols:
+            conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} {typ}')
     conn.commit()
 
 TESTABLE_SLOTS = ('CONFIRMATION_1', 'CONFIRMATION_2', 'BASELINE', 'VOLUME')
@@ -241,7 +308,7 @@ def plan(db, limit=None):
           'items': [{'sha256': r['sha256'], 'slot': r['slot'], 'filename': r['filename']} for r in rows]})
     conn.close()
 
-# ---- MT5 controller script (mirrors preview_batch.py's MT5_BATCH_SRC) --------
+# ---- MT5 controller script (pattern of the former preview_batch MT5_BATCH_SRC) --------
 
 CONTROLLER_SRC = r'''
 #property strict
@@ -308,6 +375,87 @@ bool SyncHistory(string sym,datetime from,uint timeout_ms){
     Sleep(250);
   }
   return(false);
+}
+
+// P1.2 repaint test (the method of tools/indicator_fix/IndicatorQA.mq5): the candidate runs on two
+// custom copies of the first symbol's D1 history -- NNFXR_FULL (every bar) and NNFXR_CUT (the newest
+// RP_CUT bars removed) -- and its buffers must be identical on the RP_CMP bars both histories share.
+// Any difference means a value the backtest reads at bar t was not known at bar t (repainting or
+// lookahead). A value present on one side and EMPTY/0 on the other counts as a difference (ZigZag-type
+// pivots appear and disappear); bars EMPTY/0 on both sides are not compared.
+#define RP_CUT 150
+#define RP_CMP 400
+int g_bars_full=0, g_bars_cut=0;   // bar counts at creation; a change voids the comparison
+// custom symbols get no ticks; indicators that wait for a tick before finishing would never calculate.
+// Each symbol keeps its OWN clock (its last tick) and a pump never leaves the last bar's day -- a
+// shared clock once put CUT's ticks 150 days ahead, adding a bar and shifting every comparison.
+void PumpTick(string sym){
+  if(StringFind(sym,"NNFXR_")!=0) return;
+  MqlRates r[]; if(CopyRates(sym,PERIOD_D1,0,1,r)!=1) return;
+  long day0=(long)r[0].time*1000;
+  long t=MathMax(SymbolInfoInteger(sym,SYMBOL_TIME_MSC)+1000, day0+3600000);
+  if(t>=day0+86400000-1000) return;
+  MqlTick tk[1]; tk[0].time=(datetime)(t/1000); tk[0].time_msc=t;
+  tk[0].bid=r[0].close; tk[0].ask=r[0].close+10*SymbolInfoDouble(sym,SYMBOL_POINT); tk[0].last=r[0].close;
+  tk[0].volume=1; tk[0].flags=TICK_FLAG_BID|TICK_FLAG_ASK;
+  CustomTicksAdd(sym,tk);
+}
+bool MakeCustom(string name,string origin,int drop){
+  MqlRates r[]; ArraySetAsSeries(r,false);
+  int n=CopyRates(origin,PERIOD_D1,0,Bars(origin,PERIOD_D1),r);
+  if(n<=RP_CUT+RP_CMP+200) return(false);
+  SymbolSelect(name,false); CustomSymbolDelete(name);
+  if(!CustomSymbolCreate(name,"NNFXR",origin)) return(false);
+  MqlRates k[]; ArrayResize(k,n-drop); for(int i=0;i<n-drop;i++) k[i]=r[i];
+  if(CustomRatesReplace(name,k[0].time,k[n-drop-1].time+86400,k)<=0) return(false);
+  SymbolSelect(name,true);
+  MqlTick tk[1]; tk[0].time=k[n-drop-1].time+3600; tk[0].bid=k[n-drop-1].close; tk[0].ask=k[n-drop-1].close+10*SymbolInfoDouble(origin,SYMBOL_POINT);
+  tk[0].last=tk[0].bid; tk[0].volume=1; tk[0].time_msc=(long)tk[0].time*1000; tk[0].flags=TICK_FLAG_BID|TICK_FLAG_ASK;
+  CustomTicksAdd(name,tk);
+  uint t0=GetTickCount(); while(Bars(name,PERIOD_D1)<n-drop && GetTickCount()-t0<30000) Sleep(100);
+  return(Bars(name,PERIOD_D1)>=n-drop);
+}
+int LoadCalc(string sym,string rel,uint timeout,string &status){
+  int need=Bars(sym,PERIOD_D1); uint t0=GetTickCount(); int calc=-1; uint lastpump=0;
+  int h=iCustom(sym,PERIOD_D1,rel);
+  if(h==INVALID_HANDLE){ status="load_failed"; return(h); }
+  while(true){
+    calc=BarsCalculated(h); if(calc>=need || GetTickCount()-t0>=timeout) break;
+    if(GetTickCount()-lastpump>=250){ PumpTick(sym); lastpump=GetTickCount(); }
+    Sleep(25);
+  }
+  status=(calc>=need)?"ok":((calc<=0)?"never_calculated":"too_slow");
+  return(h);
+}
+bool Blank(double v){ return(v==EMPTY_VALUE || !MathIsValidNumber(v) || v==0.0); }
+string RepaintTest(string rel,int bufA,int bufB,uint timeout){
+  string st1,st2;
+  int h1=LoadCalc("NNFXR_CUT",rel,timeout,st1);
+  if(st1!="ok"){ if(h1!=INVALID_HANDLE) IndicatorRelease(h1); return("\"repaint\":\"untested_cut_"+st1+"\""); }
+  int h2=LoadCalc("NNFXR_FULL",rel,timeout,st2);
+  if(st2!="ok"){ IndicatorRelease(h1); if(h2!=INVALID_HANDLE) IndicatorRelease(h2); return("\"repaint\":\"untested_full_"+st2+"\""); }
+  if(Bars("NNFXR_CUT",PERIOD_D1)!=g_bars_cut || Bars("NNFXR_FULL",PERIOD_D1)!=g_bars_full){
+    IndicatorRelease(h1); IndicatorRelease(h2); return("\"repaint\":\"untested_history_changed\""); }
+  int compared=0,diffs=0,deepest=-1;
+  for(int q=0;q<2;q++){
+    int b=(q==0)?bufA:bufB; if(b<0) continue;
+    double a[],f[]; ArraySetAsSeries(a,true); ArraySetAsSeries(f,true);
+    int ga=CopyBuffer(h1,b,0,RP_CMP,a);        // NNFXR_CUT newest RP_CMP bars (j = j bars before the cut)
+    int gf=CopyBuffer(h2,b,RP_CUT,RP_CMP,f);   // the SAME bars on NNFXR_FULL
+    int n=MathMin(ga,gf);
+    for(int j=0;j<n;j++){
+      bool ea=Blank(a[j]), ef=Blank(f[j]);
+      if(ea && ef) continue;
+      compared++;
+      if(ea!=ef || MathAbs(a[j]-f[j])>1e-8*MathMax(1.0,MathAbs(a[j]))){ diffs++; if(j>deepest) deepest=j; }
+    }
+  }
+  IndicatorRelease(h1); IndicatorRelease(h2);
+  // only the newest shared bar differs: a not-yet-final last value or tick volume from the pumps --
+  // reported, not treated as repainting
+  string v=(compared<50)?"untested_no_comparable_values":((diffs==0)?"aligned":((deepest==0)?"newest_bar_only":"repaints"));
+  return("\"repaint\":\""+v+"\",\"compared\":"+IntegerToString(compared)+",\"diffs\":"+IntegerToString(diffs)+
+         ",\"deepest\":"+IntegerToString(deepest));
 }
 
 void OnStart(){
@@ -414,12 +562,12 @@ void OnStart(){
     string outfile="nnfx_batch_extract_"+sym+".csv";
     int fh=FileOpen(outfile,FILE_WRITE|FILE_TXT|FILE_ANSI);
     if(fh==INVALID_HANDLE){ AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"cannot_open_output\"}"); continue; }
-    string header="date,close,high,low,ma,macd_m,macd_s,rvi,atr,mom,vol";
+    string header="date,open,close,high,low,ma,macd_m,macd_s,rvi,atr,mom,vol";
     for(int k=0;k<njobs;k++){ header+=","+keys[k]+"_a"; if(bufB[k]>=0) header+=","+keys[k]+"_b"; }
     FileWriteString(fh,header+"\r\n");
     for(int i=total-1;i>=0;i--){
       datetime t=iTime(sym,PERIOD_D1,i);
-      string line=TimeToString(t,TIME_DATE)+","+DoubleToString(iClose(sym,PERIOD_D1,i),8)+","+
+      string line=TimeToString(t,TIME_DATE)+","+DoubleToString(iOpen(sym,PERIOD_D1,i),8)+","+DoubleToString(iClose(sym,PERIOD_D1,i),8)+","+
                   DoubleToString(iHigh(sym,PERIOD_D1,i),8)+","+DoubleToString(iLow(sym,PERIOD_D1,i),8)+","+
                   EV(ma[i])+","+EV(macdM[i])+","+EV(macdS[i])+","+EV(rvi[i])+","+EV(atr[i])+","+EV(i<gotMom?mom[i]:EMPTY_VALUE)+","+EV(i<gotVol?vol[i]:EMPTY_VALUE);
       for(int k=0;k<njobs;k++){ line+=","+EV(allA[k*total+i]); if(bufB[k]>=0) line+=","+EV(allB[k*total+i]); }
@@ -431,6 +579,27 @@ void OnStart(){
                  ",\"first\":\""+TimeToString(iTime(sym,PERIOD_D1,total-1),TIME_DATE)+"\",\"synced\":"+(synced?"true":"false")+
                  ",\"server_first\":\""+TimeToString((datetime)SeriesInfoInteger(sym,PERIOD_D1,SERIES_SERVER_FIRSTDATE),TIME_DATE)+"\"}");
   }
+  // P1.2 repaint test, once per candidate, on the first symbol's history (repainting is a property of
+  // the indicator, not of the pair). Skipped for candidates that already struck out.
+  string rsym=syms[0];
+  bool rp_ok=nsyms>0 && MakeCustom("NNFXR_FULL",rsym,0) && MakeCustom("NNFXR_CUT",rsym,RP_CUT);
+  g_bars_full=Bars("NNFXR_FULL",PERIOD_D1); g_bars_cut=Bars("NNFXR_CUT",PERIOD_D1);
+  AppendResult("{\"info\":\"repaint_test\",\"symbol\":\""+rsym+"\",\"custom_symbols\":"+(rp_ok?"true":"false")+"}");
+  // controls, every session: MetaTrader's own moving average must come out aligned and its own ZigZag
+  // must come out repainting -- otherwise no verdict of this session is trusted (checked in Python)
+  if(rp_ok){
+    AppendResult("{\"repaint_control\":\"Examples\\\\Custom Moving Average\","+RepaintTest("Examples\\Custom Moving Average",0,-1,jobTimeout)+"}");
+    AppendResult("{\"repaint_control\":\"Examples\\\\ZigZag\","+RepaintTest("Examples\\ZigZag",0,-1,jobTimeout)+"}");
+  }
+  for(int k=0;k<njobs && rp_ok;k++){
+    string rj;
+    if(strikes[k]>=MAX_STRIKES) rj="\"repaint\":\"untested_struck_out\"";
+    else if(!WaitHealthy("NNFXR_FULL",Bars("NNFXR_FULL",PERIOD_D1),60000)) rj="\"repaint\":\"untested_queue_unhealthy\"";
+    else rj=RepaintTest(rels[k],bufA[k],bufB[k],jobTimeout);
+    AppendResult("{\"key\":\""+keys[k]+"\",\"repaint_symbol\":\""+rsym+"\","+rj+"}");
+  }
+  // the moving-average control again at the END: any drift during the session fails it
+  if(rp_ok) AppendResult("{\"repaint_control_end\":\"Examples\\\\Custom Moving Average\","+RepaintTest("Examples\\Custom Moving Average",0,-1,jobTimeout)+"}");
   int f=FileOpen("nnfx_batch_done.flag",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
   if(f!=INVALID_HANDLE){ FileWriteString(f,"done"); FileClose(f); }
   TerminalClose(0);
@@ -557,6 +726,132 @@ def classify_column(rows, col):
         return 'EXTRACT_GARBAGE', f'only {distinct_recent} distinct recent values -- degenerate'
     return 'EXTRACT_OK', ''
 
+
+def candidate_columns_status(rows, col_a, col_b):
+    """classify_column for buffer A AND, for a two-line candidate, buffer B. A two-line C1 whose second
+    line never has a value used to pass on buffer A alone and then score 0 trades, because every bar
+    without both lines is dropped (seen on 10 of 15 C1 candidates in the 2026-10-04 extraction)."""
+    status, detail = classify_column(rows, col_a)
+    if status == 'EXTRACT_OK' and col_b:
+        status, detail = classify_column(rows, col_b)
+        if status != 'EXTRACT_OK':
+            detail = f'buffer B: {detail}'
+    return status, detail
+
+
+REFERENCE_COLUMNS = ('ma', 'macd_m', 'macd_s', 'rvi', 'atr', 'mom', 'vol')
+LEAK_MIN_BARS = 20  # exact 8-decimal matches with a reference indicator on this many bars cannot be chance
+
+
+CLONE_SHARE = 0.95   # a column equal to a reference on >= 95% of its values is a clone of it, not a leak
+
+
+def reference_matches(rows, col):
+    """{reference column: (bars equal to it, non-blank bars of col)} for references matching >= LEAK_MIN_BARS."""
+    out = {}
+    usable = sum(1 for r in rows if r[col] not in ('EMPTY', 'FAILED', '', '0.00000000'))
+    for ref in REFERENCE_COLUMNS:
+        if rows and ref in rows[0]:
+            n = sum(1 for r in rows if r[col] == r[ref] and r[col] not in ('EMPTY', 'FAILED', '', '0.00000000'))
+            if n >= LEAK_MIN_BARS:
+                out[ref] = (n, usable)
+    return out
+
+
+def leak_source(symbol_rows, col):
+    """The reference whose values LEAKED into `col`, else ''. The 2026-10-04 extraction had
+    Examples\\Momentum's values inside 14 of 40 candidates' columns -- on every bar of some pairs and on
+    none of others, or on the newest 64 bars only -- which classify_column cannot see because the leaked
+    values vary like a real indicator. A genuine clone (a tick-volume VOLUME candidate equal to `vol`, an
+    ATR / SMA / Momentum copy) matches on >= 95% of its values on EVERY pair and is not a leak.
+    symbol_rows = {symbol: rows}."""
+    per = {sym: reference_matches(rows, col) for sym, rows in symbol_rows.items()}
+    for ref in REFERENCE_COLUMNS:
+        hits = {sym: m[ref] for sym, m in per.items() if ref in m}
+        if not hits:
+            continue
+        full = {sym for sym, (n, u) in hits.items() if u and n >= CLONE_SHARE * u}
+        partial = [f'{sym} {n}/{u}' for sym, (n, u) in hits.items() if sym not in full]
+        if partial:
+            return f'{ref} (partial: {partial[0]} bars)'
+        if len(full) < len(symbol_rows):
+            return f'{ref} (all bars on {len(full)} of {len(symbol_rows)} pairs only)'
+    return ''
+
+
+STOPS_WRITING_BARS = 50  # newest bars all exactly 0 / EMPTY -> the indicator stopped writing its buffer
+
+
+def trailing_blank(rows, col):
+    """How many of the newest rows hold exactly 0 or EMPTY. Converted MQL4 indicators that stop writing
+    their newest bars show 0 or recycled memory there (MT5 does not initialise indicator buffers)."""
+    n = 0
+    for r in reversed(rows):
+        if r[col] not in ('EMPTY', 'FAILED', '', '0.00000000'):
+            break
+        n += 1
+    return n
+
+
+def longest_blank_run(rows, col):
+    """Longest run of exactly 0 / EMPTY values in col (a two-colour histogram or arrow buffer has long
+    blank stretches by design; only a trailing run far longer than any earlier one means 'stopped')."""
+    best = cur = 0
+    for r in rows:
+        if r[col] in ('EMPTY', 'FAILED', '', '0.00000000'):
+            cur += 1; best = max(best, cur)
+        else:
+            cur = 0
+    return best
+
+
+def repaint_verdicts(results):
+    """{candidate key: the controller's repaint-test line} (P1.2), or {'__controls__': False} when the
+    session's controls did not behave (MetaTrader's moving average must be 'aligned' at the start AND at
+    the end of the session, its ZigZag 'repaints'): then no verdict of that session is trusted. Extractions made before the test existed
+    have no such lines ({})."""
+    controls = {r['repaint_control']: r['repaint'] for r in results if 'repaint_control' in r}
+    end = [r['repaint'] for r in results if 'repaint_control_end' in r]
+    verdicts = {r['key']: r for r in results if 'key' in r and 'repaint' in r}
+    if verdicts and controls.get('Examples\\Custom Moving Average') == 'aligned' \
+            and controls.get('Examples\\ZigZag') == 'repaints' and end and end[-1] == 'aligned':
+        return verdicts
+    return {'__controls__': False} if verdicts else {}
+
+
+def repaint_label(verdicts, key):
+    if verdicts.get('__controls__') is False:
+        return 'untested_controls_failed'
+    v = verdicts.get(key)
+    if v is None:
+        return 'not_run'
+    if v['repaint'] == 'repaints':
+        return f"repaints ({v['diffs']} of {v['compared']} shared values differ, deepest {v['deepest']} bars before the cut)"
+    return v['repaint']
+
+
+def extraction_problem(symbol_data, symbols, col_a, col_b):
+    """'' when the candidate's columns are usable on every symbol, else the first reason they are not.
+    The one gate both run() and rescore() apply before scoring."""
+    for sym in symbols:
+        rows = symbol_data[sym]['rows']
+        if not rows:
+            return f'{sym}: no extraction rows'
+        if col_b and col_b not in rows[0]:
+            return f'{sym}: expected column {col_b} missing from extraction (buf_b resolution mismatch)'
+        status, detail = candidate_columns_status(rows, col_a, col_b)
+        if status != 'EXTRACT_OK':
+            return f'{sym}: {detail}'
+        for col in (col_a, col_b):
+            blank = trailing_blank(rows, col) if col else 0
+            if blank >= STOPS_WRITING_BARS and blank >= 3 * longest_blank_run(rows[:len(rows) - blank], col):
+                return f'{sym}: {col[-2:]} is 0/EMPTY on the newest {blank} bars -- the indicator stops writing'
+    for col in (col_a, col_b):
+        src = leak_source({sym: symbol_data[sym]['rows'] for sym in symbols}, col) if col else ''
+        if src:
+            return f'{col[-2:]} holds the values of reference column {src} -- corrupt extraction'
+    return ''
+
 # ---- engine wiring (same roles as run_pilot_mass.py, generalized) -----------
 
 def rolling_avg(vals, window=20):
@@ -612,6 +907,10 @@ def _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref):
                 c1f, c1s = fnum(r['macd_m']), fnum(r['macd_s'])
                 c2v = fnum(r['rvi']); base = fnum(r['ma']); c2z = 0.0
                 volv = cand_a[i]; volavg = vol_avg[i]
+                if volv is None or volavg is None:
+                    # P1.5: no reading / no 20-bar average yet (warm-up) -> the filter cannot pass, but
+                    # the bar still feeds C1 history (same protection as the reference-volume path above)
+                    volv, volavg = 0.0, 1.0
             if None in (c1f, c1s, c2v, base, volv, volavg, atrv):
                 prev_close = fnum(r['close'])
                 if base is not None:
@@ -625,26 +924,101 @@ def _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref):
                        # X2 reference exit: Examples\Momentum(14), centre line 100 (not 0). Missing
                        # column (pre-FIX-2 extract) or warm-up EMPTY -> no exit indicator that bar.
                        exit_value=fnum(r.get('mom')), exit_zero_reference=REF_EXIT_ZERO_REFERENCE)
+            if 'open' in r:  # P1.3 gap fills + P1.7 next-open fills (a pre-P1 extract has no open)
+                bar['open'] = fnum(r['open'])
+                if bar['open'] is None:  # no open: dropped like any bar missing a value
+                    prev_close = fnum(r['close']); prev_baseline = base
+                    continue
             if ref.enable_news_filter:  # N1/X5 (FIX 7): dormant unless switched on
                 bar.update(symbol=sym, time_utc=bar_close_utc(r['date'], ref.server_utc_offset_hours))
             bars.append(bar)
             prev_close = fnum(r['close']); prev_baseline = base
+        # an order decided on a bar fills at the open of the NEXT BAR THE ENGINE PROCESSES, so the
+        # fill bar's high/low are always managed (a skipped raw row can never be the fill bar)
+        for j, bar in enumerate(bars):
+            if 'open' in bar:
+                bar['next_open'] = bars[j + 1]['open'] if j + 1 < len(bars) else None
     return prepared
 
 
-def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_FROM):
+MAJORS = ('EURUSD', 'GBPUSD', 'AUDUSD', 'NZDUSD', 'USDCAD', 'USDCHF', 'USDJPY')
+# P1.1 trading costs (owner decision 2026-10-14, option 1B: flat defaults). Round trip in pips =
+# spread + commission; the engine charges half on every fill, against the trade.
+COST_SPREAD_MAJOR, COST_SPREAD_CROSS, COST_COMMISSION = 1.0, 2.0, 0.7
+COST_MODEL = (f'flat: majors {COST_SPREAD_MAJOR:g}+{COST_COMMISSION:g}, '
+              f'crosses {COST_SPREAD_CROSS:g}+{COST_COMMISSION:g} pips round trip')
+
+
+def round_trip_cost_pips(symbol):
+    spread = COST_SPREAD_MAJOR if symbol in MAJORS else COST_SPREAD_CROSS
+    return spread + COST_COMMISSION
+
+
+def fill_model(prepared):
+    """'next_open+gaps' when every symbol's bars carry the open (P1.3/P1.7); otherwise the legacy
+    close fill, which is named in the results so an old extract is never mistaken for the new model."""
+    filled = [bars for bars in prepared.values() if bars]
+    if not filled:
+        return 'none (no usable bars)'
+    has_open = all('open' in bars[0] for bars in filled)
+    return 'next_open+gaps' if has_open else 'close (legacy extract: no open column)'
+
+
+def closed_trades(records):
+    """Whole trades from one symbol's engine records: entry/exit date ('YYYY.MM.DD'), pips (the two
+    equal halves averaged) and R (both halves). A trade still open at the end is not a trade."""
+    out, cur = [], None
+    for r in records:
+        date = r['date'][:10].replace('-', '.')
+        if r['action'] == 'enter':
+            cur = {'entry_date': date, 'half1': None}
+        elif r['action'] == 'exit_half' and cur is not None:
+            cur['half1'] = r['pips']
+        elif r['action'] == 'exit' and cur is not None:
+            pips = (cur['half1'] + r['pips']) / 2.0 if cur['half1'] is not None else r['pips']
+            out.append({'entry_date': cur['entry_date'], 'exit_date': date, 'pips': pips, 'r': r['r']})
+            cur = None
+    return out
+
+
+def profit_factor_of(pips):
+    """Gross wins / gross losses. Undefined (None: blank in the CSV, NULL in the DB) when there are no
+    losing trades -- the old 999.0 stand-in looked like a real, huge number on small samples."""
+    gains = sum(t for t in pips if t > 0)
+    loss_sum = -sum(t for t in pips if t < 0)
+    return round(gains / loss_sum, 2) if loss_sum > 0 else None
+
+
+def max_drawdown_pips(dated):
+    """Largest peak-to-trough fall (<= 0) of cumulative pips over the basket's trades in EXIT-DATE
+    order (ties by symbol). Concatenating each symbol's trades, as before P1.4, is not a curve anyone
+    could have traded."""
+    equity = peak = maxdd = 0.0
+    for _date, _sym, pips in sorted(dated):
+        equity += pips; peak = max(peak, equity); maxdd = min(maxdd, equity - peak)
+    return maxdd
+
+
+def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_FROM, costs=True,
+               holdout_from=HOLDOUT_FROM, stats=True):
     """One scoring pass over prepared bars at a given breaker setting. Fresh engines + a fresh
     shared account each call, so the two runs (off/on) are independent."""
     per_symbol = {}
     pooled_trades = []
-    pooled_r = []  # whole-trade results in R, from the engine's closing records
+    pooled_rt = []  # whole trades (entry date + R) for the clustered R range
+    dated = []     # (exit date, symbol, pips) for the chronological pips drawdown
     bridge_skips = continuation_trades = volume_skips = dd_breaker_skips = news_skips = 0
     fingerprints = {}
     # R1 (FIX 7b): ONE equity tracker shared by every symbol's engine, driven in date order
     # (run_lockstep), so the drawdown breaker and max_drawdown_pct see the candidate's whole account.
     account = EquityTracker()
+    model = fill_model(prepared)
     engines = {sym: NNFXEngine(NNFXParams(pip_size=0.01 if 'JPY' in sym else 0.0001,
-                                          enable_dd_breaker=enable_dd_breaker), equity=account)
+                                          enable_dd_breaker=enable_dd_breaker,
+                                          fill_at='next_open' if model == 'next_open+gaps' else 'close',
+                                          model_gaps=model == 'next_open+gaps',
+                                          round_trip_cost_pips=round_trip_cost_pips(sym) if costs else 0.0),
+                               equity=account)
                for sym in symbols}
     all_records = run_lockstep(engines, prepared)
     for sym in symbols:
@@ -655,17 +1029,13 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
         volume_skips += sum(1 for r in window if r['reason'] == 'skip:volume_filter')
         dd_breaker_skips += sum(1 for r in window if r['reason'] == 'skip:dd_breaker')
         news_skips += sum(1 for r in window if r['reason'] == 'skip:news')
-        trades = []
-        pending_half1 = None
-        for r in window:
-            if r['action'] == 'exit_half':
-                pending_half1 = r['pips']
-            elif r['action'] == 'exit':
-                trades.append((pending_half1 + r['pips']) / 2.0 if pending_half1 is not None else r['pips'])
-                pooled_r.append(r['r'])
-                pending_half1 = None
+        # P1.4: a trade belongs to the window by its ENTRY date, with both halves kept together
+        # (a TP1 half before score_from and the runner after it used to lose the half-pairing)
+        trades = [t for t in closed_trades(all_records[sym]) if t['entry_date'] >= score_from]
         per_symbol[sym] = len(trades)
-        pooled_trades.extend(trades)
+        dated.extend((t['exit_date'], sym, t['pips']) for t in trades)
+        pooled_trades.extend(t['pips'] for t in trades)
+        pooled_rt.extend(trades)
         fingerprints[sym] = tuple((r['date'], r['action'], r['reason']) for r in window)
 
     n = len(pooled_trades)
@@ -673,54 +1043,73 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
     losses = sum(1 for t in pooled_trades if t < 0)
     win_rate = round(100 * wins / n, 1) if n else 0.0
     expectancy = round(sum(pooled_trades) / n, 2) if n else 0.0
-    gains = sum(t for t in pooled_trades if t > 0)
-    loss_sum = -sum(t for t in pooled_trades if t < 0)
-    profit_factor = round(gains / loss_sum, 2) if loss_sum > 0 else (999.0 if gains > 0 else 0.0)
-    equity = peak = maxdd = 0.0
-    for t in pooled_trades:
-        equity += t; peak = max(peak, equity); maxdd = min(maxdd, equity - peak)
-    exp_r, ci_r = r_stats(pooled_r)
+    profit_factor = profit_factor_of(pooled_trades)
+    maxdd = max_drawdown_pips(dated)
+    # the breaker-ON run only reports expectancy_pips and skips: no bootstrap for it (stats=False)
+    exp_r, lo_r, hi_r = r_interval(pooled_rt) if stats else (0.0, None, None)
     return dict(trades=n, wins=wins, losses=losses, win_rate=win_rate, expectancy_pips=expectancy,
-                expectancy_r=round(exp_r, 4), expectancy_r_ci95=round(ci_r, 4) if ci_r is not None else None,
+                expectancy_r=round(exp_r, 4),
+                expectancy_r_ci95=round((hi_r - lo_r) / 2, 4) if lo_r is not None else None,  # half-width
+                expectancy_r_low=round(lo_r, 4) if lo_r is not None else None,
+                expectancy_r_high=round(hi_r, 4) if hi_r is not None else None,
                 profit_factor=profit_factor, max_drawdown=round(maxdd, 1), bridge_skips=bridge_skips,
                 continuation_trades=continuation_trades, volume_skips=volume_skips,
                 max_drawdown_pct=round(account.max_dd_pct, 2), dd_breaker_skips=dd_breaker_skips, news_skips=news_skips,
-                per_symbol=per_symbol, fingerprints=fingerprints)
+                dd_breaker_trips=account.trips, dd_breaker_halted_at_end=account.tripped_at is not None,
+                per_symbol=per_symbol, fingerprints=fingerprints, fill_model=model,
+                cost_model=COST_MODEL if costs else 'none',
+                **(holdout_stats(pooled_rt, holdout_from) if stats else {}))
 
 
-def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_from=DEFAULT_HISTORY_FROM):
+def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_from=DEFAULT_HISTORY_FROM,
+                    holdout_from=HOLDOUT_FROM):
     """FIX 8: rank on the breaker-OFF run (full trade history, apples-to-apples) and report the
     breaker-ON expectancy alongside, so the drawdown breaker never distorts the comparison. The
     ranking metric is expectancy_r (with expectancy_r_ci95); expectancy_pips is kept alongside. The
     risk column max_drawdown_pct comes from the breaker-OFF run (the TRUE unprotected drawdown);
     dd_breaker_skips comes from the breaker-ON run (how many entries the breaker WOULD stop)."""
     prepared = _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref)
-    off = _score_run(symbols, prepared, enable_dd_breaker=False, score_from=score_from)  # ranking metric + true risk
-    on = _score_run(symbols, prepared, enable_dd_breaker=True, score_from=score_from)    # reference + real breaker skips
+    off = _score_run(symbols, prepared, enable_dd_breaker=False, score_from=score_from,  # ranking metric + true risk
+                     holdout_from=holdout_from)
+    on = _score_run(symbols, prepared, enable_dd_breaker=True, score_from=score_from,    # reference + real breaker skips
+                    holdout_from=holdout_from, stats=False)
     off['expectancy_pips_breaker'] = on['expectancy_pips']
     off['dd_breaker_skips'] = on['dd_breaker_skips']
+    off['dd_breaker_trips'] = on['dd_breaker_trips']                    # P1.5: how often it tripped, and
+    off['dd_breaker_halted_at_end'] = on['dd_breaker_halted_at_end']    # whether it was still halted at the end
     return off
 
 # ---- run ----------------------------------------------------------------------
 
-def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=DEFAULT_HISTORY_FROM,
-        job_timeout=JOB_TIMEOUT_SECONDS):
-    conn = connect(db)
-    ensure_backtest_table(conn)
-    items = candidacy_rows(conn, limit)
-    if not items:
-        emit({'type': 'fatal', 'error': 'No MQL5 candidacy rows found (run nnfx-map first, or every candidate is NEEDS_REVIEW/non-MQL5).'})
-        conn.close()
-        return
-    bed = '+'.join(symbols) + '|D1|LIVE'
+ARCHIVE_ROOT = Path(os.environ.get('LOCALAPPDATA', tempfile.gettempdir())) / 'nnfx-backtest-runtime' / 'archive'
 
+
+def archive_previous_outputs(files_dir, archive_root=None):
+    """Move the previous session's job file, results, done flag and extraction CSVs into
+    <archive_root>/<timestamp>/ instead of deleting them: the runtime is shared (one per terminal+data
+    folder), so its last extraction may be the only copy. The archive lives OUTSIDE the runtime folder,
+    which pb.clone_runtime() deletes whenever the MT5 build changes."""
+    old = [files_dir / fn for fn in ('nnfx_batch.json', 'nnfx_batch_results.jsonl', 'nnfx_batch_done.flag')
+           if (files_dir / fn).exists()] + sorted(files_dir.glob('nnfx_batch_extract_*.csv'))
+    if not old:
+        return None
+    dest = Path(archive_root or ARCHIVE_ROOT) / time.strftime('%Y%m%d-%H%M%S')
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in old:
+        shutil.move(str(f), str(dest / f.name))
+    stage_event('previous_outputs_archived', to=str(dest), files=len(old))
+    return dest
+
+
+def _prepare_runtime(symbols, history_from):
+    """Discover the MT5 terminal, clone a private batch runtime (never the user's terminal), seed
+    history, prime it, restore the login and cap MaxBars. None (after a fatal event) if no MT5."""
     stage_event('discovering_runtime')
     all_terminals = pb.terminals()
     mt5 = next((t for t in all_terminals if t['kind'] == 'MT5' and t.get('terminal') and t.get('editor') and t.get('data_dir')), None)
     if not mt5:
         emit({'type': 'fatal', 'error': 'No usable MT5 terminal+data pairing found on this machine.'})
-        conn.close()
-        return
+        return None
     stage_event('runtime_found', terminal=mt5['terminal'], data_dir=mt5['data_dir'])
 
     # NOTE: MetaEditor's own /inc:<path> argument parsing truncates at the
@@ -744,16 +1133,6 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     files_dir = mqlroot / 'Files'
     for d in (indicators_dir, scripts_dir, files_dir):
         d.mkdir(parents=True, exist_ok=True)
-    for fn in ('nnfx_batch.json', 'nnfx_batch_results.jsonl', 'nnfx_batch_done.flag'):
-        try:
-            (files_dir / fn).unlink()
-        except Exception:
-            pass
-    for f in files_dir.glob('nnfx_batch_extract_*.csv'):
-        try:
-            f.unlink()
-        except Exception:
-            pass
 
     terminal_exe = rt / Path(mt5['terminal']).name
     editor = rt / Path(mt5['editor']).name
@@ -767,6 +1146,75 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     maxbars = maxbars_for(history_from)
     set_runtime_maxbars(rt, maxbars)
     stage_event('runtime_maxbars', maxbars=maxbars)
+    return rt, mqlroot, indicators_dir, scripts_dir, files_dir, terminal_exe, editor
+
+
+def _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_json, symbols, job_timeout, out):
+    """Write the job file + controller, compile it, run ONE extraction session, copy the extraction to
+    `out`. False (after a fatal event) only if the controller does not compile."""
+    (files_dir / 'nnfx_batch.json').write_text(json.dumps(job_json, separators=(',', ':')), encoding='utf-8')
+    ctrl = scripts_dir / 'NNFXBacktestBatchController.mq5'
+    ctrl.write_text(CONTROLLER_SRC, encoding='utf-8')
+    built, _cmds, log = pb.compile_file(editor, ctrl, mqlroot)
+    if not built:
+        emit({'type': 'fatal', 'error': 'batch controller failed to compile', 'log': (log or '')[-2000:]})
+        return False
+
+    cfg = rt / 'nnfx-backtest-batch.ini'
+    cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
+                    f'[StartUp]\nSymbol={symbols[0]}\nPeriod=D1\nScript={ctrl.stem}\nShutdownTerminal=0\n', encoding='utf-8')
+    stage_event('session_launch', jobs=len(job_json['jobs']), symbols=symbols)
+    proc = pb.subprocess.Popen([str(terminal_exe), '/portable', f'/config:{cfg}'],
+                                cwd=str(rt), creationflags=pb.CREATE_NO_WINDOW, startupinfo=pb.startupinfo())
+    try:
+        # ceiling: ~20 s per candidate per pair, + 2 time limits per candidate (strikes), + up to
+        # 2.5 min per symbol for the controller's history download/sync
+        n_jobs = len(job_json['jobs'])
+        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * n_jobs * len(symbols)
+                                                            + 2 * job_timeout * n_jobs + 150 * len(symbols)
+                                                            # P1.2 repaint pass: queue check + 2 loads per job,
+                                                            # 3 control runs, custom-symbol setup
+                                                            + (60 + 2 * job_timeout) * n_jobs + 6 * job_timeout + 60))
+    finally:
+        pb.terminate_tree(proc)
+    if not finished:
+        stage_event('batch_timeout')
+
+    # keep a durable copy of the raw extraction + job artifacts wherever the
+    # caller wanted them (--out); this is a plain file copy, not passed
+    # through MetaEditor's /inc: flag, so it's fine even if it contains spaces.
+    out_dir = Path(out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for f in files_dir.glob('nnfx_batch_extract_*.csv'):
+        try:
+            shutil.copy2(f, out_dir / f.name)
+        except Exception:
+            pass
+    for fn in ('nnfx_batch.json', 'nnfx_batch_results.jsonl'):
+        try:
+            shutil.copy2(files_dir / fn, out_dir / fn)
+        except Exception:
+            pass
+    return True
+
+
+def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=DEFAULT_HISTORY_FROM,
+        job_timeout=JOB_TIMEOUT_SECONDS, holdout_from=HOLDOUT_FROM):
+    conn = connect(db)
+    ensure_backtest_table(conn)
+    items = candidacy_rows(conn, limit)
+    if not items:
+        emit({'type': 'fatal', 'error': 'No MQL5 candidacy rows found (run nnfx-map first, or every candidate is NEEDS_REVIEW/non-MQL5).'})
+        conn.close()
+        return
+    bed = '+'.join(symbols) + '|D1|LIVE'
+
+    env = _prepare_runtime(symbols, history_from)
+    if env is None:
+        conn.close()
+        return
+    rt, mqlroot, indicators_dir, scripts_dir, files_dir, terminal_exe, editor = env
+    archive_previous_outputs(files_dir)
 
     # 1) stage every candidate source (mirrors render_shard's staging loop)
     prepared = {}
@@ -851,52 +1299,16 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     # "key": 1 style silently made every int field parse back as its -1 default
     # (confirmed directly: buf_b=1 in the DB came back as -1 in the CSV column
     # count, dropping the whole _b column and crashing the Python-side lookup).
-    (files_dir / 'nnfx_batch.json').write_text(json.dumps(job_json, separators=(',', ':')), encoding='utf-8')
-    ctrl = scripts_dir / 'NNFXBacktestBatchController.mq5'
-    ctrl.write_text(CONTROLLER_SRC, encoding='utf-8')
-    built, _cmds, log = pb.compile_file(editor, ctrl, mqlroot)
-    if not built:
-        emit({'type': 'fatal', 'error': 'batch controller failed to compile', 'log': (log or '')[-2000:]})
+    if not _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_json, symbols, job_timeout, out):
         conn.close()
         return
-
-    cfg = rt / 'nnfx-backtest-batch.ini'
-    cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
-                    f'[StartUp]\nSymbol={symbols[0]}\nPeriod=D1\nScript={ctrl.stem}\nShutdownTerminal=0\n', encoding='utf-8')
-    stage_event('session_launch', jobs=len(jobs), symbols=symbols)
-    proc = pb.subprocess.Popen([str(terminal_exe), '/portable', f'/config:{cfg}'],
-                                cwd=str(rt), creationflags=pb.CREATE_NO_WINDOW, startupinfo=pb.startupinfo())
-    try:
-        # ceiling: ~20 s per candidate per pair, + 2 time limits per candidate (strikes), + up to
-        # 2.5 min per symbol for the controller's history download/sync
-        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(jobs) * len(symbols)
-                                                            + 2 * job_timeout * len(jobs) + 150 * len(symbols)))
-    finally:
-        pb.terminate_tree(proc)
-    if not finished:
-        stage_event('batch_timeout')
-
-    # keep a durable copy of the raw extraction + job artifacts wherever the
-    # caller wanted them (--out); this is a plain file copy, not passed
-    # through MetaEditor's /inc: flag, so it's fine even if it contains spaces.
-    out_dir = Path(out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for f in files_dir.glob('nnfx_batch_extract_*.csv'):
-        try:
-            shutil.copy2(f, out_dir / f.name)
-        except Exception:
-            pass
-    for fn in ('nnfx_batch.json', 'nnfx_batch_results.jsonl'):
-        try:
-            shutil.copy2(files_dir / fn, out_dir / fn)
-        except Exception:
-            pass
 
     # 5) history depth per symbol: score only the symbols whose history synchronized and reaches
     #    the scoring start; report the rest (and every symbol's bars + oldest date) explicitly.
     results = _read_jsonl(files_dir / 'nnfx_batch_results.jsonl')
     statuses = {r['symbol']: r for r in results if 'symbol' in r and 'status' in r}
     failures = job_failures(results)
+    verdicts = repaint_verdicts(results)
     stage_event('history_depth', history_from=history_from, fetch_from=fetch_from(history_from),
                 symbols={s: {k: statuses.get(s, {}).get(k) for k in ('status', 'rows', 'first', 'synced', 'server_first')}
                          for s in symbols})
@@ -930,25 +1342,17 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
                 write_status_row(conn, it, bed, 'EXTRACT_FAILED', failure_reason(fails))
                 emit({'type': 'item_error', 'filename': it['filename'], 'error': failure_reason(fails)})
                 continue
-            bad = False
-            bad_reason = ''
-            for sym in symbols:
-                rows = symbol_data[sym]['rows']
-                if not rows:
-                    bad, bad_reason = True, f'{sym}: no extraction rows'
-                    break
-                if col_b and col_b not in rows[0]:
-                    bad, bad_reason = True, f'{sym}: expected column {col_b} missing from extraction (buf_b resolution mismatch)'
-                    break
-                status, detail = classify_column(rows, col_a)
-                if status != 'EXTRACT_OK':
-                    bad, bad_reason = True, f'{sym}: {detail}'
-                    break
-            if bad:
+            bad_reason = extraction_problem(symbol_data, symbols, col_a, col_b)
+            if bad_reason:
                 write_status_row(conn, it, bed, 'EXTRACT_GARBAGE', bad_reason)
                 continue
+            rp = repaint_label(verdicts, j['key'])
+            if rp.startswith('repaints'):  # P1.2: hindsight values would float it to the top -- never scored
+                write_status_row(conn, it, bed, 'EXTRACT_REPAINTS', rp)
+                continue
             result = score_candidate(symbol_data, symbols, it['slot'], col_a, col_b, it['zero_reference'],
-                                     score_from=history_from)
+                                     score_from=history_from, holdout_from=holdout_from)
+            result['repaint_test'] = rp
             write_score_row(conn, it, bed, result)
             scored += 1
             emit({'type': 'item_scored', 'filename': it['filename'], 'slot': it['slot'],
@@ -964,6 +1368,52 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     conn.close()
     emit({'type': 'batch_complete', 'compiled': len(jobs), 'compile_failed': len(compile_failed), 'scored': scored, 'bed': bed})
 
+def reextract(out, source_runtime, symbols=None, keys=None, history_from=DEFAULT_HISTORY_FROM,
+              job_timeout=JOB_TIMEOUT_SECONDS):
+    """Re-run the MT5 extraction of an earlier run WITHOUT the library DB: the job list comes from
+    <out>/nnfx_batch.json and the compiled candidates from <source_runtime>/MQL5/Indicators/
+    NNFXBacktestBatch (the runtime that run() compiled them in). A fresh private runtime is cloned,
+    so neither the user's terminal nor the source runtime is touched. Use it after a controller change
+    (e.g. the open column, the repaint test); then `rescore --out <out>`."""
+    out = Path(out)
+    source_copy = out / 'nnfx_batch.source.json'  # the session writes its (filtered) job file back to out
+    if not source_copy.exists():
+        shutil.copy2(out / 'nnfx_batch.json', source_copy)
+    job_json = json.loads(source_copy.read_text(encoding='utf-8'))  # always the ORIGINAL full job list
+    if keys:
+        job_json['jobs'] = [j for j in job_json['jobs'] if any(j['key'].startswith(k) for k in keys)]
+    symbols = symbols or job_json['symbols']
+    job_json.update(symbols=symbols, history_from=fetch_from(history_from), job_timeout_ms=int(job_timeout * 1000))
+    src = Path(source_runtime) / pb.mql_dir_name('MT5') / 'Indicators' / 'NNFXBacktestBatch'
+    missing = [j['key'] for j in job_json['jobs'] if not (src / j['key']).is_dir()]
+    if missing or not job_json['jobs']:
+        emit({'type': 'fatal', 'error': 'compiled candidates missing from the source runtime' if missing
+              else 'no jobs selected', 'missing': missing})
+        return
+    # Stage the compiled candidates OUTSIDE the runtime first: pb.clone_runtime() reuses ONE runtime per
+    # terminal+data folder, so the session runtime may BE the source runtime, and priming it empties
+    # Indicators/NNFXBacktestBatch (lost once, 2026-10-14; restored from the F:/MQLFIX_RT copies).
+    staged = out / '_candidates'
+    for j in job_json['jobs']:
+        shutil.copytree(src / j['key'], staged / j['key'], dirs_exist_ok=True)
+    env = _prepare_runtime(symbols, history_from)
+    if env is None:
+        return
+    rt, mqlroot, indicators_dir, scripts_dir, files_dir, terminal_exe, editor = env
+    if files_dir.resolve() == out.resolve():  # checked before anything is archived
+        emit({'type': 'fatal', 'error': '--out must not be the runtime Files folder'})
+        return
+    archive_previous_outputs(files_dir)
+    archive_previous_outputs(out)  # an earlier reextract's CSVs must not mix with this session's
+    for j in job_json['jobs']:
+        shutil.copytree(staged / j['key'], indicators_dir / j['key'], dirs_exist_ok=True)
+    if not _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_json, symbols, job_timeout, out):
+        return
+    results = _read_jsonl(out / 'nnfx_batch_results.jsonl')
+    emit({'type': 'reextract_complete', 'out': str(out), 'jobs': len(job_json['jobs']),
+          'symbols': {r['symbol']: r.get('status') for r in results if 'symbol' in r and 'status' in r}})
+
+
 def write_status_row(conn, it, bed, status, reason):
     """Never silently drops a candidate: COMPILE_FAILED / EXTRACT_GARBAGE both
     get a real row with trades=0 and the reason recorded, exactly like every
@@ -973,7 +1423,11 @@ def write_status_row(conn, it, bed, status, reason):
             win_rate, expectancy_pips, profit_factor, max_drawdown, bridge_skips, continuation_trades,
             mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b)
         VALUES (?,?,?,?,1,0,0,0,0,0,0,0,0,0,'batch',?,datetime('now'),?,?,?)
-        ON CONFLICT(sha256, slot, bed) DO UPDATE SET mapping_reason=excluded.mapping_reason, tested_at=excluded.tested_at
+        ON CONFLICT(sha256, slot, bed) DO UPDATE SET mapping_reason=excluded.mapping_reason, tested_at=excluded.tested_at,
+            trades=0, wins=0, losses=0, win_rate=0, expectancy_pips=0, profit_factor=NULL, max_drawdown=0,
+            expectancy_pips_breaker=NULL, expectancy_r=NULL, expectancy_r_ci95=NULL, max_drawdown_pct=NULL,
+            expectancy_r_low=NULL, expectancy_r_high=NULL, is_trades=NULL, is_expectancy_r=NULL, is_r_low=NULL,
+            oos_trades=NULL, oos_expectancy_r=NULL, oos_pass=0  -- a failed rescore must not leave old scores ranked
     """, (it['sha256'], it['slot'], it['signal_type'], bed, f'[{status}] {reason} :: {it["filename"]}',
           it['zero_reference'], it['buf_a'], it['buf_b']))
     conn.commit()  # per-candidate, not batched to the end -- a later candidate's
@@ -985,27 +1439,41 @@ def write_score_row(conn, it, bed, r):
     conn.execute("""
         INSERT INTO backtest_results(sha256, slot, signal_type, bed, stage, trades, wins, losses,
             win_rate, expectancy_pips, expectancy_pips_breaker, expectancy_r, expectancy_r_ci95, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
-            mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b)
-        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
+            mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b, fill_model, cost_model,
+            expectancy_r_low, expectancy_r_high, is_trades, is_expectancy_r, is_r_low, oos_trades, oos_expectancy_r, oos_pass,
+            repaint_test, dd_breaker_trips, dd_breaker_halted_at_end)
+        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(sha256, slot, bed) DO UPDATE SET trades=excluded.trades, wins=excluded.wins,
             losses=excluded.losses, win_rate=excluded.win_rate, expectancy_pips=excluded.expectancy_pips,
             expectancy_pips_breaker=excluded.expectancy_pips_breaker,
             expectancy_r=excluded.expectancy_r, expectancy_r_ci95=excluded.expectancy_r_ci95,
             profit_factor=excluded.profit_factor, max_drawdown=excluded.max_drawdown, max_drawdown_pct=excluded.max_drawdown_pct,
-            bridge_skips=excluded.bridge_skips, continuation_trades=excluded.continuation_trades, tested_at=excluded.tested_at
+            bridge_skips=excluded.bridge_skips, continuation_trades=excluded.continuation_trades, tested_at=excluded.tested_at,
+            fill_model=excluded.fill_model, cost_model=excluded.cost_model,
+            expectancy_r_low=excluded.expectancy_r_low, expectancy_r_high=excluded.expectancy_r_high,
+            is_trades=excluded.is_trades, is_expectancy_r=excluded.is_expectancy_r, is_r_low=excluded.is_r_low,
+            oos_trades=excluded.oos_trades, oos_expectancy_r=excluded.oos_expectancy_r, oos_pass=excluded.oos_pass,
+            repaint_test=excluded.repaint_test, dd_breaker_trips=excluded.dd_breaker_trips,
+            dd_breaker_halted_at_end=excluded.dd_breaker_halted_at_end
     """, (it['sha256'], it['slot'], it['signal_type'], bed, r['trades'], r['wins'], r['losses'], r['win_rate'],
           r['expectancy_pips'], r.get('expectancy_pips_breaker'), r['expectancy_r'], r['expectancy_r_ci95'], r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
-          f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b']))
+          f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b'],
+          r.get('fill_model'), r.get('cost_model'), r.get('expectancy_r_low'), r.get('expectancy_r_high'),
+          r.get('is_trades'), r.get('is_expectancy_r'), r.get('is_r_low'), r.get('oos_trades'),
+          r.get('oos_expectancy_r'), int(bool(r.get('oos_pass'))), r.get('repaint_test'),
+          r.get('dd_breaker_trips'), int(bool(r.get('dd_breaker_halted_at_end')))))
     conn.commit()
 
 LEADERBOARD_COLUMNS = (
-    'indicator', 'slot', 'status', 'trades', 'sufficient_sample', 'expectancy_r', 'expectancy_r_ci95', 'expectancy_r_low',
+    'indicator', 'slot', 'status', 'trades', 'sufficient_sample', 'is_trades', 'is_expectancy_r', 'is_r_low',
+    'oos_trades', 'oos_expectancy_r', 'oos_pass', 'expectancy_r', 'expectancy_r_ci95', 'expectancy_r_low',
     'expectancy_r_high', 'expectancy_pips', 'expectancy_pips_breaker', 'win_rate', 'profit_factor',
     'max_drawdown_pips', 'max_drawdown_pct', 'dd_breaker_skips', 'bridge_skips', 'continuation_trades',
-    'volume_skips', 'news_skips', 'symbols_traded')
+    'volume_skips', 'news_skips', 'symbols_traded', 'fill_model', 'cost_model', 'repaint_test',
+    'dd_breaker_trips', 'dd_breaker_halted_at_end')
 
 
-def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN_TRADES):
+def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN_TRADES, holdout_from=HOLDOUT_FROM):
     """Re-score a saved extraction (--out of an earlier run: nnfx_batch.json + per-symbol CSVs)
     with the current engine and write the leaderboard CSV ranked on expectancy_r. No MT5 needed.
     Symbols missing from the extraction or excluded by its history-depth report are left out."""
@@ -1015,6 +1483,7 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
     results = _read_jsonl(out / 'nnfx_batch_results.jsonl')
     statuses = {r['symbol']: r for r in results if 'symbol' in r and 'status' in r}
     failures = job_failures(results)
+    verdicts = repaint_verdicts(results)
     symbols = [s for s in job_json['symbols'] if (out / f'nnfx_batch_extract_{s}.csv').exists()]
     if statuses:
         symbols, dropped = usable_symbols(statuses, symbols, history_from)
@@ -1033,25 +1502,46 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
                              status=failure_reason(fails), trades=0, sufficient_sample=False, expectancy_r=0.0))
             continue
         col_b = j['key'] + '_b' if j['buf_b'] >= 0 else None
-        r = score_candidate(symbol_data, symbols, j['role'], j['key'] + '_a', col_b, None, score_from=history_from)
-        ci = r['expectancy_r_ci95']
+        garbage = extraction_problem(symbol_data, symbols, j['key'] + '_a', col_b)
+        if garbage:  # same gate as run(): never scored on garbage columns
+            rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'],
+                             status=f'EXTRACT_GARBAGE: {garbage}', trades=0, sufficient_sample=False, expectancy_r=0.0))
+            continue
+        rp = repaint_label(verdicts, j['key'])
+        if rp.startswith('repaints'):  # same gate as run()
+            rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status=f'EXTRACT_REPAINTS: {rp}',
+                             trades=0, sufficient_sample=False, expectancy_r=0.0, repaint_test=rp))
+            continue
+        r = score_candidate(symbol_data, symbols, j['role'], j['key'] + '_a', col_b, None, score_from=history_from,
+                            holdout_from=holdout_from)
         rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status='scored', trades=r['trades'],
-                         sufficient_sample=r['trades'] >= min_trades, expectancy_r=r['expectancy_r'],
-                         expectancy_r_ci95=ci,
-                         expectancy_r_low=round(r['expectancy_r'] - ci, 4) if ci is not None else None,
-                         expectancy_r_high=round(r['expectancy_r'] + ci, 4) if ci is not None else None,
+                         sufficient_sample=r['is_trades'] >= min_trades, expectancy_r=r['expectancy_r'],
+                         is_trades=r['is_trades'], is_expectancy_r=r['is_expectancy_r'], is_r_low=r['is_r_low'],
+                         oos_trades=r['oos_trades'], oos_expectancy_r=r['oos_expectancy_r'], oos_pass=r['oos_pass'],
+                         expectancy_r_ci95=r['expectancy_r_ci95'],
+                         expectancy_r_low=r['expectancy_r_low'], expectancy_r_high=r['expectancy_r_high'],
                          expectancy_pips=r['expectancy_pips'], expectancy_pips_breaker=r['expectancy_pips_breaker'],
                          win_rate=r['win_rate'], profit_factor=r['profit_factor'], max_drawdown_pips=r['max_drawdown'],
                          max_drawdown_pct=r['max_drawdown_pct'], dd_breaker_skips=r['dd_breaker_skips'],
                          bridge_skips=r['bridge_skips'], continuation_trades=r['continuation_trades'],
                          volume_skips=r['volume_skips'], news_skips=r['news_skips'],
-                         symbols_traded=sum(1 for n in r['per_symbol'].values() if n)))
+                         symbols_traded=sum(1 for n in r['per_symbol'].values() if n),
+                         fill_model=r['fill_model'], cost_model=r['cost_model'], repaint_test=rp,
+                         dd_breaker_trips=r['dd_breaker_trips'], dd_breaker_halted_at_end=r['dd_breaker_halted_at_end']))
     rows = leaderboard_order(rows, min_trades)
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = _csv.DictWriter(f, fieldnames=LEADERBOARD_COLUMNS, restval='')
         w.writeheader()
         w.writerows(rows)
     emit({'type': 'rescore_complete', 'csv': str(csv_path), 'symbols': len(symbols), 'candidates': len(rows)})
+
+
+def ymd_dots(text):
+    """argparse type: 'YYYY.MM.DD' (or YYYY-MM-DD, normalised). Dates are compared as strings, so a
+    '-'-separated value would silently put the wrong trades out-of-sample."""
+    value = text.strip().replace('-', '.')
+    datetime.strptime(value, '%Y.%m.%d')
+    return value
 
 
 def main():
@@ -1067,17 +1557,31 @@ def main():
                    help='score trades from this date (YYYY.MM.DD); history is fetched ~6 months earlier for warm-up')
     p.add_argument('--job-timeout', type=float, default=JOB_TIMEOUT_SECONDS,
                    help='seconds a candidate may take to calculate on one pair before it is marked too_slow')
+    p.add_argument('--holdout-from', default=HOLDOUT_FROM, type=ymd_dots,
+                   help='YYYY.MM.DD: trades entered from this date on are out-of-sample')
     p = sub.add_parser('rescore', help='re-score a saved extraction (no MT5) and write the leaderboard CSV')
     p.add_argument('--db', required=True); p.add_argument('--out', required=True); p.add_argument('--csv', required=True)
     p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM); p.add_argument('--min-trades', type=int, default=MIN_TRADES)
+    p.add_argument('--holdout-from', default=HOLDOUT_FROM, type=ymd_dots,
+                   help='YYYY.MM.DD: trades entered from this date on are out-of-sample')
+    p = sub.add_parser('reextract', help='re-run the MT5 extraction of an earlier run without the library DB')
+    p.add_argument('--out', required=True, help='directory holding the earlier nnfx_batch.json; receives the new CSVs')
+    p.add_argument('--source-runtime', required=True, help='runtime folder holding MQL5/Indicators/NNFXBacktestBatch')
+    p.add_argument('--symbols', default='', help='comma list (default: the symbols in the saved job file)')
+    p.add_argument('--keys', default='', help='comma list of candidate sha256 prefixes (default: all)')
+    p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM)
+    p.add_argument('--job-timeout', type=float, default=JOB_TIMEOUT_SECONDS)
     args = ap.parse_args()
     if args.cmd == 'plan':
         plan(args.db, args.limit)
     elif args.cmd == 'run':
         run(args.db, args.out, [s.strip() for s in args.bed_symbols.split(',') if s.strip()],
-            args.limit, args.min_trades, args.force, args.history_from, args.job_timeout)
+            args.limit, args.min_trades, args.force, args.history_from, args.job_timeout, args.holdout_from)
+    elif args.cmd == 'reextract':
+        reextract(args.out, args.source_runtime, [x.strip() for x in args.symbols.split(',') if x.strip()] or None,
+                  [x.strip() for x in args.keys.split(',') if x.strip()] or None, args.history_from, args.job_timeout)
     elif args.cmd == 'rescore':
-        rescore(args.db, args.out, args.csv, args.history_from, args.min_trades)
+        rescore(args.db, args.out, args.csv, args.history_from, args.min_trades, args.holdout_from)
 
 if __name__ == '__main__':
     try:

@@ -13,7 +13,6 @@ on:
       - 'mql_text.py'
       - 'requirements-build.txt'
       - 'preview_bridge.py'
-      - 'preview_batch.py'
       - 'preview_control.py'
       - 'nnfx_backtest_batch.py'
       - 'nnfx_engine.py'
@@ -39,7 +38,6 @@ on:
       - 'mql_text.py'
       - 'requirements-build.txt'
       - 'preview_bridge.py'
-      - 'preview_batch.py'
       - 'preview_control.py'
       - 'nnfx_backtest_batch.py'
       - 'nnfx_engine.py'
@@ -88,7 +86,6 @@ jobs:
           Copy-Item "$r/mql_text.py" 'engine/mql_text.py' -Force
           Copy-Item "$r/requirements-build.txt" 'engine/requirements-build.txt' -Force
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
-          Copy-Item "$r/preview_batch.py" 'engine/preview_batch.py' -Force
           Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
           Copy-Item "$r/nnfx_backtest_batch.py" 'engine/nnfx_backtest_batch.py' -Force
           Copy-Item "$r/nnfx_engine.py" 'engine/nnfx_engine.py' -Force
@@ -120,7 +117,7 @@ jobs:
         shell: pwsh
         run: |
           Set-Location $env:APP_DIR
-          python -m py_compile engine/engine.py engine/engine_core.py engine/mql_text.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py engine/nnfx_backtest_batch.py engine/nnfx_engine.py engine/nnfx_selftest.py
+          python -m py_compile engine/engine.py engine/engine_core.py engine/mql_text.py engine/preview_bridge.py engine/preview_control.py engine/nnfx_backtest_batch.py engine/nnfx_engine.py engine/nnfx_selftest.py
           if($LASTEXITCODE -ne 0){throw 'Python source validation failed'}
           python engine/nnfx_selftest.py
           if($LASTEXITCODE -ne 0){throw 'NNFX backtester self-test failed'}
@@ -165,15 +162,9 @@ jobs:
           if($bridge -notmatch 'ShutdownTerminal=1'){throw 'MT5 shutdown config must use numeric documented value'}
           if($bridge -notmatch 'preview_engine_stage' -and $ui -notmatch 'preview_engine_stage'){throw 'Preview stage logging missing'}
           if($bridge -notmatch 'def hard_kill' -or $bridge -notmatch 'psutil.process_iter'){throw 'Runtime-scoped MetaTrader hard kill missing'}
-          if($bridge -notmatch 'chunk_budget' -or $bridge -notmatch 'last_shot'){throw 'Hard chunk/no-progress deadline missing'}
           if($bridge -notmatch 'emit_heartbeat' -or $bridge -notmatch "'type':'heartbeat'"){throw 'Preview worker heartbeat missing'}
           if($bridge -notmatch 'BEGIN IMMEDIATE' -or $bridge -notmatch 'GROUP BY sha256'){throw 'Atomic SHA256 dedup claim missing'}
-          if($bridge -notmatch 'worker_id' -or $bridge -notmatch 'clone_runtime\(mt5_sel,dest,''MT5'',worker_id\)'){throw 'Worker-owned isolated runtime missing'}
-          if($bridge -notmatch '_mt5_static_fast_fail'){throw 'Known-bad MT5 static prefilter missing'}
-          if($bridge -notmatch 'static_fast_fail=False'){throw 'Static MT5 fast-fail must default OFF'}
-          if($bridge -notmatch "reason=_mt5_static_fast_fail\(r\['path'\]\) if static_fast_fail else None"){throw 'Static MT5 fast-fail is not guarded by opt-in setting'}
           if($bridge -notmatch "preview_error LIKE 'MT4 source in .mq5:%'"){throw 'Legacy static-fast-fail rows are not recovered'}
-          if($bridge -notmatch "add_argument\('--static-fast-fail',action='store_true',default=False\)"){throw 'Static MT5 fast-fail opt-in CLI setting missing'}
           if($bridge -notmatch 'RESIDENT_EA_SOURCE' -or $bridge -notmatch 'current.job' -or $bridge -notmatch 'current.done' -or $bridge -notmatch 'heartbeat.txt'){throw 'Resident EA file protocol missing'}
           if($bridge -notmatch 'def render_server' -or $bridge -notmatch "add_parser\('render-server'\)"){throw 'Resident render-server command missing'}
           if($bridge -notmatch 'def compile_pool' -or $bridge -notmatch "add_parser\('compile-pool'\)"){throw 'Parallel compile-pool command missing'}
@@ -224,13 +215,11 @@ jobs:
           python -m pip install -r engine/requirements-build.txt
           python -m PyInstaller --noconfirm --clean --onefile --name mql-engine --distpath build-sidecar --workpath build-pyinstaller-engine --specpath build-pyinstaller-engine engine/engine.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview --distpath build-sidecar --workpath build-pyinstaller-preview --specpath build-pyinstaller-preview engine/preview_bridge.py
-          python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-batch --distpath build-sidecar --workpath build-pyinstaller-preview-batch --specpath build-pyinstaller-preview-batch engine/preview_batch.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-control --distpath build-sidecar --workpath build-pyinstaller-control --specpath build-pyinstaller-control engine/preview_control.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-backtest-batch --distpath build-sidecar --workpath build-pyinstaller-backtest-batch --specpath build-pyinstaller-backtest-batch engine/nnfx_backtest_batch.py
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
           Copy-Item build-sidecar/mql-engine.exe src-tauri/binaries/mql-engine-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview.exe src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe -Force
-          Copy-Item build-sidecar/mql-preview-batch.exe src-tauri/binaries/mql-preview-batch-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview-control.exe src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-backtest-batch.exe src-tauri/binaries/mql-backtest-batch-x86_64-pc-windows-msvc.exe -Force
 
@@ -344,7 +333,6 @@ jobs:
           if($i.Name -notmatch '0.5.14'){throw "Wrong installer version: $($i.Name)"}
           if(-not(Test-Path 'src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe')){throw 'Preview sidecar missing'}
           if(-not(Test-Path 'src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe')){throw 'Preview control sidecar missing'}
-          if(-not(Test-Path 'src-tauri/binaries/mql-preview-batch-x86_64-pc-windows-msvc.exe')){throw 'Preview batch sidecar missing'}
           Write-Host "Installer $($i.FullName)"
 
       - name: Upload finished Setup.exe

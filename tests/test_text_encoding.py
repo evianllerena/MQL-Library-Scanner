@@ -70,12 +70,6 @@ class PreviewBridgeTests(unittest.TestCase):
             self.assertFalse(preview_bridge._same_source(p, 'line1\nlineX\n'))
             self.assertFalse(preview_bridge._same_source(Path(d) / 'missing.mq5', 'x'))
 
-    def test_static_fast_fail_sees_utf8_source(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / 'mt4ish.mq5'
-            p.write_text('double x=MarketInfo(Symbol(),MODE_BID);\n', encoding='utf-8')
-            self.assertIsNotNone(preview_bridge._mt5_static_fast_fail(p))
-
 
 class EngineCoreTests(unittest.TestCase):
     def test_engine_core_and_bridge_agree(self):
