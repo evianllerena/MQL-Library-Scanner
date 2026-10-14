@@ -1473,6 +1473,13 @@ LEADERBOARD_COLUMNS = (
     'dd_breaker_trips', 'dd_breaker_halted_at_end')
 
 
+def job_label(job):
+    """Readable name for a candidate the library DB does not know (e.g. a reextract without the DB):
+    the staged file name -- the last part of the job's 'rel' path -- else the hash prefix."""
+    rel = (job.get('rel') or '').replace(chr(92), '/')  # chr(92) = backslash, the MT5 path separator
+    return rel.split('/')[-1] or job['key'][:12]
+
+
 def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN_TRADES, holdout_from=HOLDOUT_FROM):
     """Re-score a saved extraction (--out of an earlier run: nnfx_batch.json + per-symbol CSVs)
     with the current engine and write the leaderboard CSV ranked on expectancy_r. No MT5 needed.
@@ -1498,23 +1505,23 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
     for j in job_json['jobs']:
         fails = {sym: st for sym, st in failures.get(j['key'], {}).items() if sym in symbols}
         if fails:  # listed with the reason, never scored on empty columns
-            rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'],
+            rows.append(dict(indicator=names.get(j['key']) or job_label(j), slot=j['role'],
                              status=failure_reason(fails), trades=0, sufficient_sample=False, expectancy_r=0.0))
             continue
         col_b = j['key'] + '_b' if j['buf_b'] >= 0 else None
         garbage = extraction_problem(symbol_data, symbols, j['key'] + '_a', col_b)
         if garbage:  # same gate as run(): never scored on garbage columns
-            rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'],
+            rows.append(dict(indicator=names.get(j['key']) or job_label(j), slot=j['role'],
                              status=f'EXTRACT_GARBAGE: {garbage}', trades=0, sufficient_sample=False, expectancy_r=0.0))
             continue
         rp = repaint_label(verdicts, j['key'])
         if rp.startswith('repaints'):  # same gate as run()
-            rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status=f'EXTRACT_REPAINTS: {rp}',
+            rows.append(dict(indicator=names.get(j['key']) or job_label(j), slot=j['role'], status=f'EXTRACT_REPAINTS: {rp}',
                              trades=0, sufficient_sample=False, expectancy_r=0.0, repaint_test=rp))
             continue
         r = score_candidate(symbol_data, symbols, j['role'], j['key'] + '_a', col_b, None, score_from=history_from,
                             holdout_from=holdout_from)
-        rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status='scored', trades=r['trades'],
+        rows.append(dict(indicator=names.get(j['key']) or job_label(j), slot=j['role'], status='scored', trades=r['trades'],
                          sufficient_sample=r['is_trades'] >= min_trades, expectancy_r=r['expectancy_r'],
                          is_trades=r['is_trades'], is_expectancy_r=r['is_expectancy_r'], is_r_low=r['is_r_low'],
                          oos_trades=r['oos_trades'], oos_expectancy_r=r['oos_expectancy_r'], oos_pass=r['oos_pass'],
