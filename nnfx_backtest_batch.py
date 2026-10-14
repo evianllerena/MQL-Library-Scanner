@@ -206,6 +206,9 @@ def ensure_backtest_table(conn):
     for col in ('expectancy_r', 'expectancy_r_ci95'):  # ranking metric in R + its 95% margin
         if col not in cols:
             conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} REAL')
+    for col in ('fill_model', 'cost_model'):  # P1.1/P1.3/P1.7: which execution model scored the row
+        if col not in cols:
+            conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} TEXT')
     conn.commit()
 
 TESTABLE_SLOTS = ('CONFIRMATION_1', 'CONFIRMATION_2', 'BASELINE', 'VOLUME')
@@ -414,12 +417,12 @@ void OnStart(){
     string outfile="nnfx_batch_extract_"+sym+".csv";
     int fh=FileOpen(outfile,FILE_WRITE|FILE_TXT|FILE_ANSI);
     if(fh==INVALID_HANDLE){ AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"cannot_open_output\"}"); continue; }
-    string header="date,close,high,low,ma,macd_m,macd_s,rvi,atr,mom,vol";
+    string header="date,open,close,high,low,ma,macd_m,macd_s,rvi,atr,mom,vol";
     for(int k=0;k<njobs;k++){ header+=","+keys[k]+"_a"; if(bufB[k]>=0) header+=","+keys[k]+"_b"; }
     FileWriteString(fh,header+"\r\n");
     for(int i=total-1;i>=0;i--){
       datetime t=iTime(sym,PERIOD_D1,i);
-      string line=TimeToString(t,TIME_DATE)+","+DoubleToString(iClose(sym,PERIOD_D1,i),8)+","+
+      string line=TimeToString(t,TIME_DATE)+","+DoubleToString(iOpen(sym,PERIOD_D1,i),8)+","+DoubleToString(iClose(sym,PERIOD_D1,i),8)+","+
                   DoubleToString(iHigh(sym,PERIOD_D1,i),8)+","+DoubleToString(iLow(sym,PERIOD_D1,i),8)+","+
                   EV(ma[i])+","+EV(macdM[i])+","+EV(macdS[i])+","+EV(rvi[i])+","+EV(atr[i])+","+EV(i<gotMom?mom[i]:EMPTY_VALUE)+","+EV(i<gotVol?vol[i]:EMPTY_VALUE);
       for(int k=0;k<njobs;k++){ line+=","+EV(allA[k*total+i]); if(bufB[k]>=0) line+=","+EV(allB[k*total+i]); }
@@ -625,6 +628,9 @@ def _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref):
                        # X2 reference exit: Examples\Momentum(14), centre line 100 (not 0). Missing
                        # column (pre-FIX-2 extract) or warm-up EMPTY -> no exit indicator that bar.
                        exit_value=fnum(r.get('mom')), exit_zero_reference=REF_EXIT_ZERO_REFERENCE)
+            if 'open' in r:  # P1.3 gap fills + P1.7 next-open fills (a pre-P1 extract has no open)
+                bar['open'] = fnum(r['open'])
+                bar['next_open'] = fnum(rows[i + 1]['open']) if i + 1 < len(rows) else None
             if ref.enable_news_filter:  # N1/X5 (FIX 7): dormant unless switched on
                 bar.update(symbol=sym, time_utc=bar_close_utc(r['date'], ref.server_utc_offset_hours))
             bars.append(bar)
@@ -632,7 +638,27 @@ def _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref):
     return prepared
 
 
-def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_FROM):
+MAJORS = ('EURUSD', 'GBPUSD', 'AUDUSD', 'NZDUSD', 'USDCAD', 'USDCHF', 'USDJPY')
+# P1.1 trading costs (owner decision 2026-10-14, option 1B: flat defaults). Round trip in pips =
+# spread + commission; the engine charges half on every fill, against the trade.
+COST_SPREAD_MAJOR, COST_SPREAD_CROSS, COST_COMMISSION = 1.0, 2.0, 0.7
+COST_MODEL = (f'flat: majors {COST_SPREAD_MAJOR:g}+{COST_COMMISSION:g}, '
+              f'crosses {COST_SPREAD_CROSS:g}+{COST_COMMISSION:g} pips round trip')
+
+
+def round_trip_cost_pips(symbol):
+    spread = COST_SPREAD_MAJOR if symbol in MAJORS else COST_SPREAD_CROSS
+    return spread + COST_COMMISSION
+
+
+def fill_model(prepared):
+    """'next_open+gaps' when every symbol's bars carry the open (P1.3/P1.7); otherwise the legacy
+    close fill, which is named in the results so an old extract is never mistaken for the new model."""
+    has_open = all(bars and 'open' in bars[0] for bars in prepared.values() if bars)
+    return 'next_open+gaps' if has_open else 'close (legacy extract: no open column)'
+
+
+def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_FROM, costs=True):
     """One scoring pass over prepared bars at a given breaker setting. Fresh engines + a fresh
     shared account each call, so the two runs (off/on) are independent."""
     per_symbol = {}
@@ -643,8 +669,13 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
     # R1 (FIX 7b): ONE equity tracker shared by every symbol's engine, driven in date order
     # (run_lockstep), so the drawdown breaker and max_drawdown_pct see the candidate's whole account.
     account = EquityTracker()
+    model = fill_model(prepared)
     engines = {sym: NNFXEngine(NNFXParams(pip_size=0.01 if 'JPY' in sym else 0.0001,
-                                          enable_dd_breaker=enable_dd_breaker), equity=account)
+                                          enable_dd_breaker=enable_dd_breaker,
+                                          fill_at='next_open' if model == 'next_open+gaps' else 'close',
+                                          model_gaps=model == 'next_open+gaps',
+                                          round_trip_cost_pips=round_trip_cost_pips(sym) if costs else 0.0),
+                               equity=account)
                for sym in symbols}
     all_records = run_lockstep(engines, prepared)
     for sym in symbols:
@@ -685,7 +716,8 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
                 profit_factor=profit_factor, max_drawdown=round(maxdd, 1), bridge_skips=bridge_skips,
                 continuation_trades=continuation_trades, volume_skips=volume_skips,
                 max_drawdown_pct=round(account.max_dd_pct, 2), dd_breaker_skips=dd_breaker_skips, news_skips=news_skips,
-                per_symbol=per_symbol, fingerprints=fingerprints)
+                per_symbol=per_symbol, fingerprints=fingerprints, fill_model=model,
+                cost_model=COST_MODEL if costs else 'none')
 
 
 def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_from=DEFAULT_HISTORY_FROM):
@@ -985,24 +1017,26 @@ def write_score_row(conn, it, bed, r):
     conn.execute("""
         INSERT INTO backtest_results(sha256, slot, signal_type, bed, stage, trades, wins, losses,
             win_rate, expectancy_pips, expectancy_pips_breaker, expectancy_r, expectancy_r_ci95, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
-            mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b)
-        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?)
+            mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b, fill_model, cost_model)
+        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?,?,?)
         ON CONFLICT(sha256, slot, bed) DO UPDATE SET trades=excluded.trades, wins=excluded.wins,
             losses=excluded.losses, win_rate=excluded.win_rate, expectancy_pips=excluded.expectancy_pips,
             expectancy_pips_breaker=excluded.expectancy_pips_breaker,
             expectancy_r=excluded.expectancy_r, expectancy_r_ci95=excluded.expectancy_r_ci95,
             profit_factor=excluded.profit_factor, max_drawdown=excluded.max_drawdown, max_drawdown_pct=excluded.max_drawdown_pct,
-            bridge_skips=excluded.bridge_skips, continuation_trades=excluded.continuation_trades, tested_at=excluded.tested_at
+            bridge_skips=excluded.bridge_skips, continuation_trades=excluded.continuation_trades, tested_at=excluded.tested_at,
+            fill_model=excluded.fill_model, cost_model=excluded.cost_model
     """, (it['sha256'], it['slot'], it['signal_type'], bed, r['trades'], r['wins'], r['losses'], r['win_rate'],
           r['expectancy_pips'], r.get('expectancy_pips_breaker'), r['expectancy_r'], r['expectancy_r_ci95'], r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
-          f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b']))
+          f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b'],
+          r.get('fill_model'), r.get('cost_model')))
     conn.commit()
 
 LEADERBOARD_COLUMNS = (
     'indicator', 'slot', 'status', 'trades', 'sufficient_sample', 'expectancy_r', 'expectancy_r_ci95', 'expectancy_r_low',
     'expectancy_r_high', 'expectancy_pips', 'expectancy_pips_breaker', 'win_rate', 'profit_factor',
     'max_drawdown_pips', 'max_drawdown_pct', 'dd_breaker_skips', 'bridge_skips', 'continuation_trades',
-    'volume_skips', 'news_skips', 'symbols_traded')
+    'volume_skips', 'news_skips', 'symbols_traded', 'fill_model', 'cost_model')
 
 
 def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN_TRADES):
@@ -1045,7 +1079,8 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
                          max_drawdown_pct=r['max_drawdown_pct'], dd_breaker_skips=r['dd_breaker_skips'],
                          bridge_skips=r['bridge_skips'], continuation_trades=r['continuation_trades'],
                          volume_skips=r['volume_skips'], news_skips=r['news_skips'],
-                         symbols_traded=sum(1 for n in r['per_symbol'].values() if n)))
+                         symbols_traded=sum(1 for n in r['per_symbol'].values() if n),
+                         fill_model=r['fill_model'], cost_model=r['cost_model']))
     rows = leaderboard_order(rows, min_trades)
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = _csv.DictWriter(f, fieldnames=LEADERBOARD_COLUMNS, restval='')

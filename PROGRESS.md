@@ -47,6 +47,15 @@ Conventions: additive only; `nnfx_engine.py` is the source of truth; MQL5 harnes
   circuit breaker (resume when back under threshold). RANK with breaker OFF; show both
   breaker-off and breaker-on expectancy + max_drawdown_pct as a risk column. [USER-CONFIRMED]
 
+- Execution model (P1.1 / P1.3 / P1.7, owner decisions 2026-10-14: 1B, 3A): every order decided on a
+  close (entries; C1-flip / X2 / X4 / X5 exits) fills at the NEXT bar's open, like the MQL5 harness;
+  SL/TP1 are measured from that fill with the signal bar's ATR. An entry on the last bar cannot fill
+  (`skip:no_next_bar`). A stop the bar opens through fills at the open (gap); TP1 is a limit and fills
+  at its level. Costs: flat round trip = spread + 0.7 pip commission (spread 1.0 majors / 2.0 crosses),
+  half charged on every fill, against the trade. Extracts without an `open` column (pre-P1) are scored
+  with the legacy close fill and labelled `fill_model=close (legacy extract...)`. Part C fixtures keep
+  the legacy fill explicitly (`P()`); the model has its own checks (142/142).
+
 ## Open / STUB-TO-CONFIRM (working defaults in place; confirm against VP's videos)
 - E4 scope: implemented C1-OR-C2 symmetric. Source unclear; revisit if VP restricts it.
 - dd_resume_rule: `below_threshold` (resume when drawdown back under 10%). Confirm.
@@ -59,6 +68,9 @@ filter, three-EA architecture, broker lot rounding, hedging/netting. EA-only; do
 ## Known divergences (see BACKLOG.md)
 - MQL5 harness can re-enter on the same bar it exits; Python never does. Align in Fix 8.
 - MQL5 harness breaker/`max_drawdown_pct` is per-symbol; Python is one account across symbols.
+- Entry price: ALIGNED (P1.7). Python used to enter at the signal close; it now fills at the next open
+  like the harness. The harness needs no change: it already trades at the new bar's first tick, and the
+  Strategy Tester applies spread, commission and gaps natively.
 
 ## Biggest open workstream (NOT a code fix)
 Data history: MT5 serves ~455 daily bars/symbol => 5-40 trades per candidate => rankings are

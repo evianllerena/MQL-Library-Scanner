@@ -274,6 +274,20 @@ class NNFXParams:
     dd_resume_rule: str = 'below_threshold'
     volume_threshold_mult: float = 1.0
     pip_size: float = 0.0001
+    # --- Execution model (P1.1 / P1.3 / P1.7; owner decisions 2026-10-14: 1B costs, 3A next open) ---
+    # fill_at: every order decided on a bar's CLOSE (entries, and the C1-flip / X2 / X4 / X5 exits)
+    #   fills at the NEXT bar's open -- bar['next_open'] -- as it would live and as the MQL5 harness
+    #   trades. 'close' = the legacy fill at the decision close (Part C rule-proof fixtures). An entry
+    #   decided on the last bar (no next_open) cannot fill and is skipped ('skip:no_next_bar'); an
+    #   exit decided there fills at that close (end of data).
+    fill_at: str = 'next_open'
+    # model_gaps: a stop (initial SL, breakeven or trail) that the bar OPENS through fills at the open,
+    #   not at the stop level (weekend gaps). TP1 is a limit order: it fills at its level (a gap in the
+    #   trade's favour is not credited). Needs bar['open'].
+    model_gaps: bool = True
+    # round_trip_cost_pips: spread + commission per round trip, charged half on every fill (entry and
+    #   each exit), always against the trade. Per-pair values are set by the caller (the batch).
+    round_trip_cost_pips: float = 0.0
 
 
 @dataclass
@@ -313,8 +327,34 @@ class NNFXEngine:
         pos.realized_r += fraction * r
         self.equity.realize(fraction * r, self.params.risk_pct, self._date)
 
-    def _close_all(self, exit_price: float, reason: str) -> dict:
+    def _cost(self, direction: int) -> float:
+        """Half the round-trip cost as a price offset AGAINST a fill in `direction`."""
+        return direction * self.params.round_trip_cost_pips / 2.0 * self.params.pip_size
+
+    def _decision_fill(self, bar: dict) -> Optional[float]:
+        """Market price an order decided on this bar's close fills at (before costs)."""
+        if self.params.fill_at == 'close':
+            return bar['close']
+        return bar.get('next_open')
+
+    def _close_decided_fill(self, bar: dict) -> float:
+        """An exit decided on this close: next bar's open, or this close at the end of the data."""
+        fill = self._decision_fill(bar)
+        return bar['close'] if fill is None else fill
+
+    def _stop_fill(self, bar: dict, level: float, direction: int) -> float:
+        """A stop is touched this bar: it fills at its level, or at the open if the bar opened
+        beyond it (model_gaps)."""
+        if not self.params.model_gaps:
+            return level
+        if 'open' not in bar:
+            raise ValueError("model_gaps needs 'open' on every bar")
+        o = bar['open']
+        return min(level, o) if direction > 0 else max(level, o)
+
+    def _close_all(self, market_price: float, reason: str) -> dict:
         pos = self.position
+        exit_price = market_price - self._cost(pos.direction)
         pips = self._pips(pos.entry_price, exit_price, pos.direction)
         self._realize(pos, exit_price, 0.5 if pos.tp1_hit else 1.0)  # after TP1 only the runner is left
         self.last_exit_dir = pos.direction
@@ -368,22 +408,31 @@ class NNFXEngine:
             return 'skip:news'
         return None
 
+    def _open_position(self, direction: int, bar: dict, reason: str, record: dict, is_continuation: bool) -> bool:
+        """Shared by every entry type. Fills at _decision_fill plus costs; SL/TP1 are measured from
+        that fill with the signal bar's ATR. Returns False (record = skip) when vetoed (dd breaker /
+        news) or when there is no next bar to fill on."""
+        p = self.params
+        blocked = self._entry_block_reason(bar)
+        if not blocked and self._decision_fill(bar) is None:
+            blocked = 'skip:no_next_bar'
+        if blocked:
+            record.update({'action': 'skip', 'reason': blocked})
+            return False
+        entry = self._decision_fill(bar) + self._cost(direction)
+        sl = entry - p.sl_mult * bar['atr'] if direction > 0 else entry + p.sl_mult * bar['atr']
+        tp1 = entry + p.tp1_mult * bar['atr'] if direction > 0 else entry - p.tp1_mult * bar['atr']
+        self.position = Position(direction, entry, sl, tp1, bar['atr'], is_continuation=is_continuation)
+        record.update({'action': 'enter', 'reason': reason, 'direction': direction})
+        return True
+
     def _open(self, direction: int, bar: dict, reason: str, record: dict) -> dict:
         """Open a fresh (non-continuation) position and arm the continuation tracker.
         Shared by E1/E2/E3/E4 -- all of them establish an 'original entry' SS7 tracks from.
-        A vetoed entry (news) opens nothing and arms nothing."""
-        p = self.params
-        blocked = self._entry_block_reason(bar)
-        if blocked:
-            record.update({'action': 'skip', 'reason': blocked})
-            return record
-        entry = bar['close']
-        sl = entry - p.sl_mult * bar['atr'] if direction > 0 else entry + p.sl_mult * bar['atr']
-        tp1 = entry + p.tp1_mult * bar['atr'] if direction > 0 else entry - p.tp1_mult * bar['atr']
-        self.position = Position(direction, entry, sl, tp1, bar['atr'], is_continuation=False)
-        self.trend_dir = direction
-        self.continuation_ok = True
-        record.update({'action': 'enter', 'reason': reason, 'direction': direction})
+        A vetoed entry (news, breaker, no next bar) opens nothing and arms nothing."""
+        if self._open_position(direction, bar, reason, record, is_continuation=False):
+            self.trend_dir = direction
+            self.continuation_ok = True
         return record
 
     def process_bar(self, bar: dict) -> dict:
@@ -430,10 +479,12 @@ class NNFXEngine:
         # --- manage / hard-exit open position -------------------------------
         if self.position is not None:
             pos = self.position
+            if p.model_gaps and bar.get('open') is None:
+                raise ValueError("model_gaps needs 'open' on every bar")
             # SL check (either half still open uses the same SL until TP1 splits it)
             hit_sl = (bar['low'] <= pos.sl) if pos.direction > 0 else (bar['high'] >= pos.sl)
             if hit_sl:
-                rec = self._close_all(pos.sl, 'exit:stop_loss')
+                rec = self._close_all(self._stop_fill(bar, pos.sl, pos.direction), 'exit:stop_loss')
                 record.update(rec); return record
 
             # TP1 on half #1 (only before it has already been hit)
@@ -444,8 +495,9 @@ class NNFXEngine:
                     pos.half1_open = False
                     # remaining half's stop -> breakeven immediately (NNFX_RULESET_THE_TRUTH.txt SS5)
                     pos.sl = pos.entry_price
-                    self._realize(pos, pos.tp1, 0.5)
-                    half_pips = self._pips(pos.entry_price, pos.tp1, pos.direction)
+                    tp1_fill = pos.tp1 - self._cost(pos.direction)  # limit order: fills at its level
+                    self._realize(pos, tp1_fill, 0.5)
+                    half_pips = self._pips(pos.entry_price, tp1_fill, pos.direction)
                     record.update({'action': 'exit_half', 'reason': 'exit:tp1_half', 'pips': round(half_pips, 1)})
 
             # T4: after TP1 the runner sits at breakeven until a close reaches trail_activate_atr
@@ -464,7 +516,7 @@ class NNFXEngine:
 
             # hard exit: whole remaining position closes immediately on a C1 flip
             if pos.half2_open and c1dir != 0 and c1dir != pos.direction:
-                rec = self._close_all(bar['close'], 'exit:c1_flip')
+                rec = self._close_all(self._close_decided_fill(bar), 'exit:c1_flip')
                 # If TP1 ALSO fired on this same bar, blend half#1's TP1 pips with half#2's
                 # flip-exit pips the same way every other round trip is blended (equal-weighted
                 # average -- both halves are equal size). A prior version string-concatenated
@@ -498,7 +550,7 @@ class NNFXEngine:
                 if small_or_losing:
                     on_close_exit = 'exit:news'
             if on_close_exit:
-                rec = self._close_all(bar['close'], on_close_exit)
+                rec = self._close_all(self._close_decided_fill(bar), on_close_exit)
                 if record['action'] == 'exit_half':
                     rec['pips'] = round((record['pips'] + rec['pips']) / 2.0, 1)
                 record.update(rec)
@@ -541,16 +593,9 @@ class NNFXEngine:
                 c2_ok = (not p.require_c2_for_continuation) or (c2dir == d)
                 trigger = fresh_c1_signal and c2_ok
             if trigger:
-                blocked = self._entry_block_reason(bar)
-                if blocked:  # vetoed: nothing opens; the sequence stays as it was
-                    record.update({'action': 'skip', 'reason': blocked})
-                    return record
-                entry = bar['close']
-                sl = entry - p.sl_mult * bar['atr'] if d > 0 else entry + p.sl_mult * bar['atr']
-                tp1 = entry + p.tp1_mult * bar['atr'] if d > 0 else entry - p.tp1_mult * bar['atr']
-                self.position = Position(d, entry, sl, tp1, bar['atr'], is_continuation=True)
-                record.update({'action': 'enter', 'reason': 'enter:continuation', 'direction': d})
-                self.last_exit_dir = 0
+                # vetoed (breaker / news / no next bar): nothing opens; the sequence stays as it was
+                if self._open_position(d, bar, 'enter:continuation', record, is_continuation=True):
+                    self.last_exit_dir = 0
                 return record
 
         # --- shared entry conditions for this bar -----------------------------

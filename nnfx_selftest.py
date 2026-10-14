@@ -60,6 +60,10 @@ def _bar(date, close, baseline, c1_fast, c1_slow, c2_value, volume_value, atr=1.
 
 def P(**kw) -> NNFXParams:
     kw.setdefault('pip_size', 1.0)
+    # Rule-proof fixtures fill at the decision close with no gap model and no costs (they carry no
+    # open / next_open); the execution model has its own checks (P1.1 / P1.3 / P1.7 below).
+    kw.setdefault('fill_at', 'close')
+    kw.setdefault('model_gaps', False)
     return NNFXParams(**kw)
 
 
@@ -777,6 +781,91 @@ def unit_tests() -> Check:
     c.that('Leaderboard order: within a slot by expectancy_r, best first; an insufficient sample (<30 trades) sorts '
            'last however high its R', [(r['slot'], r['trades']) for r in board] ==
            [('BASELINE', 1632), ('BASELINE', 1272), ('BASELINE', 11), ('CONFIRMATION_1', 1933)], detail=str(board))
+
+    # --- P1.7 / P1.3 / P1.1 execution model: next-open fills, gap fills, trading costs -----------
+    # Long setup on 'x0' (cross above 100.0, C1+C2 long, within 1xATR, ATR 1.0, pip_size 1.0).
+    X = dict(fill_at='next_open', model_gaps=True)
+
+    def ex_setup(next_open=100.8, **kw):
+        b = _bar('x0', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)
+        b.update(open=100.0, next_open=next_open)
+        e = NNFXEngine(P(**{**X, **kw}))
+        return e, e.process_bar(b)
+
+    def ex_next(e, open_, low, high, close=100.5, c1=(1.0, 0.9), next_open=None):
+        b = _bar('x1', close, 100.0, c1[0], c1[1], 5.0, 10.0, close_prev=100.6, high=high, low=low)
+        b.update(open=open_, next_open=next_open)
+        return e.process_bar(b)
+
+    e, r = ex_setup()
+    pos = e.position
+    c.that('P1.7 next-open fill: an entry decided on the close (100.6) fills at the NEXT bar\'s open (100.8); '
+           'SL 1.5xATR (99.3) and TP1 1xATR (101.8) are measured from that fill',
+           r['reason'] == 'enter:standard' and pos and (pos.entry_price, pos.sl, pos.tp1) == (100.8, 99.3, 101.8),
+           detail=str(pos))
+    e, r = ex_setup(next_open=None)
+    c.that('P1.7 no next bar: an entry decided on the last bar cannot fill -> skip:no_next_bar, nothing opens '
+           'and continuation is not armed', r['reason'] == 'skip:no_next_bar' and e.position is None and e.trend_dir == 0,
+           detail=str(r))
+    e, _ = ex_setup()
+    r = ex_next(e, 100.7, 100.3, 100.9, c1=(0.9, 1.0), next_open=100.2)   # C1 flips short on this close
+    c.that('P1.7 close-decided exits fill at the next open: a C1-flip decided on this close exits at 100.2 '
+           '(-0.6 pips from the 100.8 fill), not at the close', r['reason'] == 'exit:c1_flip' and r['pips'] == -0.6,
+           detail=str(r))
+    e, _ = ex_setup()
+    r = ex_next(e, 98.9, 98.5, 99.0)
+    c.that('P1.3 gap through the stop: the bar opens at 98.9, below the 99.3 stop -> the stop fills at the open '
+           '(-1.9 pips, -1.2667R), not at the stop level', r['reason'] == 'exit:stop_loss' and r['pips'] == -1.9
+           and round(r['r'], 4) == -1.2667, detail=str(r))
+    e, _ = ex_setup()
+    r = ex_next(e, 99.8, 99.2, 99.9)
+    c.that('P1.3 no gap: the bar opens above the stop and trades through it -> the stop fills at its level (-1R)',
+           r['reason'] == 'exit:stop_loss' and round(r['r'], 4) == -1.0, detail=str(r))
+    e, _ = ex_setup()
+    r = ex_next(e, 102.5, 102.4, 103.0, close=102.9)
+    c.that('P1.3 TP1 is a limit: a bar gapping above TP1 (open 102.5) fills half #1 at the TP1 level 101.8 '
+           '(+1.0 pips), never credits the gap', r['reason'] == 'exit:tp1_half' and r['pips'] == 1.0, detail=str(r))
+    es = NNFXEngine(P(**X))
+    bs = _bar('xs0', 99.4, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5)
+    bs.update(open=100.0, next_open=99.2)                                   # short fills at 99.2, SL 100.7
+    es.process_bar(bs)
+    bs1 = _bar('xs1', 100.9, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=99.4, high=101.3, low=100.9)
+    bs1.update(open=101.1, next_open=None)                                   # opens above the 100.7 stop
+    rs = es.process_bar(bs1)
+    c.that('P1.3 mirrors for shorts: a short (fill 99.2, stop 100.7) whose next bar opens at 101.1 fills the stop at '
+           '101.1 (-1.9 pips)', rs['reason'] == 'exit:stop_loss' and rs['pips'] == -1.9, detail=str(rs))
+    e, _ = ex_setup(round_trip_cost_pips=0.2)
+    c.that('P1.1 costs: half the 0.2-pip round trip is paid on entry -> the long fills at 100.9 (100.8 + 0.1)',
+           round(e.position.entry_price, 4) == 100.9, detail=str(e.position))
+    r = ex_next(e, 99.8, 99.3, 99.9)
+    c.that('P1.1 costs: the stop (99.4 from the 100.9 fill) pays the other half -> fill 99.3, -1.6 pips, -1.0667R '
+           '(a stop-out with costs loses MORE than 1R)', r['reason'] == 'exit:stop_loss' and r['pips'] == -1.6
+           and round(r['r'], 4) == -1.0667, detail=str(r))
+    e, _ = ex_setup(round_trip_cost_pips=0.2)
+    r = ex_next(e, 101.0, 100.9, 102.0, close=101.9)
+    c.that('P1.1 costs: TP1 (101.9 from the 100.9 fill) books half #1 at 101.8 after its exit cost (+0.9 pips)',
+           r['reason'] == 'exit:tp1_half' and r['pips'] == 0.9, detail=str(r))
+    e, _ = ex_setup()
+    bad = _bar('x1', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6)
+    try:
+        e.process_bar(bad)
+        raised = False
+    except ValueError:
+        raised = True
+    c.that('P1.3 model_gaps never guesses: a bar with no open while gap fills are on raises instead of '
+           'filling at the stop level', raised)
+    c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
+           'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
+           and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)
+    legacy = nb.score_candidate({'EURUSD': {'rows': batch_rows(200.0)}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)
+    opened = []
+    for row in batch_rows(200.0) + [dict(batch_rows(200.0)[-1], date='2024.03.23')]:
+        opened.append(dict(row, open=row['close']))
+    new = nb.score_candidate({'EURUSD': {'rows': opened}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)
+    c.that('P1.7 batch: an extract with no open column is scored with the legacy close fill and SAYS so in '
+           'fill_model; one with an open column uses next_open+gaps', legacy['fill_model'].startswith('close (legacy')
+           and new['fill_model'] == 'next_open+gaps' and new['fingerprints']['EURUSD'][21][1:] == ('enter', 'enter:standard'),
+           detail=f"{legacy['fill_model']} | {new['fill_model']} {new['fingerprints']['EURUSD'][21:]}")
 
     return c
 
