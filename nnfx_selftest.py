@@ -1013,6 +1013,20 @@ def unit_tests() -> Check:
            'position exits at -1R and TP1 is not credited', r_both['reason'] == 'exit:stop_loss' and round(r_both['r'], 4) == -1.0,
            detail=str(r_both))
 
+    # P1.6: TP1 half and runner closing on DIFFERENT bars, through the batch scorer. Legacy close fill (no open
+    # column), EURUSD costs 1.7 pips round trip (0.85 per fill), pip 0.0001, ATR 1.0. Entry 100.6 -> fill 100.600085;
+    # TP1 101.600085 fills (limit, minus exit cost) at 101.6 -> +9999.15 pips; the C1 flip two bars later closes the
+    # runner at 102.0 - 0.000085 -> +13998.30 pips. Records carry pips rounded to 0.1 (9999.2, 13998.3), so the
+    # trade is their average, +11998.75.
+    tp_rows = batch_rows(200.0)
+    tp_rows.append(dict(tp_rows[-1], date='2024.03.23', close='101.2', high='101.7', low='100.5'))
+    tp_rows.append(dict(tp_rows[-1], date='2024.03.24', close='102.0', high='102.1', low='101.1', macd_m='0.9'))
+    res_tp = nb.score_candidate({'EURUSD': {'rows': tp_rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)
+    reasons_tp = [f[2] for f in res_tp['fingerprints']['EURUSD'][-3:]]
+    c.that('P1.6 TP1-then-runner on different bars: _score_run averages the two halves into ONE trade (+11998.75 pips)',
+           reasons_tp == ['enter:standard', 'exit:tp1_half', 'exit:c1_flip'] and res_tp['trades'] == 1
+           and abs(res_tp['expectancy_pips'] - 11998.75) <= 0.001, detail=f"{reasons_tp} {res_tp['trades']} {res_tp['expectancy_pips']}")
+
     # --- P1.4 statistics --------------------------------------------------------------------
     straddle = [dict(date='2024.03.29', action='enter', pips=''), dict(date='2024.03.30', action='exit_half', pips=10.0),
                 dict(date='2024.04.02', action='exit', pips=20.0, r=0.9),

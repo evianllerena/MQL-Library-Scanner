@@ -18,9 +18,9 @@ TRACE_REASONS = {
     'trace_4_continuation_then_reset.csv': ({'enter:standard', 'exit:c1_flip', 'enter:continuation'}, set()),
     'trace_5_volume_then_pullback_skips.csv': ({'skip:volume_filter', 'skip:beyond_1xATR'}, set()),
     'trace_6_x4_baseline_exit.csv': ({'exit:baseline_cross'}, set()),
-    'trace_7_x4_off_control.csv': (set(), {'exit:baseline_cross'}),
+    'trace_7_x4_off_control.csv': ({'enter:standard', 'exit:stop_loss'}, {'exit:baseline_cross'}),
     'trace_8_x2_exit_indicator.csv': ({'exit:exit_indicator'}, set()),
-    'trace_9_x2_no_exit_indicator_control.csv': (set(), {'exit:exit_indicator'}),
+    'trace_9_x2_no_exit_indicator_control.csv': ({'enter:standard', 'exit:baseline_cross'}, {'exit:exit_indicator'}),
     'trace_10_volume_filter_skip_then_take.csv': ({'skip:volume_filter', 'enter:standard'}, set()),
     'trace_11_e1_c1_trigger.csv': ({'enter:c1_trigger'}, set()),
     'trace_12_e3_pullback.csv': ({'skip:beyond_1xATR', 'enter:pullback'}, set()),
@@ -31,6 +31,13 @@ TRACE_REASONS = {
     'trace_17_t4_trail_activation.csv': ({'exit:tp1_half'}, set()),
     'trace_18_n1_news_block_then_enter.csv': ({'skip:news', 'enter:standard'}, set()),
     'trace_19_r1_dd_breaker.csv': ({'skip:dd_breaker', 'exit:stop_loss'}, set()),
+}
+# traces whose point is a skip FOLLOWED by an entry: (skip reason, entry reason)
+SKIP_THEN_ENTER = {
+    'trace_10_volume_filter_skip_then_take.csv': ('skip:volume_filter', 'enter:standard'),
+    'trace_12_e3_pullback.csv': ('skip:beyond_1xATR', 'enter:pullback'),
+    'trace_13_e4_one_candle.csv': ('skip:one_candle_wait', 'enter:one_candle'),
+    'trace_18_n1_news_block_then_enter.csv': ('skip:news', 'enter:standard'),
 }
 
 
@@ -44,16 +51,22 @@ class PartCChecks(unittest.TestCase):
 
 class PartCTraces(unittest.TestCase):
     def test_trace_contents(self):
-        out = Path(tempfile.mkdtemp(prefix='nnfx_traces_'))
-        written = {p.name for p in st.build_traces(out)}
-        self.assertTrue(set(TRACE_REASONS) <= written, sorted(set(TRACE_REASONS) - written))
-        for name, (must, must_not) in TRACE_REASONS.items():
-            with self.subTest(trace=name):
-                rows = list(csv.DictReader(open(out / name, encoding='utf-8')))
-                self.assertTrue(rows, 'empty trace')
-                reasons = {r['reason'] for r in rows if r.get('reason')}
-                self.assertTrue(must <= reasons, f'missing {must - reasons}')
-                self.assertFalse(must_not & reasons, f'unexpected {must_not & reasons}')
+        with tempfile.TemporaryDirectory(prefix='nnfx_traces_') as tmp:
+            out = Path(tmp)
+            written = {p.name for p in st.build_traces(out)}
+            self.assertTrue(set(TRACE_REASONS) <= written, sorted(set(TRACE_REASONS) - written))
+            for name, (must, must_not) in TRACE_REASONS.items():
+                with self.subTest(trace=name):
+                    with open(out / name, encoding='utf-8') as f:
+                        rows = list(csv.DictReader(f))
+                    self.assertTrue(rows, 'empty trace')
+                    order = [r['reason'] for r in rows if r.get('reason')]
+                    reasons = set(order)
+                    self.assertTrue(must <= reasons, f'missing {must - reasons}')
+                    self.assertFalse(must_not & reasons, f'unexpected {must_not & reasons}')
+                    if name in SKIP_THEN_ENTER:
+                        skip, enter = SKIP_THEN_ENTER[name]
+                        self.assertLess(order.index(skip), order.index(enter), f'{skip} must come before {enter}')
 
 
 if __name__ == '__main__':
