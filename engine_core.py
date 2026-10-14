@@ -64,10 +64,14 @@ def read_text(path: Path) -> str:
     # Raises on unreadable files (callers rely on that), unlike mql_text.read_mql_text.
     return decode_mql_bytes(Path(path).read_bytes())
 
+_CODE_TOKENS = re.compile(r'("(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\')|//[^\r\n]*|/\*.*?\*/', re.S)
+
+
 def strip_comments(text: str) -> str:
-    text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
-    text = re.sub(r'//[^\r\n]*', ' ', text)
-    return text
+    """Remove // and /* */ comments in ONE pass that skips string literals (P2): `//` inside
+    `#property link "https://..."` -- in almost every file -- used to eat the rest of the line,
+    closing quote included, which destabilised structural_fingerprint."""
+    return _CODE_TOKENS.sub(lambda m: m.group(1) if m.group(1) else ' ', text)
 
 def normalize_newlines(text: str) -> str:
     return text.replace('\r\n','\n').replace('\r','\n').replace('\x00','')
@@ -301,6 +305,23 @@ def structural_fingerprint(logic: str) -> str:
 def _has(logic: str, pattern: str, flags=re.I) -> bool:
     return bool(re.search(pattern, logic, flags))
 
+
+def uses_volume(logic: str) -> bool:
+    """Real volume use (P2): an INDEXED read (Volume[i], tick_volume[i], real_volume[i]) or a volume
+    function. The bare names used to count, so the `const long &tick_volume[]` parameter of every
+    MQL5 OnCalculate signature scored Volume +14 on nearly every indicator."""
+    return _has(logic, r'\b(?:Volume|tick_volume|real_volume)\s*\[\s*[^\]\s]') or \
+        _has(logic, r'\b(?:iVolume|iTickVolume|iRealVolume|CopyTickVolume|CopyRealVolume|iVolumes|iOBV|iMFI|iAD)\s*\(')
+
+
+def has_ob_os_levels(logic: str) -> bool:
+    """Overbought/oversold levels (P2): 70/80 or 30/20 as a LEVEL (indicator_levelN, SetLevelValue,
+    INDICATOR_LEVELVALUE) or the words overbought/oversold. `70|80 ... 30|20` anywhere in the file
+    (any period, shift or colour constant) used to count."""
+    level = r'(?:indicator_level\d+|SetLevelValue\s*\(|INDICATOR_LEVELVALUE)[^;\n]*?\b'
+    return _has(logic, level + r'(?:70|80)(?:\.0+)?\b') or _has(logic, level + r'(?:30|20)(?:\.0+)?\b') or \
+        _has(logic, r'\b(?:overbought|oversold)\b')
+
 def classify(filename: str, logic: str, stds: list[str], a: Analysis):
     scores={k:0.0 for k in CATEGORIES if k not in ('Unknown','Custom / Specialized','Composite / Multi-Purpose')}
     evidence=[]; tags=[]; techniques=[]
@@ -332,7 +353,7 @@ def classify(filename: str, logic: str, stds: list[str], a: Analysis):
     if _has(logic, r'\b(?:upperband|lowerband|upper_band|lower_band|channel|envelope)\b'):
         add_evidence(evidence,scores,'Volatility',10,'structure','Upper/lower band or channel structure detected')
         add_evidence(evidence,scores,'Support/Resistance',6,'structure','Band/channel boundaries may act as dynamic levels')
-    if _has(logic, r'\b(?:Volume|tick_volume|real_volume)\b'):
+    if uses_volume(logic):
         add_evidence(evidence,scores,'Volume',14,'data_dependency','Uses volume/tick-volume data'); techniques.append('Volume analysis')
     if _has(logic, r'\b(?:iHighest|iLowest)\s*\(|\bHigh\s*\[.*?\].*?\bLow\s*\[', re.I|re.S):
         add_evidence(evidence,scores,'Support/Resistance',12,'price_structure','High/low extrema logic detected'); techniques.append('Extrema / levels')
@@ -352,7 +373,7 @@ def classify(filename: str, logic: str, stds: list[str], a: Analysis):
         add_evidence(evidence,scores,'Signal',20,'behavior','Divergence logic detected'); tags.append('Divergence')
     if _has(logic, r'\b(?:breakout|break\s+above|break\s+below)\b'):
         add_evidence(evidence,scores,'Signal',12,'behavior','Breakout logic detected'); add_evidence(evidence,scores,'Support/Resistance',8,'behavior','Breakout references price boundaries'); tags.append('Breakout')
-    if _has(logic, r'\b(?:70|80)\b.*\b(?:30|20)\b|\boverbought\b|\boversold\b', re.I|re.S):
+    if has_ob_os_levels(logic):
         add_evidence(evidence,scores,'Oscillator',12,'threshold','Overbought/oversold threshold behavior detected'); tags.append('Overbought/Oversold')
     if _has(logic, r'\b(?:SetLevelValue|indicator_level\d+|indicator_minimum|indicator_maximum)\b'):
         add_evidence(evidence,scores,'Oscillator',10,'visual_structure','Separate-window level/boundary metadata detected')
