@@ -1,5 +1,10 @@
 # Library-wide batch previews
 
+> **Removed (P1.8, 2026-10-14).** `preview_batch.py` and its `mql-preview-batch` sidecar were deleted:
+> the app never called it (only `render-server` / `compile-pool` are wired in lib.rs), it used an
+> incompatible status vocabulary and image layout, and all its shards cloned into the same runtime.
+> The levers below live on in `preview_bridge.py`'s render-server path. Kept for history.
+
 Turns per-click previewing (14–35s each, serialized) into a background job that
 scales to 20k+ files. Built around four levers, highest impact first:
 

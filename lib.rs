@@ -222,65 +222,6 @@ fn start_scan_engine(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, 
     Ok(json!({"started":true,"engine":engine_path.to_string_lossy()}))
 }
 
-#[tauri::command]
-fn start_preview_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, String> {
-    let cmd0 = args.first().map(String::as_str);
-    if cmd0 != Some("plan") && cmd0 != Some("run") {
-        return Err("Only the plan and run commands are permitted through start_preview_batch".into());
-    }
-    let db_path = args.windows(2).find(|w| w[0] == "--db").map(|w| w[1].clone()).unwrap_or_default();
-    let current = std::env::current_exe().map_err(|e| format!("Cannot resolve app executable: {}", e))?;
-    let dir = current.parent().ok_or_else(|| "Cannot resolve application folder".to_string())?;
-    #[cfg(target_os = "windows")]
-    let engine_path = dir.join("mql-preview-batch.exe");
-    #[cfg(not(target_os = "windows"))]
-    let engine_path = dir.join("mql-preview-batch");
-    if !engine_path.exists() {
-        append_log(&db_path,"ERROR","preview_batch_missing",json!({"path":engine_path}),None);
-        return Err(format!("Batch preview engine was not found at {}", engine_path.display()));
-    }
-    append_log(&db_path,"INFO","preview_batch_start",json!({"engine":engine_path,"args":args}),None);
-    let mut cmd = ProcessCommand::new(&engine_path);
-    cmd.args(&args)
-        .env("PYTHONUTF8", "1")
-        .env("PYTHONIOENCODING", "utf-8")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-    let mut child = cmd.spawn().map_err(|e| {
-        append_log(&db_path,"ERROR","preview_batch_spawn_failed",json!({"error":e.to_string()}),None);
-        format!("Could not start batch preview engine: {}", e)
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| "Could not capture batch output".to_string())?;
-    let stderr = child.stderr.take().ok_or_else(|| "Could not capture batch errors".to_string())?;
-    let app_out = app.clone();
-    let db_out = db_path.clone();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            append_log(&db_out,"INFO","preview_batch_stdout",json!({"line":line}),None);
-            let _ = app_out.emit("preview-batch-line", json!({"line": line}));
-        }
-    });
-    let app_err = app.clone();
-    let db_err = db_path.clone();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            append_log(&db_err,"ERROR","preview_batch_stderr",json!({"line":line}),None);
-            let _ = app_err.emit("preview-batch-stderr", json!({"line": line}));
-        }
-    });
-    std::thread::spawn(move || {
-        let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-        append_log(&db_path, if code==0{"INFO"}else{"ERROR"}, "preview_batch_done", json!({"code":code}), None);
-        let _ = app.emit("preview-batch-done", json!({"code": code}));
-    });
-    Ok(json!({"started":true,"engine":engine_path.to_string_lossy()}))
-}
-
 fn preview_worker_args(base:&[String],worker_id:&str)->Vec<String> {
     let mut out=Vec::new();
     let mut i=0usize;
@@ -812,14 +753,6 @@ fn preview_queue_stats(db_path:String) -> Result<Value,String> {
 }
 
 #[tauri::command]
-fn write_preview_batch_sources(sources:Vec<String>) -> Result<Value,String> {
-    let path=std::env::temp_dir().join(format!("mql-preview-batch-{}-{}.json",std::process::id(),now_ms()));
-    let body=serde_json::to_string(&sources).map_err(|e|e.to_string())?;
-    fs::write(&path,body).map_err(|e|e.to_string())?;
-    Ok(json!({"path":path.to_string_lossy()}))
-}
-
-#[tauri::command]
 fn db_query(db_path:String, search:String, platform:String, category:String, review_only:bool, limit:i64, offset:i64, sort_by:Option<String>, sort_dir:Option<String>) -> Result<Value,String> {
     let conn=open_db(&db_path)?;
     let mut clauses:Vec<String>=Vec::new();
@@ -1052,7 +985,7 @@ pub fn run() {
     let result=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_batch,start_preview_library,preview_queue_update,preview_queue_stats,preview_worker_pause,write_preview_batch_sources,app_log,export_diagnostics,start_backtest_batch,db_backtest_query])
+        .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_library,preview_queue_update,preview_queue_stats,preview_worker_pause,app_log,export_diagnostics,start_backtest_batch,db_backtest_query])
         .run(tauri::generate_context!());
     if let Err(err)=result { log_startup_error(&format!("tauri startup error: {}",err)); }
 }

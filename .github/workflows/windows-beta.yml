@@ -13,7 +13,6 @@ on:
       - 'mql_text.py'
       - 'requirements-build.txt'
       - 'preview_bridge.py'
-      - 'preview_batch.py'
       - 'preview_control.py'
       - 'nnfx_backtest_batch.py'
       - 'nnfx_engine.py'
@@ -39,7 +38,6 @@ on:
       - 'mql_text.py'
       - 'requirements-build.txt'
       - 'preview_bridge.py'
-      - 'preview_batch.py'
       - 'preview_control.py'
       - 'nnfx_backtest_batch.py'
       - 'nnfx_engine.py'
@@ -88,7 +86,6 @@ jobs:
           Copy-Item "$r/mql_text.py" 'engine/mql_text.py' -Force
           Copy-Item "$r/requirements-build.txt" 'engine/requirements-build.txt' -Force
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
-          Copy-Item "$r/preview_batch.py" 'engine/preview_batch.py' -Force
           Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
           Copy-Item "$r/nnfx_backtest_batch.py" 'engine/nnfx_backtest_batch.py' -Force
           Copy-Item "$r/nnfx_engine.py" 'engine/nnfx_engine.py' -Force
@@ -120,7 +117,7 @@ jobs:
         shell: pwsh
         run: |
           Set-Location $env:APP_DIR
-          python -m py_compile engine/engine.py engine/engine_core.py engine/mql_text.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py engine/nnfx_backtest_batch.py engine/nnfx_engine.py engine/nnfx_selftest.py
+          python -m py_compile engine/engine.py engine/engine_core.py engine/mql_text.py engine/preview_bridge.py engine/preview_control.py engine/nnfx_backtest_batch.py engine/nnfx_engine.py engine/nnfx_selftest.py
           if($LASTEXITCODE -ne 0){throw 'Python source validation failed'}
           python engine/nnfx_selftest.py
           if($LASTEXITCODE -ne 0){throw 'NNFX backtester self-test failed'}
@@ -224,13 +221,11 @@ jobs:
           python -m pip install -r engine/requirements-build.txt
           python -m PyInstaller --noconfirm --clean --onefile --name mql-engine --distpath build-sidecar --workpath build-pyinstaller-engine --specpath build-pyinstaller-engine engine/engine.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview --distpath build-sidecar --workpath build-pyinstaller-preview --specpath build-pyinstaller-preview engine/preview_bridge.py
-          python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-batch --distpath build-sidecar --workpath build-pyinstaller-preview-batch --specpath build-pyinstaller-preview-batch engine/preview_batch.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-preview-control --distpath build-sidecar --workpath build-pyinstaller-control --specpath build-pyinstaller-control engine/preview_control.py
           python -m PyInstaller --noconfirm --clean --onefile --name mql-backtest-batch --distpath build-sidecar --workpath build-pyinstaller-backtest-batch --specpath build-pyinstaller-backtest-batch engine/nnfx_backtest_batch.py
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
           Copy-Item build-sidecar/mql-engine.exe src-tauri/binaries/mql-engine-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview.exe src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe -Force
-          Copy-Item build-sidecar/mql-preview-batch.exe src-tauri/binaries/mql-preview-batch-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-preview-control.exe src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe -Force
           Copy-Item build-sidecar/mql-backtest-batch.exe src-tauri/binaries/mql-backtest-batch-x86_64-pc-windows-msvc.exe -Force
 
@@ -344,7 +339,6 @@ jobs:
           if($i.Name -notmatch '0.5.14'){throw "Wrong installer version: $($i.Name)"}
           if(-not(Test-Path 'src-tauri/binaries/mql-preview-x86_64-pc-windows-msvc.exe')){throw 'Preview sidecar missing'}
           if(-not(Test-Path 'src-tauri/binaries/mql-preview-control-x86_64-pc-windows-msvc.exe')){throw 'Preview control sidecar missing'}
-          if(-not(Test-Path 'src-tauri/binaries/mql-preview-batch-x86_64-pc-windows-msvc.exe')){throw 'Preview batch sidecar missing'}
           Write-Host "Installer $($i.FullName)"
 
       - name: Upload finished Setup.exe
