@@ -38,6 +38,7 @@ async function execSidecar(name,args){
 function detailSource(){
   const detail=document.getElementById('detail');
   if(!detail)return null;
+  if(detail.dataset.sourcePath)return detail.dataset.sourcePath; // set by main.js showDetail (P2)
   for(const section of detail.querySelectorAll('.section')){
     if(section.querySelector('.label')?.textContent?.trim()==='File')return section.querySelector('.value')?.textContent?.trim()||null;
   }
