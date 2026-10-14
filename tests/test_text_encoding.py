@@ -69,12 +69,8 @@ class PreviewBridgeTests(unittest.TestCase):
             self.assertTrue(preview_bridge._same_source(p, 'line1\nline2\n'))
             self.assertFalse(preview_bridge._same_source(p, 'line1\nlineX\n'))
             self.assertFalse(preview_bridge._same_source(Path(d) / 'missing.mq5', 'x'))
-
-    def test_static_fast_fail_sees_utf8_source(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / 'mt4ish.mq5'
-            p.write_text('double x=MarketInfo(Symbol(),MODE_BID);\n', encoding='utf-8')
-            self.assertIsNotNone(preview_bridge._mt5_static_fast_fail(p))
+    # (P1.8: the _mt5_static_fast_fail test went with the function -- it only served the deleted
+    #  render_library pipeline.)
 
 
 class EngineCoreTests(unittest.TestCase):

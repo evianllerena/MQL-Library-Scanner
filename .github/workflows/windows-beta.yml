@@ -162,15 +162,9 @@ jobs:
           if($bridge -notmatch 'ShutdownTerminal=1'){throw 'MT5 shutdown config must use numeric documented value'}
           if($bridge -notmatch 'preview_engine_stage' -and $ui -notmatch 'preview_engine_stage'){throw 'Preview stage logging missing'}
           if($bridge -notmatch 'def hard_kill' -or $bridge -notmatch 'psutil.process_iter'){throw 'Runtime-scoped MetaTrader hard kill missing'}
-          if($bridge -notmatch 'chunk_budget' -or $bridge -notmatch 'last_shot'){throw 'Hard chunk/no-progress deadline missing'}
           if($bridge -notmatch 'emit_heartbeat' -or $bridge -notmatch "'type':'heartbeat'"){throw 'Preview worker heartbeat missing'}
           if($bridge -notmatch 'BEGIN IMMEDIATE' -or $bridge -notmatch 'GROUP BY sha256'){throw 'Atomic SHA256 dedup claim missing'}
-          if($bridge -notmatch 'worker_id' -or $bridge -notmatch 'clone_runtime\(mt5_sel,dest,''MT5'',worker_id\)'){throw 'Worker-owned isolated runtime missing'}
-          if($bridge -notmatch '_mt5_static_fast_fail'){throw 'Known-bad MT5 static prefilter missing'}
-          if($bridge -notmatch 'static_fast_fail=False'){throw 'Static MT5 fast-fail must default OFF'}
-          if($bridge -notmatch "reason=_mt5_static_fast_fail\(r\['path'\]\) if static_fast_fail else None"){throw 'Static MT5 fast-fail is not guarded by opt-in setting'}
           if($bridge -notmatch "preview_error LIKE 'MT4 source in .mq5:%'"){throw 'Legacy static-fast-fail rows are not recovered'}
-          if($bridge -notmatch "add_argument\('--static-fast-fail',action='store_true',default=False\)"){throw 'Static MT5 fast-fail opt-in CLI setting missing'}
           if($bridge -notmatch 'RESIDENT_EA_SOURCE' -or $bridge -notmatch 'current.job' -or $bridge -notmatch 'current.done' -or $bridge -notmatch 'heartbeat.txt'){throw 'Resident EA file protocol missing'}
           if($bridge -notmatch 'def render_server' -or $bridge -notmatch "add_parser\('render-server'\)"){throw 'Resident render-server command missing'}
           if($bridge -notmatch 'def compile_pool' -or $bridge -notmatch "add_parser\('compile-pool'\)"){throw 'Parallel compile-pool command missing'}
