@@ -130,4 +130,4 @@ if __name__ == '__main__':
                 return rec
         for i, rec in enumerate(ex.map(safe, todo), 1):
             if rec.get('skipped'): continue
-            print(f"{i}/{len(todo)} {rec['name'][:40]} passes={rec.get("passes")} {rec['seconds']}s {rec['agent'][:60]}", flush=True)
+            print(f"{i}/{len(todo)} {rec['name'][:40]} passes={rec.get('passes')} {rec['seconds']}s {rec['agent'][:60]}", flush=True)

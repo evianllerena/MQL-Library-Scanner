@@ -53,5 +53,32 @@ class MachinePathsTest(unittest.TestCase):
             importlib.reload(fix_paths)
 
 
+class PrePy312SyntaxTest(unittest.TestCase):
+    """Before Python 3.12 (PEP 701) a replacement field may not reuse the f-string's own quote character."""
+
+    def test_no_f_string_reuses_its_own_quote(self):
+        import io
+        import tokenize
+        if sys.version_info < (3, 12):          # older interpreters reject such files outright
+            for p in sorted(TOOLS.glob('*.py')):
+                compile(p.read_text(encoding='utf-8'), str(p), 'exec')
+            return
+        hits = []
+        for p in sorted(TOOLS.glob('*.py')):
+            quotes = []                          # quote char of each enclosing f-string
+            for tok in tokenize.generate_tokens(io.StringIO(p.read_text(encoding='utf-8')).readline):
+                if tok.type == tokenize.FSTRING_START:
+                    q = tok.string.lstrip('rRbBfFuU')[:1]
+                    if q in quotes:
+                        hits.append(f'{p.name}:{tok.start[0]}')
+                    quotes.append(q)
+                elif tok.type == tokenize.FSTRING_END:
+                    quotes.pop()
+                elif tok.type == tokenize.STRING and quotes:
+                    if tok.string.lstrip('rRbBfFuU')[:1] in quotes:
+                        hits.append(f'{p.name}:{tok.start[0]}')
+        self.assertEqual(hits, [])
+
+
 if __name__ == '__main__':
     unittest.main()
