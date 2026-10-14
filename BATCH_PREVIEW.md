@@ -20,7 +20,7 @@ scales to 20k+ files. Built around four levers, highest impact first:
 | `preview_batch.py` | done; core tested on Linux, render path needs Windows validation | the batch engine (plan/run), dedup/cache, sharding, DB writeback, MT5/MT4 single-session renderers, embedded MQL controllers |
 | `tauri.conf.json` | done | declares `binaries/mql-preview-batch` |
 | `default.json` | done | shell execute/spawn permission for the sidecar |
-| `build_windows.ps1` | done | PyInstaller build line for the sidecar |
+| `build_windows.ps1` | done (script removed in P0.7; CI builds the sidecar) | PyInstaller build line for the sidecar |
 | `lib.rs` | done; needs `cargo build` to compile-verify | `start_preview_batch` streaming command (mirrors `start_scan_engine`); `db_query` now returns preview columns |
 | **frontend hooks** | **you apply** — see below | trigger after scan; show thumbnails; prioritize on-screen |
 
@@ -99,7 +99,8 @@ early.
 
 ## Build
 
-`build_windows.ps1` now builds `mql-preview-batch` via PyInstaller. Because
+(Historical: `build_windows.ps1` was removed in P0.7; CI builds this sidecar.)
+`build_windows.ps1` built `mql-preview-batch` via PyInstaller. Because
 `preview_batch.py` imports `preview_bridge.py`, both must sit in the folder passed
 to PyInstaller (`--paths` is set for that). Adjust the source path to match your
 build layout. **Note:** the pre-existing `mql-preview` and `mql-preview-control`
