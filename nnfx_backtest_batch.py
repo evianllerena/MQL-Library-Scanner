@@ -32,7 +32,16 @@ import argparse, json, os, shutil, sqlite3, sys, time, hashlib, threading, tempf
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import preview_bridge as pb  # discovery, clone_runtime, compile_file, stage, mql_dir_name, ...
+class _LazyPreviewBridge:
+    """preview_bridge (discovery, clone_runtime, compile_file, stage, mql_dir_name, ...), imported on first
+    use (P1.6): the pure scoring path and the no-MT5 self-test must not load the MT5 preview bridge. The
+    import stays a plain statement so PyInstaller still bundles preview_bridge into the sidecar."""
+    def __getattr__(self, name):
+        import preview_bridge
+        return getattr(preview_bridge, name)
+
+
+pb = _LazyPreviewBridge()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from nnfx_engine import NNFXEngine, NNFXParams, EquityTracker, bar_close_utc, run_lockstep
