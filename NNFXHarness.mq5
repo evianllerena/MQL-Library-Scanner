@@ -499,8 +499,10 @@ bool NewsAhead(int shift)
    if(!EnableNewsFilter || ArraySize(g_newsCur)==0) return(false);
    datetime t = iTime(_Symbol,PERIOD_D1,shift) + 86400 - (datetime)(ServerUTCOffsetHours*3600);
    datetime until = t + (datetime)(NewsWindowHours*3600);
-   MqlDateTime u; TimeToStruct(until,u);
-   while(u.day_of_week==0 || u.day_of_week==6) { until+=86400; TimeToStruct(until,u); } // P1.5: skip the weekend
+   // P1.5: if the bar that would close at `until` opens on a Saturday/Sunday in SERVER time, push the
+   // window to Monday's close (engine: news_window_end)
+   MqlDateTime u; TimeToStruct(until+(datetime)(ServerUTCOffsetHours*3600)-1,u);
+   while(u.day_of_week==0 || u.day_of_week==6) { until+=86400; TimeToStruct(until+(datetime)(ServerUTCOffsetHours*3600)-1,u); }
    string base=StringSubstr(_Symbol,0,3), quote=StringSubstr(_Symbol,3,3);
    for(int i=0;i<ArraySize(g_newsCur);i++)
       if((g_newsCur[i]==base || g_newsCur[i]==quote) && g_newsTime[i]>t && g_newsTime[i]<=until)
@@ -508,18 +510,25 @@ bool NewsAhead(int shift)
    return(false);
 }
 
+// R1 (engine: _breaker_update): trip when the drawdown from g_breakerRef reaches DDBreakerPct; resume
+// when it is back under, or (default rule) after DDCooldownBars bars, re-basing g_breakerRef. Runs at the
+// start of every bar and before every entry. true = tripped.
+bool BreakerUpdate()
+{
+   if(!EnableDDBreaker || g_breakerRef<=0) return(false);
+   double bal=AccountInfoDouble(ACCOUNT_BALANCE);
+   double dd=(g_breakerRef-bal)/g_breakerRef*100.0;
+   if(g_ddTrippedAt<0) { if(dd>=DDBreakerPct) { g_ddTrippedAt=g_barIndex; g_ddTrips++; } }
+   else if(dd<DDBreakerPct) { g_ddTrippedAt=-1; g_ddResumes++; }
+   else if(DDResumeRule=="below_threshold_or_cooldown" && g_barIndex-g_ddTrippedAt>=DDCooldownBars)
+      { g_breakerRef=bal; g_ddTrippedAt=-1; g_ddResumes++; }
+   return(g_ddTrippedAt>=0);
+}
+
 // Rules that veto ANY new trade (every entry type, continuation included). Logs the skip.
 bool EntryBlocked(int dir,double atrVal)
 {
-   if(EnableDDBreaker && g_ddTrippedAt>=0)
-   {
-      double bal=AccountInfoDouble(ACCOUNT_BALANCE);
-      double dd=(g_breakerRef-bal)/g_breakerRef*100.0;
-      if(dd<DDBreakerPct) { g_ddTrippedAt=-1; g_ddResumes++; }                       // recovered
-      else if(DDResumeRule=="below_threshold_or_cooldown" && g_barIndex-g_ddTrippedAt>=DDCooldownBars)
-         { g_breakerRef=bal; g_ddTrippedAt=-1; g_ddResumes++; }                       // flat deadlock: re-base
-      else { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:dd_breaker"); g_summaryDDSkips++; return(true); }
-   }
+   if(BreakerUpdate()) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:dd_breaker"); g_summaryDDSkips++; return(true); }
    if(NewsAhead(1)) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:news"); g_summaryNewsSkips++; return(true); }
    return(false);
 }
@@ -730,9 +739,7 @@ void OnNewDailyBar()
 {
    int shift=1; // last CLOSED bar; shift 0 is the still-forming bar, never read
    g_barIndex++; // one per closed bar, like the engine's idx -- so E4's "next bar" is exactly +1
-   if(EnableDDBreaker && g_ddTrippedAt<0 && g_breakerRef>0 &&
-      (g_breakerRef-AccountInfoDouble(ACCOUNT_BALANCE))/g_breakerRef*100.0>=DDBreakerPct)
-      { g_ddTrippedAt=g_barIndex; g_ddTrips++; }  // R1 trips on the first bar after the breach (engine: same)
+   BreakerUpdate();  // R1: trip / resume on every bar (engine: same), so trips and halted-at-end never lag
    double atrVal;
    if(!BufVal(h_atr,0,shift,atrVal) || atrVal<=0) return;
 

@@ -924,12 +924,12 @@ def unit_tests() -> Check:
 
     # R1 deadlock (P1.5): two 6% stop-outs while FLAT take the account 11.64% below its peak; nothing is
     # open, so no close can lift it back under 10%. 22 quiet bars later a valid setup arrives.
-    def flat_deadlock(**kw):
+    def flat_deadlock(n_quiet=22, **kw):
         e = NNFXEngine(P(risk_pct=6.0, **kw))
         setup = lambda d: _bar(d, 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)
         stop = lambda d: _bar(d, 99.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.6, high=100.7, low=99.0)
         seq = [setup('d01'), stop('d02'), setup('d03'), stop('d04')]
-        seq += [_bar(f'q{i:02d}', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0) for i in range(22)]
+        seq += [_bar(f'q{i:02d}', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0) for i in range(n_quiet)]
         seq += [setup('d27')]
         recs = [e.process_bar(b) for b in seq]
         return recs, e.equity
@@ -940,6 +940,12 @@ def unit_tests() -> Check:
            and recs_dl[-1]['reason'] == 'enter:standard' and (acct_dl.trips, acct_dl.resumes) == (1, 1)
            and round(acct_dl.max_dd_pct, 2) == 11.64, detail=f"{recs_dl[-1]['reason']} trips={acct_dl.trips} resumes={acct_dl.resumes}")
     recs_old, acct_old = flat_deadlock(dd_resume_rule='below_threshold')
+    edge19, _ = flat_deadlock(n_quiet=19)
+    edge20, acct20 = flat_deadlock(n_quiet=20)
+    c.that('P1.5 R1 cooldown boundary: tripped on the first bar after the breach (date 5), a setup on date 24 '
+           '(19 dates later) is still skipped and one on date 25 (20 dates later) enters',
+           edge19[-1]['reason'] == 'skip:dd_breaker' and edge20[-1]['reason'] == 'enter:standard'
+           and acct20.tripped_at is None, detail=f"{edge19[-1]['reason']} {edge20[-1]['reason']}")
     c.that('P1.5 R1 deadlock control: with the old rule (below_threshold) the same flat account never resumes -- '
            'the setup is skipped (skip:dd_breaker) and the breaker is still tripped at the end',
            recs_old[-1]['reason'] == 'skip:dd_breaker' and acct_old.tripped_at is not None and acct_old.resumes == 0,
@@ -976,6 +982,18 @@ def unit_tests() -> Check:
     c.that('P1.5 news window over a weekend: a Friday close\'s 24h window would end Saturday; it is pushed to Monday, '
            'so a High EUR event Monday 10:00 UTC blocks the Friday entry (skip:news)', r_fri['reason'] == 'skip:news'
            and str(news_window_end(fri)) == '2025-04-07 21:00:00+00:00', detail=f"{r_fri['reason']} {news_window_end(fri)}")
+    fri0 = datetime(2025, 4, 5, 0, 0, tzinfo=timezone.utc)          # Friday's bar close at server offset 0
+    c.that('P1.5 news window, server offset 0: Friday\'s close is Saturday 00:00 UTC; the window still runs to '
+           'Monday\'s close (Tuesday 00:00 UTC), not just to Monday 00:00',
+           str(news_window_end(fri0, 24.0, 0.0)) == '2025-04-08 00:00:00+00:00'
+           and str(news_window_end(fri, 24.0, 3.0)) == '2025-04-07 21:00:00+00:00'
+           and str(news_window_end(datetime(2025, 4, 1, 21, 0, tzinfo=timezone.utc), 24.0, 3.0)) == '2025-04-02 21:00:00+00:00',
+           detail=f'{news_window_end(fri0, 24.0, 0.0)} {news_window_end(fri, 24.0, 3.0)}')
+    try:
+        NNFXParams(dd_resume_rule='below_treshold'); bad_rule = False
+    except ValueError:
+        bad_rule = True
+    c.that('P1.5 a mistyped dd_resume_rule / fill_at raises instead of silently using another rule', bad_rule)
     hold_rec = NNFXEngine(P()).process_bar(_bar('h0', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0))
     c.that('P1.5 record pips is None or a number (never the empty string that used to be added to floats)',
            hold_rec['pips'] is None and not hasattr(Position(1, 1.0, 0.5, 1.5, 0.1), 'half2_open'), detail=str(hold_rec['pips']))

@@ -132,12 +132,15 @@ def bar_close_utc(date: str, server_utc_offset_hours: float) -> datetime:
     return (opened + timedelta(days=1) - timedelta(hours=server_utc_offset_hours)).replace(tzinfo=timezone.utc)
 
 
-def news_window_end(t: datetime, hours: float = 24.0) -> datetime:
-    """End of the N1/X5 news window that starts at decision moment t (UTC). P1.5: a window that ends on
-    a Saturday or Sunday is pushed day by day to Monday -- the market is closed, so a Friday close's
-    24 h would otherwise cover only the weekend and miss the events before the next trading close."""
+def news_window_end(t: datetime, hours: float = 24.0, server_utc_offset_hours: float = 0.0) -> datetime:
+    """End of the N1/X5 news window that starts at decision moment t (UTC). P1.5: if the daily bar that
+    would close at the window's end opens on a Saturday or Sunday in SERVER time, the window is pushed
+    day by day to Monday's close -- the market is closed, so a Friday close's 24 h would otherwise cover
+    only the weekend and miss the events before the next trading close. Server time, not UTC: at offset
+    0 Friday's bar closes at Saturday 00:00 UTC, which is still Friday's bar."""
     until = t + timedelta(hours=hours)
-    while until.weekday() >= 5:
+    shift = timedelta(hours=server_utc_offset_hours) - timedelta(seconds=1)
+    while (until + shift).weekday() >= 5:
         until += timedelta(days=1)
     return until
 
@@ -303,6 +306,8 @@ class NNFXParams:
     dd_breaker_pct: float = 10.0
     dd_resume_rule: str = 'below_threshold_or_cooldown'
     dd_cooldown_bars: int = 20
+    # NB: trips / resumes are counted from the first bar the engines see (warm-up included), while the
+    # batch's dd_breaker_skips counts from score_from.
     volume_threshold_mult: float = 1.0
     pip_size: float = 0.0001
     # --- Execution model (P1.1 / P1.3 / P1.7; owner decisions 2026-10-14: 1B costs, 3A next open) ---
@@ -319,6 +324,13 @@ class NNFXParams:
     # round_trip_cost_pips: spread + commission per round trip, charged half on every fill (entry and
     #   each exit), always against the trade. Per-pair values are set by the caller (the batch).
     round_trip_cost_pips: float = 0.0
+
+    def __post_init__(self):
+        # a mistyped mode used to fall back silently to another rule
+        for name, allowed in (('dd_resume_rule', ('below_threshold', 'below_threshold_or_cooldown')),
+                              ('fill_at', ('next_open', 'close'))):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f'{name}={getattr(self, name)!r}; allowed: {allowed}')
 
 
 @dataclass
@@ -433,7 +445,7 @@ class NNFXEngine:
             raise ValueError("enable_news_filter needs 'symbol' and 'time_utc' on every bar")
         events = load_news_calendar(p.news_calendar)
         t = bar['time_utc']
-        until = news_window_end(t, p.news_window_hours)
+        until = news_window_end(t, p.news_window_hours, p.server_utc_offset_hours)
         for cur in (bar['symbol'][:3].upper(), bar['symbol'][3:6].upper()):
             ts = events.get(cur, [])
             i = bisect.bisect_right(ts, t)  # first event strictly after t
@@ -441,19 +453,29 @@ class NNFXEngine:
                 return True
         return False
 
+    def _breaker_update(self) -> bool:
+        """R1: trip the (shared) breaker when the drawdown from its reference reaches dd_breaker_pct;
+        resume it when the drawdown is back under (closed trades recovered it) or, with the default
+        rule, after dd_cooldown_bars trading dates (re-basing the reference). Runs at the start of every
+        bar and before every entry, so the trips / halted-at-end flags never lag. True = tripped."""
+        p, eq = self.params, self.equity
+        if not p.enable_dd_breaker:
+            return False
+        if eq.tripped_at is None:
+            if eq.breaker_dd_pct() >= p.dd_breaker_pct:
+                eq.tripped_at = eq.dates_seen; eq.trips += 1
+        elif eq.breaker_dd_pct() < p.dd_breaker_pct:
+            eq.tripped_at = None; eq.resumes += 1
+        elif p.dd_resume_rule == 'below_threshold_or_cooldown' and eq.dates_seen - eq.tripped_at >= p.dd_cooldown_bars:
+            eq.breaker_ref = eq.equity
+            eq.tripped_at = None; eq.resumes += 1
+        return eq.tripped_at is not None
+
     def _entry_block_reason(self, bar: dict) -> Optional[str]:
         """Rules that veto ANY new trade (every entry type, continuation included)."""
         p = self.params
-        eq = self.equity
-        if p.enable_dd_breaker and eq.tripped_at is not None:  # R1
-            if eq.breaker_dd_pct() < p.dd_breaker_pct:
-                eq.tripped_at = None; eq.resumes += 1                    # recovered by closing trades
-            elif p.dd_resume_rule == 'below_threshold_or_cooldown' and \
-                    eq.dates_seen - eq.tripped_at >= p.dd_cooldown_bars:
-                eq.breaker_ref = eq.equity                               # flat deadlock: re-base, resume
-                eq.tripped_at = None; eq.resumes += 1
-            else:
-                return 'skip:dd_breaker'
+        if self._breaker_update():  # R1
+            return 'skip:dd_breaker'
         if self._news_ahead(bar):
             return 'skip:news'
         return None
@@ -495,9 +517,7 @@ class NNFXEngine:
         for r in self._deferred_r:  # exits decided on the previous close filled at this bar's open
             self.equity.realize(r, p.risk_pct, self._date)
         self._deferred_r.clear()
-        eq = self.equity
-        if p.enable_dd_breaker and eq.tripped_at is None and eq.breaker_dd_pct() >= p.dd_breaker_pct:
-            eq.tripped_at = eq.dates_seen; eq.trips += 1                 # R1 trips on the first bar after the breach
+        self._breaker_update()  # R1: trip / resume on every bar (trips and halted-at-end never lag)
         self.c1_history.append((bar['c1_fast'], bar['c1_slow']))
         idx = len(self.c1_history) - 1
 
