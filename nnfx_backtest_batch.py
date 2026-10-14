@@ -585,10 +585,14 @@ void OnStart(){
   bool rp_ok=nsyms>0 && MakeCustom("NNFXR_FULL",rsym,0) && MakeCustom("NNFXR_CUT",rsym,RP_CUT);
   g_bars_full=Bars("NNFXR_FULL",PERIOD_D1); g_bars_cut=Bars("NNFXR_CUT",PERIOD_D1);
   AppendResult("{\"info\":\"repaint_test\",\"symbol\":\""+rsym+"\",\"custom_symbols\":"+(rp_ok?"true":"false")+"}");
-  // controls, every session: MetaTrader's own moving average must come out aligned and its own ZigZag
-  // must come out repainting -- otherwise no verdict of this session is trusted (checked in Python)
+  // controls, every session: MetaTrader's own moving average must come out aligned, and the deterministic
+  // positive control NNFXR_Mirror (reads close newest-first without ArraySetAsSeries -- the exact bug of
+  // unflipped MQL4 conversions) must come out repainting; otherwise no verdict of this session is trusted
+  // (checked in Python). MetaTrader's ZigZag is recorded for information only: on some histories its
+  // shared window holds too few pivots to compare.
   if(rp_ok){
     AppendResult("{\"repaint_control\":\"Examples\\\\Custom Moving Average\","+RepaintTest("Examples\\Custom Moving Average",0,-1,jobTimeout)+"}");
+    AppendResult("{\"repaint_control\":\"NNFXR_Mirror\","+RepaintTest("NNFXBacktestBatch\\_control\\NNFXR_Mirror",0,-1,jobTimeout)+"}");
     AppendResult("{\"repaint_control\":\"Examples\\\\ZigZag\","+RepaintTest("Examples\\ZigZag",0,-1,jobTimeout)+"}");
   }
   for(int k=0;k<njobs && rp_ok;k++){
@@ -605,6 +609,26 @@ void OnStart(){
   TerminalClose(0);
 }
 '''
+
+MIRROR_CONTROL_SRC = r'''
+// NNFXR_Mirror -- positive control for the batch repaint test (P1.2). It reads close[] newest-first
+// WITHOUT ArraySetAsSeries, exactly like an unflipped MQL4 conversion, so each bar's value depends on how
+// many bars exist: the test MUST report it as repainting, or the session's verdicts are not trusted.
+#property indicator_separate_window
+#property indicator_buffers 1
+#property indicator_plots 1
+#property indicator_type1 DRAW_LINE
+double b[];
+int OnInit(){ SetIndexBuffer(0,b,INDICATOR_DATA); return(INIT_SUCCEEDED); }
+int OnCalculate(const int rates_total,const int prev_calculated,const datetime &time[],const double &open[],
+                const double &high[],const double &low[],const double &close[],const long &tick_volume[],
+                const long &volume[],const int &spread[])
+{
+  for(int i=0;i<rates_total;i++) b[i]=close[rates_total-1-i];
+  return(rates_total);
+}
+'''
+
 
 def copy_history_for_symbols(live, rt, symbols):
     """pb.copy_mt5_history() only seeds ONE symbol's cached history into a
@@ -808,13 +832,13 @@ def longest_blank_run(rows, col):
 def repaint_verdicts(results):
     """{candidate key: the controller's repaint-test line} (P1.2), or {'__controls__': False} when the
     session's controls did not behave (MetaTrader's moving average must be 'aligned' at the start AND at
-    the end of the session, its ZigZag 'repaints'): then no verdict of that session is trusted. Extractions made before the test existed
-    have no such lines ({})."""
+    the end of the session, the deterministic NNFXR_Mirror control 'repaints'): then no verdict of that
+    session is trusted. Extractions made before the test existed have no such lines ({})."""
     controls = {r['repaint_control']: r['repaint'] for r in results if 'repaint_control' in r}
     end = [r['repaint'] for r in results if 'repaint_control_end' in r]
     verdicts = {r['key']: r for r in results if 'key' in r and 'repaint' in r}
     if verdicts and controls.get('Examples\\Custom Moving Average') == 'aligned' \
-            and controls.get('Examples\\ZigZag') == 'repaints' and end and end[-1] == 'aligned':
+            and controls.get('NNFXR_Mirror') == 'repaints' and end and end[-1] == 'aligned':
         return verdicts
     return {'__controls__': False} if verdicts else {}
 
@@ -1155,6 +1179,13 @@ def _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_
     (files_dir / 'nnfx_batch.json').write_text(json.dumps(job_json, separators=(',', ':')), encoding='utf-8')
     ctrl = scripts_dir / 'NNFXBacktestBatchController.mq5'
     ctrl.write_text(CONTROLLER_SRC, encoding='utf-8')
+    # P1.2 positive control for the repaint test (compiled every session; if it fails to build, its
+    # verdict is missing and the session's repaint verdicts are not trusted)
+    mirror = mqlroot / 'Indicators' / 'NNFXBacktestBatch' / '_control' / 'NNFXR_Mirror.mq5'
+    mirror.parent.mkdir(parents=True, exist_ok=True)
+    mirror.write_text(MIRROR_CONTROL_SRC, encoding='utf-8')
+    if not pb.compile_file(editor, mirror, mqlroot)[0]:
+        stage_event('repaint_control_compile_failed')
     built, _cmds, log = pb.compile_file(editor, ctrl, mqlroot)
     if not built:
         emit({'type': 'fatal', 'error': 'batch controller failed to compile', 'log': (log or '')[-2000:]})
