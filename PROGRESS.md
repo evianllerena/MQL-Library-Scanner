@@ -91,7 +91,18 @@ filter, three-EA architecture, broker lot rounding, hedging/netting. EA-only; do
   like the harness. The harness needs no change: it already trades at the new bar's first tick, and the
   Strategy Tester applies spread, commission and gaps natively.
 
-## Biggest open workstream (NOT a code fix)
-Data history: MT5 serves ~455 daily bars/symbol => 5-40 trades per candidate => rankings are
-NOT yet trustworthy. Needs "Max bars in chart" raised and/or more history downloaded (target the
-2019+ window). This is the real blocker to a usable scoreboard; schedule after Fix 8.
+## Leaderboard status (2026-10-14, after P1.1-P1.7)
+- History: RESOLVED. The controller requests D1 history from 2014-07 (--history-from 2015.01.01 +
+  warm-up); all 28 pairs return ~3,190 bars (2014-07-02 .. 2026-10). The old "~455 bars" note is obsolete.
+- `leaderboard_28basket.csv`, `leaderboard_fix7b.csv`: INVALID -- built from the 2026-10-04 extraction,
+  which the P1.2 gates show was mostly corrupt (Momentum values leaked into 14 of 40 candidates,
+  10 two-line C1s with an empty second line, degenerate columns) and scored without costs, gap fills
+  or next-open fills. Kept only for history.
+- `leaderboard_p1_2026-10-14.csv`: the same 40 candidates re-extracted with the open column, scored with
+  costs / gap + next-open fills / holdout / cluster bootstrap, every extraction gate and a TRUSTED repaint
+  test (controls: MetaTrader MA aligned 0/400 at start and end; NNFXR_Mirror repaints 400/400).
+  Result: 17 never calculate on some pair, 18 corrupt extractions, 4 repaint/misaligned (Kijun-seny,
+  EMAPredictive2, JMA_StarLight, Moving_Averages -- the unflipped-MQL4-conversion bug class), 1 scored
+  (ZigZagE_2, 11 trades, repaint-untestable). This pool contains NO usable indicator.
+- Next workstream (data, not code): run the batch on indicators the tools/indicator_fix pipeline verified
+  as Working (F:\Fixed MQL5 Indicators\Working), which needs a library DB built by scanning that folder.

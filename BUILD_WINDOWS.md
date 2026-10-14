@@ -13,9 +13,18 @@ The installer is built by GitHub Actions only. Your normal PC does not need Pyth
 
 For Beta 0.2, updater signing is intentionally not required because `createUpdaterArtifacts` is disabled. The updater UI remains present but will report unavailable until a permanent update endpoint and signing key are configured.
 
-## No local build
+## Building locally (same steps as CI)
 
-There is no supported local build script (the old `build_windows.ps1` pointed above the repo, expected a
-layout that only exists inside `MQL-Indicator-Library-Repo-Ready.zip`, and built only 2 of the 5 sidecars,
-so it was removed). The buildable Tauri layout exists only inside that zip, which the workflow extracts and
-overlays with the repo-root sources. Use the GitHub Actions build above.
+The repository is the Tauri project: `ui/` (frontend), `src-tauri/` (Rust app, config, capabilities,
+installer hook), `index.html` and `package.json` at the root, and the Python sidecar sources at the root.
+(The old `build_windows.ps1` and the `MQL-Indicator-Library-Repo-Ready.zip` baseline were removed.)
+`.github/workflows/windows-beta.yml` is the reference build script; on Windows with Python 3.12, Node 22
+and Rust stable the steps are:
+
+1. copy the Python engine files (`engine*.py`, `mql_text.py`, `preview_*.py`, `nnfx_*.py`,
+   `requirements-build.txt`) into `engine/` and `pip install -r engine/requirements-build.txt`;
+2. build the four sidecars with PyInstaller (`mql-engine`, `mql-preview`, `mql-preview-control`,
+   `mql-backtest-batch`) and copy them into `src-tauri/binaries/` with the `-x86_64-pc-windows-msvc.exe` suffix;
+3. `npm install` and `npm run tauri build`.
+
+The installer lands in `src-tauri/target/release/bundle/nsis/`.

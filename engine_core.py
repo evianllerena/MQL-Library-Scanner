@@ -50,8 +50,10 @@ class Analysis:
     evidence: list[dict] = field(default_factory=list)
     classification_status: str = 'Unknown'
     review_reason: str = ''
-    classifier_version: str = 'evidence-v5'  # v5: adds line_buffer_indices (NNFX Part B needs real
+    classifier_version: str = 'evidence-v6'  # v5: adds line_buffer_indices (NNFX Part B needs real
                                               # buffer indices, not a 0/1 guess -- see nnfx_slot_signal)
+                                              # v6 (P2): volume/OB-OS evidence and string-aware comment
+                                              # stripping changed, so every file is re-analyzed once
     confidence: int = 0
     warnings: list[str] = field(default_factory=list)
     duplicate_of: str | None = None
@@ -64,10 +66,14 @@ def read_text(path: Path) -> str:
     # Raises on unreadable files (callers rely on that), unlike mql_text.read_mql_text.
     return decode_mql_bytes(Path(path).read_bytes())
 
+_CODE_TOKENS = re.compile(r'("(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\')|//[^\r\n]*|/\*.*?\*/', re.S)
+
+
 def strip_comments(text: str) -> str:
-    text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
-    text = re.sub(r'//[^\r\n]*', ' ', text)
-    return text
+    """Remove // and /* */ comments in ONE pass that skips string literals (P2): `//` inside
+    `#property link "https://..."` -- in almost every file -- used to eat the rest of the line,
+    closing quote included, which destabilised structural_fingerprint."""
+    return _CODE_TOKENS.sub(lambda m: m.group(1) if m.group(1) else ' ', text)
 
 def normalize_newlines(text: str) -> str:
     return text.replace('\r\n','\n').replace('\r','\n').replace('\x00','')
@@ -99,10 +105,17 @@ def logic_code(code: str) -> tuple[str,bool]:
     parts.append(code[pos:])
     return '\n'.join(parts), True
 
+def _builtin_call_regex():
+    names = sorted({n for base in BUILTINS for n in (base, 'MQL4_' + base)}, key=len, reverse=True)
+    return re.compile(r'\b(' + '|'.join(map(re.escape, names)) + r')\s*\(')
+
+
 def count_actual_calls(code: str, name: str) -> int:
     total=len(re.findall(r'\b'+re.escape(name)+r'\s*\(', code))
     defs=len(re.findall(r'(?m)^\s*(?:[\w:<>&*\[\]]+\s+)+'+re.escape(name)+r'\s*\([^;{}]*\)\s*\{', code))
     return max(0,total-defs)
+
+_BUILTIN_CALL = _builtin_call_regex()  # every built-in name and its MQL4_ twin, one alternation
 
 def extract_int_property(code: str, prop: str) -> int:
     m=re.search(r'#property\s+'+re.escape(prop)+r'\s+(\d+)', code, re.I)
@@ -301,6 +314,27 @@ def structural_fingerprint(logic: str) -> str:
 def _has(logic: str, pattern: str, flags=re.I) -> bool:
     return bool(re.search(pattern, logic, flags))
 
+
+def uses_volume(logic: str) -> bool:
+    """Real volume use (P2): an INDEXED read (Volume[i], tick_volume[i], real_volume[i]) or a volume
+    function. The bare names used to count, so the `const long &tick_volume[]` parameter of every
+    MQL5 OnCalculate signature scored Volume +14 on nearly every indicator."""
+    return _has(logic, r'\b(?:Volume|tick_volume|real_volume)\s*\[\s*[^\]\s]') or \
+        _has(logic, r'\.(?:tick_volume|real_volume)\b') or \
+        _has(logic, r'\b(?:VOLUME_TICK|VOLUME_REAL)\b', 0) or \
+        _has(logic, r'\b(?:iVolume|iTickVolume|iRealVolume|CopyTickVolume|CopyRealVolume|iVolumes|iOBV|iMFI|iAD|iForce|iBWMFI)\s*\(')
+
+
+def has_ob_os_levels(logic: str) -> bool:
+    """Overbought/oversold levels (P2): 70/80 or 30/20 as a LEVEL (indicator_levelN, SetLevelValue,
+    INDICATOR_LEVELVALUE) or the words overbought/oversold. `70|80 ... 30|20` anywhere in the file
+    (any period, shift or colour constant) used to count. A high AND a low level are both required
+    (a lone 20 is usually an ADX/trend-strength line); the words also match inside identifiers
+    (Overbought_Level, InpOversold)."""
+    level = r'(?:indicator_level\d+|SetLevelValue\s*\(|INDICATOR_LEVELVALUE)[^;\n]*?\b'
+    return (_has(logic, level + r'(?:70|80)(?:\.0+)?\b') and _has(logic, level + r'(?:30|20)(?:\.0+)?\b')) or \
+        _has(logic, r'overbought|oversold')
+
 def classify(filename: str, logic: str, stds: list[str], a: Analysis):
     scores={k:0.0 for k in CATEGORIES if k not in ('Unknown','Custom / Specialized','Composite / Multi-Purpose')}
     evidence=[]; tags=[]; techniques=[]
@@ -332,7 +366,7 @@ def classify(filename: str, logic: str, stds: list[str], a: Analysis):
     if _has(logic, r'\b(?:upperband|lowerband|upper_band|lower_band|channel|envelope)\b'):
         add_evidence(evidence,scores,'Volatility',10,'structure','Upper/lower band or channel structure detected')
         add_evidence(evidence,scores,'Support/Resistance',6,'structure','Band/channel boundaries may act as dynamic levels')
-    if _has(logic, r'\b(?:Volume|tick_volume|real_volume)\b'):
+    if uses_volume(logic):
         add_evidence(evidence,scores,'Volume',14,'data_dependency','Uses volume/tick-volume data'); techniques.append('Volume analysis')
     if _has(logic, r'\b(?:iHighest|iLowest)\s*\(|\bHigh\s*\[.*?\].*?\bLow\s*\[', re.I|re.S):
         add_evidence(evidence,scores,'Support/Resistance',12,'price_structure','High/low extrema logic detected'); techniques.append('Extrema / levels')
@@ -352,7 +386,7 @@ def classify(filename: str, logic: str, stds: list[str], a: Analysis):
         add_evidence(evidence,scores,'Signal',20,'behavior','Divergence logic detected'); tags.append('Divergence')
     if _has(logic, r'\b(?:breakout|break\s+above|break\s+below)\b'):
         add_evidence(evidence,scores,'Signal',12,'behavior','Breakout logic detected'); add_evidence(evidence,scores,'Support/Resistance',8,'behavior','Breakout references price boundaries'); tags.append('Breakout')
-    if _has(logic, r'\b(?:70|80)\b.*\b(?:30|20)\b|\boverbought\b|\boversold\b', re.I|re.S):
+    if has_ob_os_levels(logic):
         add_evidence(evidence,scores,'Oscillator',12,'threshold','Overbought/oversold threshold behavior detected'); tags.append('Overbought/Oversold')
     if _has(logic, r'\b(?:SetLevelValue|indicator_level\d+|indicator_minimum|indicator_maximum)\b'):
         add_evidence(evidence,scores,'Oscillator',10,'visual_structure','Separate-window level/boundary metadata detected')
@@ -450,9 +484,12 @@ def analyze(path: Path) -> Analysis:
     a.line_buffer_indices=sorted(line_idx)
     a.object_usage=bool(re.search(r'ObjectCreate\s*\(|OBJ_(?:HLINE|VLINE|TREND|RECTANGLE|TEXT|LABEL|ARROW|FIBO)',logic,re.I))
     stds=[]
+    # one pass finds which built-in names are called at all (P2 perf: the per-name scan over the whole file
+    # was ~60% of analysis time); the exact calls-minus-definitions count then runs only for those
+    called=set(_BUILTIN_CALL.findall(logic))
     for base in BUILTINS:
         for nm in (base,'MQL4_'+base):
-            if count_actual_calls(logic,nm)>0: stds.append(nm)
+            if nm in called and count_actual_calls(logic,nm)>0: stds.append(nm)
     a.standard_indicators=sorted(set(stds))
     deps=[]
     for m in re.finditer(r'\biCustom\s*\((.*?)\)',logic,re.I|re.S):

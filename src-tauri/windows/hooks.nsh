@@ -3,6 +3,8 @@
   nsExec::ExecToLog 'taskkill /F /IM "mql-indicator-library.exe"'
   nsExec::ExecToLog 'taskkill /F /IM "mql-engine.exe"'
   nsExec::ExecToLog 'taskkill /F /IM "mql-preview.exe"'
+  nsExec::ExecToLog 'taskkill /F /IM "mql-preview-control.exe"'
+  nsExec::ExecToLog 'taskkill /F /IM "mql-backtest-batch.exe"'
   Sleep 1200
 !macroend
 
@@ -10,5 +12,7 @@
   nsExec::ExecToLog 'taskkill /F /IM "mql-indicator-library.exe"'
   nsExec::ExecToLog 'taskkill /F /IM "mql-engine.exe"'
   nsExec::ExecToLog 'taskkill /F /IM "mql-preview.exe"'
+  nsExec::ExecToLog 'taskkill /F /IM "mql-preview-control.exe"'
+  nsExec::ExecToLog 'taskkill /F /IM "mql-backtest-batch.exe"'
   Sleep 800
 !macroend

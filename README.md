@@ -43,7 +43,7 @@ This environment is not Windows and does not have the Rust toolchain, so a Windo
 
 ## Building on Windows
 
-The installer is built by GitHub Actions only (`.github/workflows/windows-beta.yml`): run **Windows Beta Build** from the Actions tab and download the artifact. There is no supported local build script — the buildable Tauri layout currently exists only inside the CI baseline zip. See `BUILD_WINDOWS.md`.
+The supported build is GitHub Actions (`.github/workflows/windows-beta.yml`): run **Windows Beta Build** from the Actions tab and download the artifact. The repository is the Tauri project itself (`ui/`, `src-tauri/`, `index.html`, `package.json`; the Python sidecar sources are at the root), so the same steps also work on a Windows machine with Python 3.12, Node 22 and Rust — see `BUILD_WINDOWS.md`.
 
 ## Updater
 

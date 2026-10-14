@@ -1122,14 +1122,15 @@ def unit_tests() -> Check:
            'nnfx_batch_results.jsonl'] and (dest / 'nnfx_batch_extract_EURUSD.csv').read_text() == 'nnfx_batch_extract_EURUSD.csv'
            and dest.parent == arch_root and sorted(f.name for f in arch_dir.iterdir()) == ['keep.txt'], detail=str(dest))
     ctl_ok = [{'repaint_control': 'Examples\\Custom Moving Average', 'repaint': 'aligned'},
-              {'repaint_control': 'Examples\\ZigZag', 'repaint': 'repaints'},
+              {'repaint_control': 'NNFXR_Mirror', 'repaint': 'repaints'},
+              {'repaint_control': 'Examples\\ZigZag', 'repaint': 'untested_no_comparable_values'},  # informational only
               {'repaint_control_end': 'Examples\\Custom Moving Average', 'repaint': 'aligned'}]
     cand = [{'key': 'zz', 'repaint': 'repaints', 'compared': 400, 'diffs': 400, 'deepest': 399},
             {'key': 'ma', 'repaint': 'aligned', 'compared': 400, 'diffs': 0, 'deepest': -1}]
     v_ok = nb.repaint_verdicts(ctl_ok + cand)
     v_bad = nb.repaint_verdicts([dict(ctl_ok[0], repaint='repaints'), ctl_ok[1]] + cand)
     c.that('P1.2 repaint verdicts are trusted only when the session controls behave (MetaTrader MA aligned at the '
-           'start AND the end, MetaTrader ZigZag repaints); a repainter is labelled with its counts; a difference on '
+           'start AND the end, the deterministic NNFXR_Mirror control repaints; MetaTrader ZigZag is informational); a repainter is labelled with its counts; a difference on '
            'the newest bar only is reported (newest_bar_only), not gated; an older extract is not_run',
            nb.repaint_label(v_ok, 'zz').startswith('repaints (400 of 400') and nb.repaint_label(v_ok, 'ma') == 'aligned'
            and nb.repaint_label(v_bad, 'zz') == 'untested_controls_failed'
