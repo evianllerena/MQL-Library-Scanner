@@ -311,6 +311,7 @@ class NNFXEngine:
     # pulls back in or agreement breaks. E4: exactly one input lagged on the previous bar;
     # remember the direction + the bar index so the grace is exactly ONE candle.
     pending_pullback_dir: int = 0
+    pending_pullback_from_e1: bool = False  # P1.5 / owner 6A: an E1-armed pullback never gets the bridge rule
     pending_onecandle_dir: int = 0
     pending_onecandle_bar: int = -1
     # R1 (FIX 7b): realized % equity. Pass ONE shared tracker to several engines (run_lockstep)
@@ -624,7 +625,8 @@ class NNFXEngine:
             if broke:
                 self.pending_pullback_dir = 0
             else:
-                if within_atr and side == d and c1dir == d and c2dir == d and vol_ok and not self._bridge_too_far(d, idx):
+                bridge_ok = self.pending_pullback_from_e1 or not self._bridge_too_far(d, idx)
+                if within_atr and side == d and c1dir == d and c2dir == d and vol_ok and bridge_ok:
                     self.pending_pullback_dir = 0
                     return self._open(d, bar, 'enter:pullback', record)
                 return record  # still on-side and agreeing but not yet back within 1xATR -> wait
@@ -653,6 +655,7 @@ class NNFXEngine:
                 if not within_atr:
                     if p.enable_pullback_entry and not self._bridge_too_far(cross, idx):
                         self.pending_pullback_dir = cross
+                        self.pending_pullback_from_e1 = False
                     record.update({'action': 'skip', 'reason': 'skip:beyond_1xATR'}); return record
                 if self._bridge_too_far(cross, idx):
                     record.update({'action': 'skip', 'reason': 'skip:bridge_too_far'}); return record
@@ -681,6 +684,7 @@ class NNFXEngine:
                 if not within_atr:
                     if p.enable_pullback_entry:
                         self.pending_pullback_dir = d
+                        self.pending_pullback_from_e1 = True  # bridge-too-far never applies to E1 (NNFXParams)
                     record.update({'action': 'skip', 'reason': 'skip:beyond_1xATR'}); return record
                 return self._open(d, bar, 'enter:c1_trigger', record)
         return record

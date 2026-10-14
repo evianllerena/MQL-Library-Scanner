@@ -896,6 +896,32 @@ def unit_tests() -> Check:
            and by_date['2024.03.10']['next_open'] == float(gap_rows[11]['open'])
            and by_date['2024.03.12']['next_open'] == float(gap_rows[13]['open']) and prep[-1]['next_open'] is None,
            detail=str([(b['date'], b['next_open']) for b in prep[8:14]]))
+    # --- P1.5 engine fixes -------------------------------------------------------------------
+    # E1-armed pullback (owner 6A): b1 is a fresh C1 long cross with price already 1.5xATR above the
+    # baseline -> E1 is valid but beyond 1xATR, arming E3; price stays beyond for 7 more bars, then
+    # pulls back within 1xATR on b9, by which point C1 has been long for 8 bars (>= 7 = bridge-too-far).
+    def e1_pullback(arm_with_cross):
+        e = NNFXEngine(P())
+        recs = [e.process_bar(_bar('b0', 101.5, 100.0, 0.9, 1.0, 5.0, 10.0,
+                                   close_prev=101.5 if not arm_with_cross else 99.5))]
+        if arm_with_cross:  # E2 control: the beyond-1xATR setup is a baseline cross (C1 long for 1 bar)
+            recs[0] = e.process_bar(_bar('b0b', 99.5, 100.0, 1.0, 0.9, 5.0, 10.0))
+            recs.append(e.process_bar(_bar('b1', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)))
+        else:
+            recs.append(e.process_bar(_bar('b1', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0)))
+        for i in range(2, 9):
+            recs.append(e.process_bar(_bar(f'b{i}', 101.5, 100.0, 1.0, 0.9, 5.0, 10.0)))
+        recs.append(e.process_bar(_bar('b9', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=101.5)))
+        return recs
+    r_e1 = e1_pullback(False)
+    c.that('P1.5 E1 + bridge (owner 6A): a pullback armed by an E1 (C1-triggered) setup ENTERS when price comes '
+           'back within 1xATR, even though C1 has now run 8 bars -- bridge-too-far never applies to E1',
+           r_e1[1]['reason'] == 'skip:beyond_1xATR' and r_e1[-1]['reason'] == 'enter:pullback', detail=str(r_e1[-1]))
+    r_e2 = e1_pullback(True)
+    c.that('P1.5 E1 + bridge control: a pullback armed by a baseline-cross (E2) setup is still held back by '
+           'bridge-too-far after the same 8-bar C1 run', r_e2[1]['reason'] == 'skip:beyond_1xATR'
+           and r_e2[-1]['action'] != 'enter', detail=str([x['reason'] for x in r_e2]))
+
     # --- P1.4 statistics --------------------------------------------------------------------
     straddle = [dict(date='2024.03.29', action='enter', pips=''), dict(date='2024.03.30', action='exit_half', pips=10.0),
                 dict(date='2024.04.02', action='exit', pips=20.0, r=0.9),

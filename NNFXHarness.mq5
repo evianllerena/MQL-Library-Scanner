@@ -192,6 +192,7 @@ int      g_lastExitIndDirSeen = 0; // FIX 5: previous exit-indicator direction (
 // closed-bar counter (shift can't be used -- it is always 1 for the bar being decided).
 int      g_barIndex            = -1;
 int      g_pendingPullbackDir  = 0;
+bool     g_pendingPullbackFromE1 = false; // P1.5 / owner 6A: an E1-armed pullback never gets bridge-too-far
 int      g_pendingOneCandleDir = 0;
 int      g_pendingOneCandleBar = -1;
 
@@ -840,7 +841,8 @@ void OnNewDailyBar()
          g_pendingPullbackDir=0;
       else
       {
-         if(withinATR && side==d && c1dir==d && c2dir==d && VolumePasses(shift,d) && !BridgeTooFar(shift,d))
+         bool bridgeOK = g_pendingPullbackFromE1 || !BridgeTooFar(shift,d);
+         if(withinATR && side==d && c1dir==d && c2dir==d && VolumePasses(shift,d) && bridgeOK)
          {
             g_pendingPullbackDir=0;
             OpenFresh(d, atrVal, "enter:pullback");
@@ -876,7 +878,7 @@ void OnNewDailyBar()
          if(!VolumePasses(shift,crossDir)) { LogTrade("skip",crossDir,0,0,0,0,atrVal,"skip:volume_filter"); return; }
          if(!withinATR)
          {
-            if(EnablePullbackEntry && !BridgeTooFar(shift,crossDir)) g_pendingPullbackDir=crossDir;
+            if(EnablePullbackEntry && !BridgeTooFar(shift,crossDir)) { g_pendingPullbackDir=crossDir; g_pendingPullbackFromE1=false; }
             LogTrade("skip",crossDir,0,0,0,0,atrVal,"skip:beyond_1xATR");
             return;
          }
@@ -910,7 +912,7 @@ void OnNewDailyBar()
          if(!VolumePasses(shift,d)) { LogTrade("skip",d,0,0,0,0,atrVal,"skip:volume_filter"); return; }
          if(!withinATR)
          {
-            if(EnablePullbackEntry) g_pendingPullbackDir=d;
+            if(EnablePullbackEntry) { g_pendingPullbackDir=d; g_pendingPullbackFromE1=true; }
             LogTrade("skip",d,0,0,0,0,atrVal,"skip:beyond_1xATR");
             return;
          }
