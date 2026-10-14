@@ -179,7 +179,8 @@ jobs:
           if($bridge -notmatch 'def compile_pool' -or $bridge -notmatch "add_parser\('compile-pool'\)"){throw 'Parallel compile-pool command missing'}
           if($bridge -notmatch '_resident_indicator_rel' -or $bridge -notmatch "MQLLibraryPreview/"){throw 'Forward-slash resident iCustom path missing'}
           if($bridge -notmatch 'resolve_mt5_render_data_dir' -or $bridge -notmatch 'seed_render_runtime_from_data_dir'){throw 'FIX 1 logged-in MT5 render seed missing'}
-          if($bridge -notmatch 'AllowLiveTrading=1' -or $bridge -notmatch "add_argument\('--mt5-data-dir'"){throw 'FIX 1 render account/algo setting missing'}
+          if($bridge -notmatch "add_argument\('--mt5-data-dir'"){throw 'FIX 1 render account setting missing'}
+          if($bridge -match 'AllowLiveTrading=1'){throw 'Render terminals must never allow live trading (P0.3)'}
           if($bridge -notmatch 'RENDER_STARTUP_EXIT=42' -or $bridge -notmatch 'def _wait_for_resident_startup'){throw 'FIX 2 first-heartbeat handshake missing'}
           if($bridge -notmatch 'resident_ea_ready' -or $bridge -notmatch 'relaunch_cap=3'){throw 'FIX 2 ready/hang recovery guard missing'}
           $lib=Get-Content src-tauri/src/lib.rs -Raw

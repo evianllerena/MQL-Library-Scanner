@@ -1034,7 +1034,11 @@ def _launch_resident_terminal(rt,terminalexe,sym,job_id):
     cfg=Path(rt)/f'render-server-{safe_job_id(job_id)}.ini'
     cfg_text=(
         '[Common]\nNewsEnable=0\n\n'
-        '[Experts]\nEnabled=1\nAllowLiveTrading=1\nAllowDllImport=0\n\n'
+        # AllowLiveTrading=0: the clone is seeded with the user's real accounts.dat/servers.dat
+        # (seed_render_runtime_from_data_dir) and loads arbitrary third-party indicators, so it
+        # must never be able to trade. The resident EA places no orders; Enabled=1 (the Algo
+        # Trading button) is what lets it run, and stays on.
+        '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
         f'[StartUp]\nSymbol={sym}\nPeriod=H1\nExpert=MQLLibRenderServer\nShutdownTerminal=0\n')
     if 'Expert=MQLLibRenderServer' not in cfg_text:
         raise RenderStartupError('Render startup config does not reference MQLLibRenderServer exactly.')
