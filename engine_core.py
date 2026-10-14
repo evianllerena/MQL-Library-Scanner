@@ -50,10 +50,11 @@ class Analysis:
     evidence: list[dict] = field(default_factory=list)
     classification_status: str = 'Unknown'
     review_reason: str = ''
-    classifier_version: str = 'evidence-v6'  # v5: adds line_buffer_indices (NNFX Part B needs real
+    classifier_version: str = 'evidence-v7'  # v5: adds line_buffer_indices (NNFX Part B needs real
                                               # buffer indices, not a 0/1 guess -- see nnfx_slot_signal)
                                               # v6 (P2): volume/OB-OS evidence and string-aware comment
                                               # stripping changed, so every file is re-analyzed once
+                                              # v7: converter MQL4_iVolume()/MQL4_iOBV() calls count as volume
     confidence: int = 0
     warnings: list[str] = field(default_factory=list)
     duplicate_of: str | None = None
@@ -318,11 +319,12 @@ def _has(logic: str, pattern: str, flags=re.I) -> bool:
 def uses_volume(logic: str) -> bool:
     """Real volume use (P2): an INDEXED read (Volume[i], tick_volume[i], real_volume[i]) or a volume
     function. The bare names used to count, so the `const long &tick_volume[]` parameter of every
-    MQL5 OnCalculate signature scored Volume +14 on nearly every indicator."""
+    MQL5 OnCalculate signature scored Volume +14 on nearly every indicator. Converted MQL4 code calls
+    the converter's wrappers (Volume[i] becomes MQL4_iVolume(i)), so the MQL4_ prefix counts too."""
     return _has(logic, r'\b(?:Volume|tick_volume|real_volume)\s*\[\s*[^\]\s]') or \
         _has(logic, r'\.(?:tick_volume|real_volume)\b') or \
         _has(logic, r'\b(?:VOLUME_TICK|VOLUME_REAL)\b', 0) or \
-        _has(logic, r'\b(?:iVolume|iTickVolume|iRealVolume|CopyTickVolume|CopyRealVolume|iVolumes|iOBV|iMFI|iAD|iForce|iBWMFI)\s*\(')
+        _has(logic, r'\b(?:MQL4_)?(?:iVolume|iTickVolume|iRealVolume|CopyTickVolume|CopyRealVolume|iVolumes|iOBV|iMFI|iAD|iForce|iBWMFI)\s*\(')
 
 
 def has_ob_os_levels(logic: str) -> bool:
