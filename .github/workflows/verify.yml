@@ -9,11 +9,25 @@ on:
       - 'nnfx_engine.py'
       - 'nnfx_selftest.py'
       - 'nnfx_backtest_batch.py'
+      - 'mql_text.py'
+      - 'preview_bridge.py'
+      - 'engine_core.py'
+      - 'tests/**'
+      - 'tools/indicator_fix/**'
+      - 'README.md'
+      - 'BUILD_WINDOWS.md'
   pull_request:
     paths:
       - 'nnfx_engine.py'
       - 'nnfx_selftest.py'
       - 'nnfx_backtest_batch.py'
+      - 'mql_text.py'
+      - 'preview_bridge.py'
+      - 'engine_core.py'
+      - 'tests/**'
+      - 'tools/indicator_fix/**'
+      - 'README.md'
+      - 'BUILD_WINDOWS.md'
   workflow_dispatch:
 jobs:
   selftest:
@@ -27,3 +41,5 @@ jobs:
         run: python -m py_compile nnfx_engine.py nnfx_selftest.py nnfx_backtest_batch.py
       - name: Part C self-test (fails unless ALL checks + both golden cases pass)
         run: python nnfx_selftest.py
+      - name: Encoding regression tests (mql_text / preview_bridge / engine_core)
+        run: python -m unittest discover -s tests -v

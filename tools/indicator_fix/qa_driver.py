@@ -6,14 +6,15 @@ results file are skipped. If the terminal stops producing output for HANG_S seco
 indicator it was on is recorded as 'hang', and a new session continues after it."""
 import hashlib, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
+from fix_paths import BUILD, QA_RT
 
 def arg(flag, default=None):
     return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
 
 # --rt <portable MT5 dir> and --shard k/N let several runtime copies test disjoint shares in parallel
-RT = Path(arg('--rt', r'C:\Users\Evision\AppData\Local\nnfx-backtest-runtime\preview-runtime\v5\mt5-5ece741c1d'))
+RT = Path(arg('--rt', QA_RT))
 FILES = RT / 'MQL5' / 'Files'
-W = Path(r'F:\MQLFIX_BUILD')
+W = BUILD
 HANG_S = 120
 V = sys.argv[1]
 SESSION = int(arg('--session', 300))

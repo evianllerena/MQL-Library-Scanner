@@ -1,6 +1,6 @@
 # Build the first Windows beta installer
 
-The recommended path is GitHub Actions. Your normal PC does not need Python, Node, Rust, or PyInstaller to run the finished application.
+The installer is built by GitHub Actions only. Your normal PC does not need Python, Node, Rust, or PyInstaller to run the finished application.
 
 ## GitHub Actions build
 
@@ -13,17 +13,9 @@ The recommended path is GitHub Actions. Your normal PC does not need Python, Nod
 
 For Beta 0.2, updater signing is intentionally not required because `createUpdaterArtifacts` is disabled. The updater UI remains present but will report unavailable until a permanent update endpoint and signing key are configured.
 
-## Local Windows build (fallback)
+## No local build
 
-If GitHub Actions is unavailable, run PowerShell as a normal user from the project root:
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\build_windows.ps1
-```
-
-The build machine requires Python 3.11+, Node.js 20+, Rust stable, and the Microsoft C++ build tools. These are build-time dependencies only and are not required on PCs that install the finished Setup.exe.
-
-The installer output will be under:
-
-`src-tauri\target\release\bundle\nsis\`
+There is no supported local build script (the old `build_windows.ps1` pointed above the repo, expected a
+layout that only exists inside `MQL-Indicator-Library-Repo-Ready.zip`, and built only 2 of the 5 sidecars,
+so it was removed). The buildable Tauri layout exists only inside that zip, which the workflow extracts and
+overlays with the repo-root sources. Use the GitHub Actions build above.

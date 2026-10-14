@@ -4,10 +4,11 @@ r"""Unattended orchestration of the fix pipeline after the variants are built.
    files back beside their sources;
 3. runtime QA: 4 parallel shards over A until nothing is left, then the same over B (B skips names
    already aligned in A). Progress -> F:\MQLFIX_BUILD\orchestrate.log"""
-import shutil, subprocess, sys, time
+import re, shutil, subprocess, sys, time
 from pathlib import Path
+from fix_paths import BUILD, rt
 
-W = Path(r'F:\MQLFIX_BUILD')
+W = BUILD
 HERE = Path(__file__).resolve().parent
 LOG = W / 'orchestrate.log'
 
@@ -34,16 +35,21 @@ def recompile_failed(v):
             shutil.copy2(ex, src.with_suffix('.ex5')); back += 1
     log(f'{v}: recompile recovered {back} of {len(failed)}')
 
+def is_qa_driver(name, cmdline):
+    # only a Python process running the script counts: the PowerShell query below (and any shell
+    # that launched it) also has 'qa_driver.py' in its command line
+    return (name or '').lower().startswith(('python', 'py.exe')) and re.search(r'qa_driver\.py\b', cmdline or '') is not None
+
 def drivers_running():
     out = subprocess.run(['powershell', '-NoProfile', '-Command',
-                          "(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'qa_driver.py' }).Count"],
-                         capture_output=True, text=True).stdout.strip()
-    return int(out or 0) > 0
+                          "Get-CimInstance Win32_Process | ForEach-Object { $_.Name + \"`t\" + $_.CommandLine }"],
+                         capture_output=True, text=True, errors='replace').stdout
+    return any(is_qa_driver(*line.split('\t', 1)) for line in out.splitlines() if '\t' in line)
 
 def qa(v):
     while drivers_running():          # never two drivers on one runtime copy
         time.sleep(30)
-    procs = [subprocess.Popen([sys.executable, str(HERE / 'qa_driver.py'), v, '--rt', rf'F:\MQLFIX_RT\rt{k + 1}',
+    procs = [subprocess.Popen([sys.executable, str(HERE / 'qa_driver.py'), v, '--rt', str(rt(k + 1)),
                                '--shard', f'{k}/4'], cwd=HERE,
                               stdout=open(W / f'qa_{v}_s{k}.progress.txt', 'a'), stderr=subprocess.STDOUT)
              for k in range(4)]

@@ -1,6 +1,7 @@
 r"""Inventory: every unique indicator source in F:\Converted Indicators and F:\Ready MQL5 Indicators (top level),
 resolved to its ORIGINAL MT4 source. Writes inventory.json."""
 import glob, hashlib, json, os, time
+from fix_paths import CONVERTED, READY
 OUT = os.path.dirname(os.path.abspath(__file__))
 def sha(b): return hashlib.sha256(b).hexdigest()
 t = time.time()
@@ -13,13 +14,13 @@ def add_original(path, data, origin_tag):
     if n not in rec['names']: rec['names'].append(n)
     rec['paths'].append(path); rec['sources'].add(origin_tag)
     return h
-conv = glob.glob(r'F:\Converted Indicators\*.mq5')
+conv = glob.glob(os.path.join(CONVERTED, '*.mq5'))
 for p in conv:
     add_original(p, open(p, 'rb').read(), 'converted')
 print('converted files', len(conv), 'unique originals so far', len(items), round(time.time() - t), 's', flush=True)
 # 2) VALIDATED evidence: converted-output hash -> original hash
 val_map = {}
-for ev in glob.glob(r'F:\Ready MQL5 Indicators\MQL_ONE\OUTPUT\VALIDATED\*\evidence.json'):
+for ev in glob.glob(os.path.join(READY, 'MQL_ONE', 'OUTPUT', 'VALIDATED', '*', 'evidence.json')):
     try:
         e = json.load(open(ev, encoding='utf-8'))
         d = os.path.dirname(ev)
@@ -31,7 +32,7 @@ print('validated outputs mapped', len(val_map), round(time.time() - t), 's', flu
 # 3) Ready top level: raw ones are originals; converted ones map back via VALIDATED evidence
 ready_raw = ready_mapped = ready_orphan = 0
 orphans = []
-for p in glob.glob(r'F:\Ready MQL5 Indicators\*.mq5'):
+for p in glob.glob(os.path.join(READY, '*.mq5')):
     data = open(p, 'rb').read()
     if b'MQLONE_COMPAT_SHIM' not in data:
         add_original(p, data, 'ready_raw'); ready_raw += 1

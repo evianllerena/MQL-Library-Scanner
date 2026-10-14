@@ -1,11 +1,12 @@
 r"""Map each unique original (inventory.json) to an existing MQL_ONE-repaired conversion:
 VALIDATED/<id>/<name>.mq5 (via evidence.json original_hash / origin) or a Ready top-level conversion (by name)."""
 import json, os, re, time
+from fix_paths import READY
 HERE = os.path.dirname(os.path.abspath(__file__))
 inv = json.load(open(os.path.join(HERE, 'inventory.json')))
 by_hash = {r['hash']: r for r in inv['originals']}
 by_path = {p.lower(): r['hash'] for r in inv['originals'] for p in r['paths']}
-VAL = r'F:\Ready MQL5 Indicators\MQL_ONE\OUTPUT\VALIDATED'
+VAL = os.path.join(READY, 'MQL_ONE', 'OUTPUT', 'VALIDATED')
 t = time.time(); found = {}; unmatched_ev = 0
 def item_dirs():
     for d in os.listdir(VAL):

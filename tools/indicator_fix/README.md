@@ -26,3 +26,8 @@ MQL_ONE 5.9.19 added this flip (convert.py FIX 1), but the existing outputs pred
    Known-answer check: Kijun-seny/Moving Averages A = misaligned, B = aligned; RSI both aligned.
 6. Selection: per indicator keep the variant that is aligned (A preferred when both are).
    Indicators with no working variant, plus the 2,482 originals MQL_ONE never repaired, go to repair.
+
+## Paths
+Machine paths live in `fix_paths.py`; each default (the original machine's path) can be overridden by an
+environment variable: `MQLFIX_BUILD`, `MQLFIX_RT`, `MQLFIX_CONVERTED`, `MQLFIX_READY`, `MQLFIX_FIXED`,
+`MQLFIX_METAEDITOR`, `MQLFIX_MQL5_INC`, `MQLFIX_CLAUDE`, `MQLFIX_MQLC`, `MQLFIX_QA_RT`, `MQLFIX_MQLONE_MODULES`.

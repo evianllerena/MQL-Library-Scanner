@@ -43,13 +43,7 @@ This environment is not Windows and does not have the Rust toolchain, so a Windo
 
 ## Building on Windows
 
-Run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
-```
-
-The development/build machine needs Python 3.11+, Node 20+ and Rust 1.77.2+. Those dependencies are build-time only; end users receive the resulting Setup.exe.
+The installer is built by GitHub Actions only (`.github/workflows/windows-beta.yml`): run **Windows Beta Build** from the Actions tab and download the artifact. There is no supported local build script — the buildable Tauri layout currently exists only inside the CI baseline zip. See `BUILD_WINDOWS.md`.
 
 ## Updater
 
@@ -57,4 +51,4 @@ Before distributing an updater-enabled release, create one permanent Tauri updat
 
 
 ## First Windows installer
-See `BUILD_WINDOWS.md` for the GitHub Actions and local Windows build paths, and `FIRST_TEST_PLAN.md` for the first installed beta test.
+See `BUILD_WINDOWS.md` for the GitHub Actions build, and `FIRST_TEST_PLAN.md` for the first installed beta test.

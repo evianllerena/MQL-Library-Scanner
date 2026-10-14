@@ -6,10 +6,11 @@ Runtime QA later keeps whichever variant passes the no-look-ahead test. Space-fr
 cuts paths at spaces): F:\MQLFIX_BUILD\{A,B}\<name>.mq5 + variants.json."""
 import json, os, re, sys
 from pathlib import Path
-sys.path.insert(0, r'C:\Users\Evision\AppData\Local\Temp\claude\C--Users-Evision\c27ab46c-7c67-48b8-915c-a0ab7cb2913a\scratchpad\mqlone\src\MQL_ONE_FIXED_v5.9.19\src\modules')
+from fix_paths import BUILD, MQLONE_MODULES
+sys.path.insert(0, MQLONE_MODULES)
 import textio
 HERE = Path(__file__).resolve().parent
-W = Path(r'F:\MQLFIX_BUILD')
+W = BUILD
 (W / 'A').mkdir(parents=True, exist_ok=True); (W / 'B').mkdir(parents=True, exist_ok=True)
 inv = {r['hash']: r for r in json.load(open(HERE / 'inventory.json'))['originals']}
 conv = json.load(open(HERE / 'conversions.json'))

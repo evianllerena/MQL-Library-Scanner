@@ -11,9 +11,10 @@ Writes <dest>\{Working,Repaints,Not working,Not compiling,Excluded\...}\ and REP
 import csv, json, shutil, sys
 from collections import Counter
 from pathlib import Path
+from fix_paths import BUILD, FIXED
 
-W = Path(r'F:\MQLFIX_BUILD')
-DEST = Path(sys.argv[1] if len(sys.argv) > 1 else r'F:\Fixed MQL5 Indicators')
+W = BUILD
+DEST = Path(sys.argv[1]) if len(sys.argv) > 1 else FIXED
 HERE = Path(__file__).resolve().parent
 ORDER = ['C', 'A', 'D', 'B', 'X']          # variant preference on ties
 

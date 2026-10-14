@@ -1,9 +1,9 @@
 r"""Compile ONE .mq5 with MetaEditor (standard + user includes) and print the result as plain text.
 Usage: python F:\MQLFIX_BUILD\tools\mqlc.py <file.mq5>   -> exit 0 on 0 errors."""
-import subprocess, sys, tempfile
+import os, subprocess, sys, tempfile
 from pathlib import Path
-ME = r'C:\Program Files\MetaTrader 5\MetaEditor64.exe'
-INC = r'C:\Users\Evision\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5'
+ME = os.environ.get('MQLFIX_METAEDITOR') or r'C:\Program Files\MetaTrader 5\MetaEditor64.exe'          # same names as fix_paths.py
+INC = os.environ.get('MQLFIX_MQL5_INC') or r'C:\Users\Evision\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5'
 src = Path(sys.argv[1]).resolve()
 if ' ' in str(src):
     print('ERROR: path contains a space; MetaEditor cannot compile it'); sys.exit(2)
