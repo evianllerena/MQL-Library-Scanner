@@ -14,3 +14,8 @@
   `max_drawdown_pct` use ONE account across every symbol, in date order (`run_lockstep`). The
   harness runs one symbol per Strategy Tester pass, so its breaker only sees that symbol's
   balance. Reference-only; does not affect the leaderboard.
+
+- **Minimum lot (MQL5 harness only).** When 2% risk sizes each half below the broker's minimum lot,
+  the harness skips the trade (`skip:lots_below_min`) instead of oversizing it; the Python engine has
+  no lot concept and takes it. A skip arms no continuation, so the following bars can differ too.
+  Shows up only on small accounts / wide stops; reference-only.
