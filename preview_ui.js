@@ -1,6 +1,7 @@
 import { Command } from '@tauri-apps/plugin-shell';
 import { appDataDir, join } from '@tauri-apps/api/path';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { getVersion } from '@tauri-apps/api/app';
 
 
 let previewToken=0;
@@ -390,8 +391,8 @@ function startUiWatchdog(){
 }
 
 function boot(){
-  const brand=document.querySelector('.brand small');
-  if(brand)brand.textContent='0.5.14 • Evidence Engine v5 + Paired Runtime Discovery';
+  // P2: the version comes from the app itself (getVersion), never from a literal in the UI
+  void getVersion().then(v=>document.querySelectorAll('[data-app-version]').forEach(n=>{n.textContent=v;})).catch(()=>{});
   ensureClearCard();
   enhanceSourceRemoval();
   startUiWatchdog();
