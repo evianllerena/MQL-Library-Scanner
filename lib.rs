@@ -929,10 +929,9 @@ fn db_backtest_query(db_path:String, slot:String, bed:String, search:String, min
         where_sql, order
     );
     let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;
-    // params order: [min_trades_for_case, ...where-clause-vals..., limit, offset]
-    let mut bind:Vec<rusqlite::types::Value>=Vec::new();
+    // anonymous ? are numbered in SQL-text order: WHERE vals, then the ORDER BY min_trades, then limit, offset
+    let mut bind:Vec<rusqlite::types::Value>=vals.clone();
     bind.push(rusqlite::types::Value::Integer(min_trades));
-    bind.extend(vals.iter().cloned());
     bind.push(rusqlite::types::Value::Integer(limit.clamp(1,500)));
     bind.push(rusqlite::types::Value::Integer(offset.max(0)));
     let mapped=stmt.query_map(rusqlite::params_from_iter(bind.iter()),|r| {
