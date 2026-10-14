@@ -82,7 +82,10 @@ Multi-timeframe (we are Daily only), rollover windows, M6/M7 shared exposure, D1
 filter, three-EA architecture, broker lot rounding, hedging/netting. EA-only; do not build.
 
 ## Known divergences (see BACKLOG.md)
-- MQL5 harness can re-enter on the same bar it exits; Python never does. Align in Fix 8.
+- Same-bar re-entry: ALIGNED (Fix 8) -- the harness no longer enters on a bar a position closed on.
+- Harness trade safety (P0.5): both halves or nothing, failed closes retried, no forced min-lot
+  halves, hedging-account check, restart recovery by MagicNumber, TP1 only on a real TP fill, pip
+  size per symbol. Compiles 0/0; a Strategy Tester run is still to be done.
 - MQL5 harness breaker/`max_drawdown_pct` is per-symbol; Python is one account across symbols.
 - Entry price: ALIGNED (P1.7). Python used to enter at the signal close; it now fills at the next open
   like the harness. The harness needs no change: it already trades at the new bar's first tick, and the

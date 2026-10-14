@@ -87,7 +87,7 @@ input double RiskPct            = 2.0;     // M2 (label A): 2% per trade
 input double MinBeyondATR       = 1.0;
 input ulong  MagicNumber        = 20260001;
 input string RunTag             = "";      // unique per batch run -- keeps each run's trade log from colliding
-input double PipSize            = 0.0001;  // for the human-readable pips column in the trade/result log only
+input double PipSize            = 0.0;     // pips column in the logs only; 0 = auto per symbol (P0.5: 0.01 on JPY / 3-digit, 0.0001 on 5-digit)
 
 // --- bridge-too-far (C1 ONLY; never runs for C2) ---------------------
 input bool   EnableBridgeTooFar = true;
@@ -208,6 +208,10 @@ struct Half
 };
 Half g_half1, g_half2;
 int  g_posDir = 0; // +1 long, -1 short, 0 flat
+double g_pipSize = 0.0001;        // P0.5: resolved in OnInit (PipSize or auto)
+string g_closeRetryReason = "";   // P0.5: a close that failed is retried every tick until it succeeds
+bool   g_needBreakeven = false;   // P0.5: a failed breakeven move is retried every tick
+datetime g_lastCloseTime = 0;     // P1.7: when the last position went flat (no same-bar re-entry)
 
 // Round-trip trade result tracking: both halves are equal-sized (see OpenPosition), so the
 // blended per-lot pip result of the whole trade is the simple average of each half's own
@@ -238,6 +242,16 @@ long   g_summaryBridgeSkips=0, g_summaryContinuationTrades=0;
 int OnInit()
 {
    trade.SetExpertMagicNumber(MagicNumber);
+   // P0.5: every trade is two same-direction halves (two tickets) -- only a hedging account holds that;
+   // on a netting account the second order would merge into the first and the half logic breaks
+   if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE)!=ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+   {
+      Print("NNFXHarness: needs a HEDGING account (each trade is two same-direction halves)");
+      return(INIT_FAILED);
+   }
+   int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   g_pipSize = PipSize>0 ? PipSize : ((digits==3 || digits==5) ? point*10.0 : point);
    g_tradeLogFile = "NNFX_" + (RunTag=="" ? "run" : RunTag) + "_tradelog.csv";
 
    // Candidates run on their OWN compiled defaults (iCustom with no extra parameters) --
@@ -351,8 +365,37 @@ int OnInit()
 
    g_half1.open=false; g_half1.tp1Hit=false; g_half1.ticket=0;
    g_half2.open=false; g_half2.tp1Hit=false; g_half2.ticket=0;
+   RecoverPositions();
 
    return(INIT_SUCCEEDED);
+}
+
+// P0.5: after a restart, re-adopt this EA's open halves (same symbol + MagicNumber) instead of trading on
+// top of them. The ATR at entry is carried in the order comment ("H1 <atr>" / "H2 <atr>").
+void RecoverPositions()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i);
+      if(t==0 || !posInfo.SelectByTicket(t)) continue;
+      if(posInfo.Symbol()!=_Symbol || posInfo.Magic()!=MagicNumber) continue;
+      string cm=posInfo.Comment();
+      string tag=StringSubstr(cm,0,2);
+      if(tag!="H1" && tag!="H2") continue;
+      int dir = posInfo.PositionType()==POSITION_TYPE_BUY ? 1 : -1;
+      if(tag=="H1"){ g_half1.ticket=t; g_half1.open=true; g_half1.tp1Hit=false; }
+      else         { g_half2.ticket=t; g_half2.open=true; }
+      g_posDir=dir; g_entryPriceForLog=posInfo.PriceOpen();
+      if(StringLen(cm)>3) g_atrAtEntry=StringToDouble(StringSubstr(cm,3));
+   }
+   if(g_posDir!=0)
+   {
+      // only the runner left: half #1 already closed at TP1 (a stop closes both halves together)
+      if(!g_half1.open && g_half2.open){ g_half1.tp1Hit=true; g_half2.tp1Hit=true; }
+      g_trailActive=false;
+      Print("NNFXHarness: re-adopted open position after restart, dir=",g_posDir," half1=",g_half1.open,
+            " half2=",g_half2.open," atrAtEntry=",g_atrAtEntry," (pips of an adopted trade's earlier half are not known)");
+   }
 }
 
 void OnDeinit(const int reason)
@@ -583,10 +626,24 @@ double GetClosePrice(ulong positionTicket)
    return(0.0);
 }
 
+// P0.5: why a position closed (DEAL_REASON_TP / _SL / _EXPERT ...), from its closing deal
+long GetCloseReason(ulong positionTicket)
+{
+   if(!HistorySelectByPosition((long)positionTicket)) return(-1);
+   for(int i=HistoryDealsTotal()-1;i>=0;i--)
+   {
+      ulong dealTicket=HistoryDealGetTicket(i);
+      if(dealTicket==0) continue;
+      if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket,DEAL_ENTRY)==DEAL_ENTRY_OUT)
+         return(HistoryDealGetInteger(dealTicket,DEAL_REASON));
+   }
+   return(-1);
+}
+
 double PipsFor(int dir,double entry,double exitp)
 {
-   if(PipSize<=0) return(0.0);
-   return((dir>0 ? (exitp-entry) : (entry-exitp))/PipSize);
+   if(g_pipSize<=0) return(0.0);
+   return((dir>0 ? (exitp-entry) : (entry-exitp))/g_pipSize);
 }
 
 // Called once both halves are confirmed flat -- logs the blended round-trip result and
@@ -623,25 +680,52 @@ double LotsForRisk(double stopDistancePoints)
 // ENTRY / EXIT
 //====================================================================
 
+bool TradeOK()
+{
+   uint rc=trade.ResultRetcode();
+   return(rc==TRADE_RETCODE_DONE || rc==TRADE_RETCODE_DONE_PARTIAL || rc==TRADE_RETCODE_PLACED);
+}
+
+// P0.5: a half is marked closed only if its close really went through. A failed close keeps the state
+// (the EA must not trade on top of a live position) and is retried every tick (g_closeRetryReason).
 void CloseAllHalves(string reason)
 {
    int dir=g_posDir;
-   if(g_half1.open && posInfo.SelectByTicket(g_half1.ticket))
+   bool failed=false;
+   if(g_half1.open)
    {
-      trade.PositionClose(g_half1.ticket);
-      if(!g_half1PipsSet){ g_half1Pips=PipsFor(dir,g_entryPriceForLog,trade.ResultPrice()); g_half1PipsSet=true; }
+      if(!posInfo.SelectByTicket(g_half1.ticket)) g_half1.open=false;            // already closed broker-side
+      else if(trade.PositionClose(g_half1.ticket) && TradeOK())
+      {
+         if(!g_half1PipsSet){ g_half1Pips=PipsFor(dir,g_entryPriceForLog,trade.ResultPrice()); g_half1PipsSet=true; }
+         g_half1.open=false;
+      }
+      else failed=true;
    }
-   if(g_half2.open && posInfo.SelectByTicket(g_half2.ticket))
+   if(g_half2.open)
    {
-      trade.PositionClose(g_half2.ticket);
-      if(!g_half2PipsSet){ g_half2Pips=PipsFor(dir,g_entryPriceForLog,trade.ResultPrice()); g_half2PipsSet=true; }
+      if(!posInfo.SelectByTicket(g_half2.ticket)) g_half2.open=false;
+      else if(trade.PositionClose(g_half2.ticket) && TradeOK())
+      {
+         if(!g_half2PipsSet){ g_half2Pips=PipsFor(dir,g_entryPriceForLog,trade.ResultPrice()); g_half2PipsSet=true; }
+         g_half2.open=false;
+      }
+      else failed=true;
    }
-   g_half1.open=false; g_half2.open=false; g_posDir=0;
+   if(failed)
+   {
+      g_closeRetryReason=reason;
+      LogTrade("exit_failed",dir,0,0,0,0,0,reason+" retcode="+IntegerToString((int)trade.ResultRetcode()));
+      return;
+   }
+   g_closeRetryReason=""; g_posDir=0; g_needBreakeven=false; g_lastCloseTime=TimeCurrent();
    LogTrade("exit_all",0,0,0,0,0,0,reason);
    FinalizeTradeIfFlat(dir);
 }
 
-void OpenPosition(int dir,double atrVal,bool isContinuation,string reason="")
+// P0.5: returns true only when BOTH halves are open. One failed leg -> the filled one is closed again;
+// halves smaller than the broker's minimum lot are skipped, never bumped up (that doubled the risk).
+bool OpenPosition(int dir,double atrVal,bool isContinuation,string reason="")
 {
    if(reason=="") reason = isContinuation?"enter:continuation":"enter:standard";
    double price = dir>0 ? SymbolInfoDouble(_Symbol,SYMBOL_ASK) : SymbolInfoDouble(_Symbol,SYMBOL_BID);
@@ -651,19 +735,32 @@ void OpenPosition(int dir,double atrVal,bool isContinuation,string reason="")
    double point = SymbolInfoDouble(_Symbol,SYMBOL_POINT);
    double stopDistPoints = slDist; // price units; LotsForRisk converts via tick size/value
    double totalLots = LotsForRisk(stopDistPoints);
-   if(totalLots<=0.0) return;
-   double halfLots = MathMax(SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN), NormalizeLots(totalLots/2.0));
+   if(totalLots<=0.0) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:lots_below_min"); return(false); }
+   double halfLots = NormalizeLots(totalLots/2.0);
+   if(halfLots<SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN)) { LogTrade("skip",dir,0,0,0,0,atrVal,"skip:lots_below_min"); return(false); }
 
-   bool ok1 = dir>0 ? trade.Buy(halfLots,_Symbol,price,sl,tp1,"H1") : trade.Sell(halfLots,_Symbol,price,sl,tp1,"H1");
-   bool ok2 = dir>0 ? trade.Buy(halfLots,_Symbol,price,sl,0.0,"H2") : trade.Sell(halfLots,_Symbol,price,sl,0.0,"H2");
-   if(ok1){ g_half1.ticket=trade.ResultOrder(); g_half1.open=true; g_half1.tp1Hit=false; }
-   if(ok2){ g_half2.ticket=trade.ResultOrder(); g_half2.open=true; g_half2.tp1Hit=false; }
+   string atrTag=" "+DoubleToString(atrVal,_Digits);
+   bool ok1 = (dir>0 ? trade.Buy(halfLots,_Symbol,price,sl,tp1,"H1"+atrTag) : trade.Sell(halfLots,_Symbol,price,sl,tp1,"H1"+atrTag)) && TradeOK();
+   ulong t1 = ok1 ? trade.ResultOrder() : 0;
+   bool ok2 = (dir>0 ? trade.Buy(halfLots,_Symbol,price,sl,0.0,"H2"+atrTag) : trade.Sell(halfLots,_Symbol,price,sl,0.0,"H2"+atrTag)) && TradeOK();
+   ulong t2 = ok2 ? trade.ResultOrder() : 0;
+   if(!ok1 || !ok2)
+   {
+      ulong t = ok1 ? t1 : (ok2 ? t2 : 0);
+      if(t!=0 && posInfo.SelectByTicket(t)) trade.PositionClose(t);   // never a one-legged trade
+      LogTrade("skip",dir,0,0,0,0,atrVal,(ok1||ok2)?"skip:one_leg_failed":"skip:order_failed");
+      return(false);
+   }
+   g_half1.ticket=t1; g_half1.open=true; g_half1.tp1Hit=false;
+   g_half2.ticket=t2; g_half2.open=true; g_half2.tp1Hit=false;
+   g_needBreakeven=false;
    g_posDir=dir;
    g_atrAtEntry=atrVal; g_trailActive=false;
    g_entryPriceForLog=price; g_half1PipsSet=false; g_half2PipsSet=false; g_half1Pips=0; g_half2Pips=0;
    g_tradeIsContinuation=isContinuation;
 
    LogTrade(reason,dir,totalLots,price,sl,tp1,atrVal,reason);
+   return(true);
 }
 
 // Open a fresh (non-continuation) position and arm the continuation tracker. Shared by
@@ -671,8 +768,8 @@ void OpenPosition(int dir,double atrVal,bool isContinuation,string reason="")
 void OpenFresh(int dir,double atrVal,string reason)
 {
    if(EntryBlocked(dir,atrVal)) return; // vetoed: opens nothing, arms nothing
+   if(!OpenPosition(dir, atrVal, false, reason)) return; // a failed order arms nothing either (engine: same)
    g_trendDir=dir; g_continuationOK=true;
-   OpenPosition(dir, atrVal, false, reason);
 }
 
 double NormalizeLots(double lots)
@@ -693,16 +790,18 @@ void ManageOpenPosition(double atrVal,bool newBar)
 
    if(g_half1.open && !posInfo.SelectByTicket(g_half1.ticket))
    {
-      g_half1.open=false; g_half1.tp1Hit=true;
+      g_half1.open=false;
+      // P0.5: TP1 counts only when half #1 really closed at its take-profit (a stop closes both halves)
+      g_half1.tp1Hit = (GetCloseReason(g_half1.ticket)==DEAL_REASON_TP);
       if(!g_half1PipsSet){ g_half1Pips=PipsFor(dir,g_entryPriceForLog,GetClosePrice(g_half1.ticket)); g_half1PipsSet=true; }
+      if(g_half1.tp1Hit && g_half2.open) g_needBreakeven=true;
    }
-   if(!g_half1.open && g_half2.open && !g_half1.tp1Hit)
+   if(g_needBreakeven && g_half2.open && posInfo.SelectByTicket(g_half2.ticket))
    {
-      // Half #1 closed (TP1 or otherwise) and half #2 is still open: move to breakeven, then trail.
-      g_half1.tp1Hit=true;
-      double entryPrice = posInfo.SelectByTicket(g_half2.ticket) ? posInfo.PriceOpen() : 0.0;
-      if(entryPrice>0)
-         trade.PositionModify(g_half2.ticket, entryPrice, posInfo.TakeProfit());
+      // TP1 filled and half #2 is still open: move it to breakeven (retried every tick until it sticks)
+      if(trade.PositionModify(g_half2.ticket, posInfo.PriceOpen(), posInfo.TakeProfit()) && TradeOK())
+         g_needBreakeven=false;
+      else Print("NNFXHarness: breakeven move failed, retcode=",trade.ResultRetcode()," -- retrying next tick");
    }
    if(newBar && g_half2.open && posInfo.SelectByTicket(g_half2.ticket) && g_half1.tp1Hit)
    {
@@ -715,7 +814,8 @@ void ManageOpenPosition(double atrVal,bool newBar)
       {
          double newSL = g_posDir>0 ? closeNow-TrailDistanceATR*refATR : closeNow+TrailDistanceATR*refATR;
          bool improves = g_posDir>0 ? newSL>posInfo.StopLoss() : newSL<posInfo.StopLoss();
-         if(improves) trade.PositionModify(g_half2.ticket, newSL, posInfo.TakeProfit());
+         if(improves && !(trade.PositionModify(g_half2.ticket, newSL, posInfo.TakeProfit()) && TradeOK()))
+            Print("NNFXHarness: trail move failed, retcode=",trade.ResultRetcode());
       }
    }
    if(g_half2.open && !posInfo.SelectByTicket(g_half2.ticket))
@@ -725,7 +825,7 @@ void ManageOpenPosition(double atrVal,bool newBar)
    }
    if(!g_half2.open)
    {
-      g_posDir=0; g_half1.open=false;
+      g_posDir=0; g_half1.open=false; g_lastCloseTime=TimeCurrent(); // P1.7: closed broker-side (stop)
       if(!g_half1PipsSet){ g_half1Pips=g_half2Pips; g_half1PipsSet=true; } // SL hit before TP1: both halves closed at the same price
       FinalizeTradeIfFlat(dir);
    }
@@ -763,6 +863,9 @@ void OnNewDailyBar()
    int prevExitInd = g_lastExitIndDirSeen;
    g_lastExitIndDirSeen = exitdir;
 
+   // P1.7 / Fix 8: a bar that exits never also enters (nnfx_engine returns on every exit bar; this EA
+   // used to fall through to the entry logic -- BACKLOG.md "same-bar re-entry")
+   // g_lastCloseTime >= the decided bar's open: a stop filled during that bar, or an exit fills right now
    // --- X3 hard exit: whole position closes immediately on a C1 flip. ---------------
    if(g_posDir!=0 && c1dir!=0 && c1dir!=g_posDir)
    {
@@ -819,6 +922,7 @@ void OnNewDailyBar()
    }
 
    if(g_posDir!=0) return; // already in a trade; nothing else to evaluate this bar
+   if(g_lastCloseTime>=iTime(_Symbol,PERIOD_D1,shift)) return; // a position closed on this bar: no same-bar re-entry
 
    // --- CONTINUATION entry (E6): same direction as the last trade, sequence unbroken since
    //     the original entry. EVERY mode ignores the 1xATR-beyond-baseline rule AND the volume
@@ -841,14 +945,14 @@ void OnNewDailyBar()
       if(trigger)
       {
          if(EntryBlocked(d,atrVal)) return; // vetoed: nothing opens; the sequence stays as it was
-         OpenPosition(d, atrVal, true);
-         g_lastExitDir=0; // consumed
+         if(OpenPosition(d, atrVal, true)) g_lastExitDir=0; // consumed only by a real entry
          return;
       }
    }
 
    // --- shared entry conditions for this bar (1xATR-beyond-baseline zone; volume) ---------
-   double baseNow; BufVal(h_baseline,g_baselineBuf,shift,baseNow);
+   double baseNow;
+   if(!BufVal(h_baseline,g_baselineBuf,shift,baseNow)) return; // P0.5: no baseline value -> no decision on garbage
    double closeNow = iClose(_Symbol,PERIOD_D1,shift);
    bool withinATR = !(MathAbs(closeNow-baseNow) > MinBeyondATR*atrVal);
 
@@ -965,6 +1069,7 @@ void OnTick()
    g_breakerRef  = MathMax(g_breakerRef,  AccountInfoDouble(ACCOUNT_BALANCE));
    datetime t0 = iTime(_Symbol,PERIOD_D1,0);
    bool newBar = (t0!=g_lastBarTime);
+   if(g_closeRetryReason!="" && g_posDir!=0) CloseAllHalves(g_closeRetryReason); // P0.5: retry a failed close
    if(BufVal(h_atr,0,1,atrVal)) ManageOpenPosition(atrVal,newBar); // fills every tick; T4 trail on newBar only
 
    if(!newBar) return; // only act once, on the bar that just closed
