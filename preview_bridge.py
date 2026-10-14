@@ -2049,7 +2049,7 @@ def render_library(db, out, terminal=None, chunk_size=70, item_timeout=30, max_a
                         try:
                             emit_heartbeat(job_id,0,str(r['path']),stage='mt4_render',worker_id=worker_id)
                             compiled=_compiled_cache_path(dest,'MT4',r['sha256'])
-                            image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id,compiled,worker_id)
+                            image,_meta=render_mt4(Path(r['path']),dest,mt4_sel,job_id,compiled,worker_id=worker_id)
                             final=_store_preview_image(image,dest,r['sha256'])
                             results[str(r['path'])]={'ok':True,'image':str(final),'kind':'MT4'}
                             emit_heartbeat(job_id,0,str(r['path']),stage='mt4_done',worker_id=worker_id)
@@ -2103,9 +2103,11 @@ def render_library(db, out, terminal=None, chunk_size=70, item_timeout=30, max_a
     con.close()
     emit({'ok':True,'job_id':job_id,'worker_id':worker_id,'finished':True})
 
-def render_mt4(src,out,t,job_id,compiled_cache=None):
+def render_mt4(src,out,t,job_id,compiled_cache=None,worker_id=None):
+    # worker_id gives each library worker its own MT4 runtime dir (runtime_path suffix), so
+    # parallel workers never share one terminal/profile/Files folder.
     emit_stage(job_id,'runtime_clone','Preparing isolated MT4 runtime.')
-    rt=clone_runtime(t,out,'MT4');mql=rt/'MQL4';scripts=mql/'Scripts';templates=rt/'templates';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,templates,files)]
+    rt=clone_runtime(t,out,'MT4',worker_id);mql=rt/'MQL4';scripts=mql/'Scripts';templates=rt/'templates';files=mql/'Files';[d.mkdir(parents=True,exist_ok=True) for d in (scripts,templates,files)]
     editor=rt/Path(t['editor']).name;terminal=rt/Path(t['terminal']).name;sym=copy_mt4_history(Path(t['data_dir']),rt)
     emit_stage(job_id,'indicator_compile','Compiling/staging the selected MT4 indicator.')
     job,staged,binary,meta=stage(src,mql,'MT4',editor,t.get('data_dir'),compiled_cache);emit_stage(job_id,'indicator_staged','Indicator copied into isolated MT4 runtime.',staged=str(staged),binary=str(binary));emit_stage(job_id,'indicator_compile_success','MT4 indicator is ready for rendering.',binary=str(binary));rel=f'MQLLibraryPreview\\{job}\\{binary.stem}'
@@ -2750,6 +2752,7 @@ def self_test():
         'mql_text_utf8_source':'indicator_separate_window' in decode_mql_bytes(b'#property indicator_separate_window\r\n'),
         'mql_text_utf16le_source':'indicator_separate_window' in decode_mql_bytes(b'\xff\xfe'+'#property indicator_separate_window\r\n'.encode('utf-16-le')),
         'mql_text_bomless_utf16le':decode_mql_bytes('Result: 0 errors'.encode('utf-16-le'))=='Result: 0 errors',
+        'render_mt4_accepts_worker_id':'worker_id' in render_mt4.__code__.co_varnames[:render_mt4.__code__.co_argcount],
         'mql_str_backslash_escape':_mql_str(r'MQLLibraryPreview\\abc\\demo')==r'MQLLibraryPreview\\\\abc\\\\demo',
         'resident_ea_timer':'EventSetMillisecondTimer(150)' in RESIDENT_EA_SOURCE,
         'resident_ea_job_protocol':all(x in RESIDENT_EA_SOURCE for x in ('current.job','current.done','heartbeat.txt')),
