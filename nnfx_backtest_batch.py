@@ -24,6 +24,8 @@ Commands (JSONL on stdout, like the other sidecars):
   run  --db <db> --out <dir> --bed-symbols EURUSD,GBPUSD,USDJPY [--limit N]
        [--min-trades 30] [--force] [--history-from 2015.01.01]
   rescore --db <db> --out <dir of an earlier run> --csv <leaderboard.csv> [--history-from 2015.01.01]
+  reextract --out <dir with nnfx_batch.json> --source-runtime <runtime with compiled candidates>
+       [--symbols EURUSD,...] [--keys sha-prefix,...]
 """
 from __future__ import annotations
 import argparse, json, os, shutil, sqlite3, sys, time, hashlib, threading, tempfile
@@ -882,24 +884,31 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_fr
 
 # ---- run ----------------------------------------------------------------------
 
-def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=DEFAULT_HISTORY_FROM,
-        job_timeout=JOB_TIMEOUT_SECONDS, holdout_from=HOLDOUT_FROM):
-    conn = connect(db)
-    ensure_backtest_table(conn)
-    items = candidacy_rows(conn, limit)
-    if not items:
-        emit({'type': 'fatal', 'error': 'No MQL5 candidacy rows found (run nnfx-map first, or every candidate is NEEDS_REVIEW/non-MQL5).'})
-        conn.close()
-        return
-    bed = '+'.join(symbols) + '|D1|LIVE'
+def archive_previous_outputs(files_dir):
+    """Move the previous session's job file, results, done flag and extraction CSVs into
+    Files/nnfx_archive/<timestamp>/ instead of deleting them: the runtime is shared (one per
+    terminal+data folder), so its last extraction may be the only copy."""
+    old = [files_dir / fn for fn in ('nnfx_batch.json', 'nnfx_batch_results.jsonl', 'nnfx_batch_done.flag')
+           if (files_dir / fn).exists()] + sorted(files_dir.glob('nnfx_batch_extract_*.csv'))
+    if not old:
+        return None
+    dest = files_dir / 'nnfx_archive' / time.strftime('%Y%m%d-%H%M%S')
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in old:
+        shutil.move(str(f), str(dest / f.name))
+    stage_event('previous_outputs_archived', to=str(dest), files=len(old))
+    return dest
 
+
+def _prepare_runtime(symbols, history_from):
+    """Discover the MT5 terminal, clone a private batch runtime (never the user's terminal), seed
+    history, prime it, restore the login and cap MaxBars. None (after a fatal event) if no MT5."""
     stage_event('discovering_runtime')
     all_terminals = pb.terminals()
     mt5 = next((t for t in all_terminals if t['kind'] == 'MT5' and t.get('terminal') and t.get('editor') and t.get('data_dir')), None)
     if not mt5:
         emit({'type': 'fatal', 'error': 'No usable MT5 terminal+data pairing found on this machine.'})
-        conn.close()
-        return
+        return None
     stage_event('runtime_found', terminal=mt5['terminal'], data_dir=mt5['data_dir'])
 
     # NOTE: MetaEditor's own /inc:<path> argument parsing truncates at the
@@ -923,16 +932,7 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     files_dir = mqlroot / 'Files'
     for d in (indicators_dir, scripts_dir, files_dir):
         d.mkdir(parents=True, exist_ok=True)
-    for fn in ('nnfx_batch.json', 'nnfx_batch_results.jsonl', 'nnfx_batch_done.flag'):
-        try:
-            (files_dir / fn).unlink()
-        except Exception:
-            pass
-    for f in files_dir.glob('nnfx_batch_extract_*.csv'):
-        try:
-            f.unlink()
-        except Exception:
-            pass
+    archive_previous_outputs(files_dir)
 
     terminal_exe = rt / Path(mt5['terminal']).name
     editor = rt / Path(mt5['editor']).name
@@ -946,6 +946,70 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     maxbars = maxbars_for(history_from)
     set_runtime_maxbars(rt, maxbars)
     stage_event('runtime_maxbars', maxbars=maxbars)
+    return rt, mqlroot, indicators_dir, scripts_dir, files_dir, terminal_exe, editor
+
+
+def _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_json, symbols, job_timeout, out):
+    """Write the job file + controller, compile it, run ONE extraction session, copy the extraction to
+    `out`. False (after a fatal event) only if the controller does not compile."""
+    (files_dir / 'nnfx_batch.json').write_text(json.dumps(job_json, separators=(',', ':')), encoding='utf-8')
+    ctrl = scripts_dir / 'NNFXBacktestBatchController.mq5'
+    ctrl.write_text(CONTROLLER_SRC, encoding='utf-8')
+    built, _cmds, log = pb.compile_file(editor, ctrl, mqlroot)
+    if not built:
+        emit({'type': 'fatal', 'error': 'batch controller failed to compile', 'log': (log or '')[-2000:]})
+        return False
+
+    cfg = rt / 'nnfx-backtest-batch.ini'
+    cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
+                    f'[StartUp]\nSymbol={symbols[0]}\nPeriod=D1\nScript={ctrl.stem}\nShutdownTerminal=0\n', encoding='utf-8')
+    stage_event('session_launch', jobs=len(job_json['jobs']), symbols=symbols)
+    proc = pb.subprocess.Popen([str(terminal_exe), '/portable', f'/config:{cfg}'],
+                                cwd=str(rt), creationflags=pb.CREATE_NO_WINDOW, startupinfo=pb.startupinfo())
+    try:
+        # ceiling: ~20 s per candidate per pair, + 2 time limits per candidate (strikes), + up to
+        # 2.5 min per symbol for the controller's history download/sync
+        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(job_json['jobs']) * len(symbols)
+                                                            + 2 * job_timeout * len(job_json['jobs']) + 150 * len(symbols)))
+    finally:
+        pb.terminate_tree(proc)
+    if not finished:
+        stage_event('batch_timeout')
+
+    # keep a durable copy of the raw extraction + job artifacts wherever the
+    # caller wanted them (--out); this is a plain file copy, not passed
+    # through MetaEditor's /inc: flag, so it's fine even if it contains spaces.
+    out_dir = Path(out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for f in files_dir.glob('nnfx_batch_extract_*.csv'):
+        try:
+            shutil.copy2(f, out_dir / f.name)
+        except Exception:
+            pass
+    for fn in ('nnfx_batch.json', 'nnfx_batch_results.jsonl'):
+        try:
+            shutil.copy2(files_dir / fn, out_dir / fn)
+        except Exception:
+            pass
+    return True
+
+
+def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=DEFAULT_HISTORY_FROM,
+        job_timeout=JOB_TIMEOUT_SECONDS, holdout_from=HOLDOUT_FROM):
+    conn = connect(db)
+    ensure_backtest_table(conn)
+    items = candidacy_rows(conn, limit)
+    if not items:
+        emit({'type': 'fatal', 'error': 'No MQL5 candidacy rows found (run nnfx-map first, or every candidate is NEEDS_REVIEW/non-MQL5).'})
+        conn.close()
+        return
+    bed = '+'.join(symbols) + '|D1|LIVE'
+
+    env = _prepare_runtime(symbols, history_from)
+    if env is None:
+        conn.close()
+        return
+    rt, mqlroot, indicators_dir, scripts_dir, files_dir, terminal_exe, editor = env
 
     # 1) stage every candidate source (mirrors render_shard's staging loop)
     prepared = {}
@@ -1030,46 +1094,9 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     # "key": 1 style silently made every int field parse back as its -1 default
     # (confirmed directly: buf_b=1 in the DB came back as -1 in the CSV column
     # count, dropping the whole _b column and crashing the Python-side lookup).
-    (files_dir / 'nnfx_batch.json').write_text(json.dumps(job_json, separators=(',', ':')), encoding='utf-8')
-    ctrl = scripts_dir / 'NNFXBacktestBatchController.mq5'
-    ctrl.write_text(CONTROLLER_SRC, encoding='utf-8')
-    built, _cmds, log = pb.compile_file(editor, ctrl, mqlroot)
-    if not built:
-        emit({'type': 'fatal', 'error': 'batch controller failed to compile', 'log': (log or '')[-2000:]})
+    if not _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_json, symbols, job_timeout, out):
         conn.close()
         return
-
-    cfg = rt / 'nnfx-backtest-batch.ini'
-    cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
-                    f'[StartUp]\nSymbol={symbols[0]}\nPeriod=D1\nScript={ctrl.stem}\nShutdownTerminal=0\n', encoding='utf-8')
-    stage_event('session_launch', jobs=len(jobs), symbols=symbols)
-    proc = pb.subprocess.Popen([str(terminal_exe), '/portable', f'/config:{cfg}'],
-                                cwd=str(rt), creationflags=pb.CREATE_NO_WINDOW, startupinfo=pb.startupinfo())
-    try:
-        # ceiling: ~20 s per candidate per pair, + 2 time limits per candidate (strikes), + up to
-        # 2.5 min per symbol for the controller's history download/sync
-        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(jobs) * len(symbols)
-                                                            + 2 * job_timeout * len(jobs) + 150 * len(symbols)))
-    finally:
-        pb.terminate_tree(proc)
-    if not finished:
-        stage_event('batch_timeout')
-
-    # keep a durable copy of the raw extraction + job artifacts wherever the
-    # caller wanted them (--out); this is a plain file copy, not passed
-    # through MetaEditor's /inc: flag, so it's fine even if it contains spaces.
-    out_dir = Path(out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for f in files_dir.glob('nnfx_batch_extract_*.csv'):
-        try:
-            shutil.copy2(f, out_dir / f.name)
-        except Exception:
-            pass
-    for fn in ('nnfx_batch.json', 'nnfx_batch_results.jsonl'):
-        try:
-            shutil.copy2(files_dir / fn, out_dir / fn)
-        except Exception:
-            pass
 
     # 5) history depth per symbol: score only the symbols whose history synchronized and reaches
     #    the scoring start; report the rest (and every symbol's bars + oldest date) explicitly.
@@ -1129,6 +1156,48 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     conn.commit()
     conn.close()
     emit({'type': 'batch_complete', 'compiled': len(jobs), 'compile_failed': len(compile_failed), 'scored': scored, 'bed': bed})
+
+def reextract(out, source_runtime, symbols=None, keys=None, history_from=DEFAULT_HISTORY_FROM,
+              job_timeout=JOB_TIMEOUT_SECONDS):
+    """Re-run the MT5 extraction of an earlier run WITHOUT the library DB: the job list comes from
+    <out>/nnfx_batch.json and the compiled candidates from <source_runtime>/MQL5/Indicators/
+    NNFXBacktestBatch (the runtime that run() compiled them in). A fresh private runtime is cloned,
+    so neither the user's terminal nor the source runtime is touched. Use it after a controller change
+    (e.g. the open column, the repaint test); then `rescore --out <out>`."""
+    out = Path(out)
+    job_json = json.loads((out / 'nnfx_batch.json').read_text(encoding='utf-8'))
+    if keys:
+        job_json['jobs'] = [j for j in job_json['jobs'] if any(j['key'].startswith(k) for k in keys)]
+    symbols = symbols or job_json['symbols']
+    job_json.update(symbols=symbols, history_from=fetch_from(history_from), job_timeout_ms=int(job_timeout * 1000))
+    src = Path(source_runtime) / pb.mql_dir_name('MT5') / 'Indicators' / 'NNFXBacktestBatch'
+    missing = [j['key'] for j in job_json['jobs'] if not (src / j['key']).is_dir()]
+    if missing or not job_json['jobs']:
+        emit({'type': 'fatal', 'error': 'compiled candidates missing from the source runtime' if missing
+              else 'no jobs selected', 'missing': missing})
+        return
+    # Stage the compiled candidates OUTSIDE the runtime first: pb.clone_runtime() reuses ONE runtime per
+    # terminal+data folder, so the session runtime may BE the source runtime, and priming it empties
+    # Indicators/NNFXBacktestBatch (lost once, 2026-10-14; restored from the F:/MQLFIX_RT copies).
+    staged = out / '_candidates'
+    for j in job_json['jobs']:
+        shutil.copytree(src / j['key'], staged / j['key'], dirs_exist_ok=True)
+    env = _prepare_runtime(symbols, history_from)
+    if env is None:
+        return
+    rt, mqlroot, indicators_dir, scripts_dir, files_dir, terminal_exe, editor = env
+    if files_dir.resolve() == out.resolve():
+        emit({'type': 'fatal', 'error': '--out must not be the runtime Files folder'})
+        return
+    archive_previous_outputs(files_dir)
+    for j in job_json['jobs']:
+        shutil.copytree(staged / j['key'], indicators_dir / j['key'], dirs_exist_ok=True)
+    if not _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_json, symbols, job_timeout, out):
+        return
+    results = _read_jsonl(out / 'nnfx_batch_results.jsonl')
+    emit({'type': 'reextract_complete', 'out': str(out), 'jobs': len(job_json['jobs']),
+          'symbols': {r['symbol']: r.get('status') for r in results if 'symbol' in r and 'status' in r}})
+
 
 def write_status_row(conn, it, bed, status, reason):
     """Never silently drops a candidate: COMPILE_FAILED / EXTRACT_GARBAGE both
@@ -1268,12 +1337,22 @@ def main():
     p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM); p.add_argument('--min-trades', type=int, default=MIN_TRADES)
     p.add_argument('--holdout-from', default=HOLDOUT_FROM, type=ymd_dots,
                    help='YYYY.MM.DD: trades entered from this date on are out-of-sample')
+    p = sub.add_parser('reextract', help='re-run the MT5 extraction of an earlier run without the library DB')
+    p.add_argument('--out', required=True, help='directory holding the earlier nnfx_batch.json; receives the new CSVs')
+    p.add_argument('--source-runtime', required=True, help='runtime folder holding MQL5/Indicators/NNFXBacktestBatch')
+    p.add_argument('--symbols', default='', help='comma list (default: the symbols in the saved job file)')
+    p.add_argument('--keys', default='', help='comma list of candidate sha256 prefixes (default: all)')
+    p.add_argument('--history-from', default=DEFAULT_HISTORY_FROM)
+    p.add_argument('--job-timeout', type=float, default=JOB_TIMEOUT_SECONDS)
     args = ap.parse_args()
     if args.cmd == 'plan':
         plan(args.db, args.limit)
     elif args.cmd == 'run':
         run(args.db, args.out, [s.strip() for s in args.bed_symbols.split(',') if s.strip()],
             args.limit, args.min_trades, args.force, args.history_from, args.job_timeout, args.holdout_from)
+    elif args.cmd == 'reextract':
+        reextract(args.out, args.source_runtime, [x.strip() for x in args.symbols.split(',') if x.strip()] or None,
+                  [x.strip() for x in args.keys.split(',') if x.strip()] or None, args.history_from, args.job_timeout)
     elif args.cmd == 'rescore':
         rescore(args.db, args.out, args.csv, args.history_from, args.min_trades, args.holdout_from)
 

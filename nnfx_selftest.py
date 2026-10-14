@@ -957,6 +957,15 @@ def unit_tests() -> Check:
     c.that('P1.2 extraction gate: a column holding a reference indicator\'s exact values (here Momentum on the newest '
            '25 bars, as found in 14 of 40 candidates of the 2026-10-04 extraction) is a corrupt extraction',
            'reference column mom (25 bars)' in prob, detail=prob)
+    arch_dir = Path(tempfile.mkdtemp(prefix='nnfx_arch_'))
+    for name in ('nnfx_batch.json', 'nnfx_batch_results.jsonl', 'nnfx_batch_extract_EURUSD.csv', 'keep.txt'):
+        (arch_dir / name).write_text(name)
+    dest = nb.archive_previous_outputs(arch_dir)
+    c.that('Runtime safety: a new session ARCHIVES the previous job file, results and extraction CSVs into '
+           'Files/nnfx_archive/<time>/ (the runtime is shared, so they may be the only copy) and leaves other files',
+           dest is not None and sorted(f.name for f in dest.iterdir()) == ['nnfx_batch.json', 'nnfx_batch_extract_EURUSD.csv',
+           'nnfx_batch_results.jsonl'] and (dest / 'nnfx_batch_extract_EURUSD.csv').read_text() == 'nnfx_batch_extract_EURUSD.csv'
+           and sorted(f.name for f in arch_dir.iterdir()) == ['keep.txt', 'nnfx_archive'], detail=str(dest))
     c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
            'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
            and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)
