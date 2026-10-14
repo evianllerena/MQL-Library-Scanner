@@ -255,7 +255,7 @@ def ensure_backtest_table(conn):
     for col in ('expectancy_r', 'expectancy_r_ci95'):  # ranking metric in R + its 95% margin
         if col not in cols:
             conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} REAL')
-    for col in ('fill_model', 'cost_model'):  # P1.1/P1.3/P1.7: which execution model scored the row
+    for col in ('fill_model', 'cost_model', 'repaint_test'):  # which execution model scored the row; P1.2 verdict
         if col not in cols:
             conn.execute(f'ALTER TABLE backtest_results ADD COLUMN {col} TEXT')
     for col, typ in (('expectancy_r_low', 'REAL'), ('expectancy_r_high', 'REAL'), ('is_trades', 'INTEGER'),
@@ -365,6 +365,80 @@ bool SyncHistory(string sym,datetime from,uint timeout_ms){
     Sleep(250);
   }
   return(false);
+}
+
+// P1.2 repaint test (the method of tools/indicator_fix/IndicatorQA.mq5): the candidate runs on two
+// custom copies of the first symbol's D1 history -- NNFXR_FULL (every bar) and NNFXR_CUT (the newest
+// RP_CUT bars removed) -- and its buffers must be identical on the RP_CMP bars both histories share.
+// Any difference means a value the backtest reads at bar t was not known at bar t (repainting or
+// lookahead). A value present on one side and EMPTY/0 on the other counts as a difference (ZigZag-type
+// pivots appear and disappear); bars EMPTY/0 on both sides are not compared.
+#define RP_CUT 150
+#define RP_CMP 400
+long g_tick_msc=0;
+// custom symbols get no ticks; indicators that wait for a tick before finishing would never calculate
+void PumpTick(string sym){
+  if(StringFind(sym,"NNFXR_")!=0) return;
+  MqlRates r[]; if(CopyRates(sym,PERIOD_D1,0,1,r)!=1) return;
+  long t=(long)r[0].time*1000+3600000;
+  if(g_tick_msc<t) g_tick_msc=t; g_tick_msc+=1000;
+  MqlTick tk[1]; tk[0].time=(datetime)(g_tick_msc/1000); tk[0].time_msc=g_tick_msc;
+  tk[0].bid=r[0].close; tk[0].ask=r[0].close+10*SymbolInfoDouble(sym,SYMBOL_POINT); tk[0].last=r[0].close;
+  tk[0].volume=1; tk[0].flags=TICK_FLAG_BID|TICK_FLAG_ASK;
+  CustomTicksAdd(sym,tk);
+}
+bool MakeCustom(string name,string origin,int drop){
+  MqlRates r[]; ArraySetAsSeries(r,false);
+  int n=CopyRates(origin,PERIOD_D1,0,Bars(origin,PERIOD_D1),r);
+  if(n<=RP_CUT+RP_CMP+200) return(false);
+  SymbolSelect(name,false); CustomSymbolDelete(name);
+  if(!CustomSymbolCreate(name,"NNFXR",origin)) return(false);
+  MqlRates k[]; ArrayResize(k,n-drop); for(int i=0;i<n-drop;i++) k[i]=r[i];
+  if(CustomRatesReplace(name,k[0].time,k[n-drop-1].time+86400,k)<=0) return(false);
+  SymbolSelect(name,true);
+  MqlTick tk[1]; tk[0].time=k[n-drop-1].time+3600; tk[0].bid=k[n-drop-1].close; tk[0].ask=k[n-drop-1].close+10*SymbolInfoDouble(origin,SYMBOL_POINT);
+  tk[0].last=tk[0].bid; tk[0].volume=1; tk[0].time_msc=(long)tk[0].time*1000; tk[0].flags=TICK_FLAG_BID|TICK_FLAG_ASK;
+  CustomTicksAdd(name,tk);
+  uint t0=GetTickCount(); while(Bars(name,PERIOD_D1)<n-drop && GetTickCount()-t0<30000) Sleep(100);
+  return(Bars(name,PERIOD_D1)>=n-drop);
+}
+int LoadCalc(string sym,string rel,uint timeout,string &status){
+  int need=Bars(sym,PERIOD_D1); uint t0=GetTickCount(); int calc=-1; uint lastpump=0;
+  int h=iCustom(sym,PERIOD_D1,rel);
+  if(h==INVALID_HANDLE){ status="load_failed"; return(h); }
+  while(true){
+    calc=BarsCalculated(h); if(calc>=need || GetTickCount()-t0>=timeout) break;
+    if(GetTickCount()-lastpump>=250){ PumpTick(sym); lastpump=GetTickCount(); }
+    Sleep(25);
+  }
+  status=(calc>=need)?"ok":((calc<=0)?"never_calculated":"too_slow");
+  return(h);
+}
+bool Blank(double v){ return(v==EMPTY_VALUE || !MathIsValidNumber(v) || v==0.0); }
+string RepaintTest(string rel,int bufA,int bufB,uint timeout){
+  string st1,st2;
+  int h1=LoadCalc("NNFXR_CUT",rel,timeout,st1);
+  if(st1!="ok"){ if(h1!=INVALID_HANDLE) IndicatorRelease(h1); return("\"repaint\":\"untested_cut_"+st1+"\""); }
+  int h2=LoadCalc("NNFXR_FULL",rel,timeout,st2);
+  if(st2!="ok"){ IndicatorRelease(h1); if(h2!=INVALID_HANDLE) IndicatorRelease(h2); return("\"repaint\":\"untested_full_"+st2+"\""); }
+  int compared=0,diffs=0,deepest=-1;
+  for(int q=0;q<2;q++){
+    int b=(q==0)?bufA:bufB; if(b<0) continue;
+    double a[],f[]; ArraySetAsSeries(a,true); ArraySetAsSeries(f,true);
+    int ga=CopyBuffer(h1,b,0,RP_CMP,a);        // NNFXR_CUT newest RP_CMP bars (j = j bars before the cut)
+    int gf=CopyBuffer(h2,b,RP_CUT,RP_CMP,f);   // the SAME bars on NNFXR_FULL
+    int n=MathMin(ga,gf);
+    for(int j=0;j<n;j++){
+      bool ea=Blank(a[j]), ef=Blank(f[j]);
+      if(ea && ef) continue;
+      compared++;
+      if(ea!=ef || MathAbs(a[j]-f[j])>1e-8*MathMax(1.0,MathAbs(a[j]))){ diffs++; if(j>deepest) deepest=j; }
+    }
+  }
+  IndicatorRelease(h1); IndicatorRelease(h2);
+  string v=(compared<50)?"untested_no_comparable_values":((diffs==0)?"aligned":"repaints");
+  return("\"repaint\":\""+v+"\",\"compared\":"+IntegerToString(compared)+",\"diffs\":"+IntegerToString(diffs)+
+         ",\"deepest\":"+IntegerToString(deepest));
 }
 
 void OnStart(){
@@ -487,6 +561,24 @@ void OnStart(){
     AppendResult("{\"symbol\":\""+sym+"\",\"status\":\"done\",\"rows\":"+IntegerToString(total)+
                  ",\"first\":\""+TimeToString(iTime(sym,PERIOD_D1,total-1),TIME_DATE)+"\",\"synced\":"+(synced?"true":"false")+
                  ",\"server_first\":\""+TimeToString((datetime)SeriesInfoInteger(sym,PERIOD_D1,SERIES_SERVER_FIRSTDATE),TIME_DATE)+"\"}");
+  }
+  // P1.2 repaint test, once per candidate, on the first symbol's history (repainting is a property of
+  // the indicator, not of the pair). Skipped for candidates that already struck out.
+  string rsym=syms[0];
+  bool rp_ok=nsyms>0 && MakeCustom("NNFXR_FULL",rsym,0) && MakeCustom("NNFXR_CUT",rsym,RP_CUT);
+  AppendResult("{\"info\":\"repaint_test\",\"symbol\":\""+rsym+"\",\"custom_symbols\":"+(rp_ok?"true":"false")+"}");
+  // controls, every session: MetaTrader's own moving average must come out aligned and its own ZigZag
+  // must come out repainting -- otherwise no verdict of this session is trusted (checked in Python)
+  if(rp_ok){
+    AppendResult("{\"repaint_control\":\"Examples\\\\Custom Moving Average\","+RepaintTest("Examples\\Custom Moving Average",0,-1,jobTimeout)+"}");
+    AppendResult("{\"repaint_control\":\"Examples\\\\ZigZag\","+RepaintTest("Examples\\ZigZag",0,-1,jobTimeout)+"}");
+  }
+  for(int k=0;k<njobs && rp_ok;k++){
+    string rj;
+    if(strikes[k]>=MAX_STRIKES) rj="\"repaint\":\"untested_struck_out\"";
+    else if(!WaitHealthy("NNFXR_FULL",Bars("NNFXR_FULL",PERIOD_D1),60000)) rj="\"repaint\":\"untested_queue_unhealthy\"";
+    else rj=RepaintTest(rels[k],bufA[k],bufB[k],jobTimeout);
+    AppendResult("{\"key\":\""+keys[k]+"\",\"repaint_symbol\":\""+rsym+"\","+rj+"}");
   }
   int f=FileOpen("nnfx_batch_done.flag",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
   if(f!=INVALID_HANDLE){ FileWriteString(f,"done"); FileClose(f); }
@@ -644,6 +736,44 @@ def leak_source(rows, col):
     return ''
 
 
+STOPS_WRITING_BARS = 50  # newest bars all exactly 0 / EMPTY -> the indicator stopped writing its buffer
+
+
+def trailing_blank(rows, col):
+    """How many of the newest rows hold exactly 0 or EMPTY. Converted MQL4 indicators that stop writing
+    their newest bars show 0 or recycled memory there (MT5 does not initialise indicator buffers)."""
+    n = 0
+    for r in reversed(rows):
+        if r[col] not in ('EMPTY', 'FAILED', '', '0.00000000'):
+            break
+        n += 1
+    return n
+
+
+def repaint_verdicts(results):
+    """{candidate key: the controller's repaint-test line} (P1.2), or {'__controls__': False} when the
+    session's controls did not behave (MetaTrader's moving average must be 'aligned', its ZigZag
+    'repaints'): then no verdict of that session is trusted. Extractions made before the test existed
+    have no such lines ({})."""
+    controls = {r['repaint_control']: r['repaint'] for r in results if 'repaint_control' in r}
+    verdicts = {r['key']: r for r in results if 'key' in r and 'repaint' in r}
+    if verdicts and controls.get('Examples\\Custom Moving Average') == 'aligned' \
+            and controls.get('Examples\\ZigZag') == 'repaints':
+        return verdicts
+    return {'__controls__': False} if verdicts else {}
+
+
+def repaint_label(verdicts, key):
+    if verdicts.get('__controls__') is False:
+        return 'untested_controls_failed'
+    v = verdicts.get(key)
+    if v is None:
+        return 'not_run'
+    if v['repaint'] == 'repaints':
+        return f"repaints ({v['diffs']} of {v['compared']} shared values differ, deepest {v['deepest']} bars before the cut)"
+    return v['repaint']
+
+
 def extraction_problem(symbol_data, symbols, col_a, col_b):
     """'' when the candidate's columns are usable on every symbol, else the first reason they are not.
     The one gate both run() and rescore() apply before scoring."""
@@ -660,6 +790,9 @@ def extraction_problem(symbol_data, symbols, col_a, col_b):
             src = leak_source(rows, col) if col else ''
             if src:
                 return f'{sym}: {col[-2:]} holds the values of reference column {src} -- corrupt extraction'
+            blank = trailing_blank(rows, col) if col else 0
+            if blank >= STOPS_WRITING_BARS:
+                return f'{sym}: {col[-2:]} is 0/EMPTY on the newest {blank} bars -- the indicator stops writing'
     return ''
 
 # ---- engine wiring (same roles as run_pilot_mass.py, generalized) -----------
@@ -1103,6 +1236,7 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
     results = _read_jsonl(files_dir / 'nnfx_batch_results.jsonl')
     statuses = {r['symbol']: r for r in results if 'symbol' in r and 'status' in r}
     failures = job_failures(results)
+    verdicts = repaint_verdicts(results)
     stage_event('history_depth', history_from=history_from, fetch_from=fetch_from(history_from),
                 symbols={s: {k: statuses.get(s, {}).get(k) for k in ('status', 'rows', 'first', 'synced', 'server_first')}
                          for s in symbols})
@@ -1140,8 +1274,13 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
             if bad_reason:
                 write_status_row(conn, it, bed, 'EXTRACT_GARBAGE', bad_reason)
                 continue
+            rp = repaint_label(verdicts, j['key'])
+            if rp.startswith('repaints'):  # P1.2: hindsight values would float it to the top -- never scored
+                write_status_row(conn, it, bed, 'EXTRACT_REPAINTS', rp)
+                continue
             result = score_candidate(symbol_data, symbols, it['slot'], col_a, col_b, it['zero_reference'],
                                      score_from=history_from, holdout_from=holdout_from)
+            result['repaint_test'] = rp
             write_score_row(conn, it, bed, result)
             scored += 1
             emit({'type': 'item_scored', 'filename': it['filename'], 'slot': it['slot'],
@@ -1166,6 +1305,9 @@ def reextract(out, source_runtime, symbols=None, keys=None, history_from=DEFAULT
     (e.g. the open column, the repaint test); then `rescore --out <out>`."""
     out = Path(out)
     job_json = json.loads((out / 'nnfx_batch.json').read_text(encoding='utf-8'))
+    source_copy = out / 'nnfx_batch.source.json'  # the session writes its (filtered) job file back to out
+    if not source_copy.exists():
+        shutil.copy2(out / 'nnfx_batch.json', source_copy)
     if keys:
         job_json['jobs'] = [j for j in job_json['jobs'] if any(j['key'].startswith(k) for k in keys)]
     symbols = symbols or job_json['symbols']
@@ -1225,8 +1367,9 @@ def write_score_row(conn, it, bed, r):
         INSERT INTO backtest_results(sha256, slot, signal_type, bed, stage, trades, wins, losses,
             win_rate, expectancy_pips, expectancy_pips_breaker, expectancy_r, expectancy_r_ci95, profit_factor, max_drawdown, max_drawdown_pct, bridge_skips, continuation_trades,
             mapping_source, mapping_reason, tested_at, zero_reference, buf_a, buf_b, fill_model, cost_model,
-            expectancy_r_low, expectancy_r_high, is_trades, is_expectancy_r, is_r_low, oos_trades, oos_expectancy_r, oos_pass)
-        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?)
+            expectancy_r_low, expectancy_r_high, is_trades, is_expectancy_r, is_r_low, oos_trades, oos_expectancy_r, oos_pass,
+            repaint_test)
+        VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,'batch',?,datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(sha256, slot, bed) DO UPDATE SET trades=excluded.trades, wins=excluded.wins,
             losses=excluded.losses, win_rate=excluded.win_rate, expectancy_pips=excluded.expectancy_pips,
             expectancy_pips_breaker=excluded.expectancy_pips_breaker,
@@ -1236,13 +1379,14 @@ def write_score_row(conn, it, bed, r):
             fill_model=excluded.fill_model, cost_model=excluded.cost_model,
             expectancy_r_low=excluded.expectancy_r_low, expectancy_r_high=excluded.expectancy_r_high,
             is_trades=excluded.is_trades, is_expectancy_r=excluded.is_expectancy_r, is_r_low=excluded.is_r_low,
-            oos_trades=excluded.oos_trades, oos_expectancy_r=excluded.oos_expectancy_r, oos_pass=excluded.oos_pass
+            oos_trades=excluded.oos_trades, oos_expectancy_r=excluded.oos_expectancy_r, oos_pass=excluded.oos_pass,
+            repaint_test=excluded.repaint_test
     """, (it['sha256'], it['slot'], it['signal_type'], bed, r['trades'], r['wins'], r['losses'], r['win_rate'],
           r['expectancy_pips'], r.get('expectancy_pips_breaker'), r['expectancy_r'], r['expectancy_r_ci95'], r['profit_factor'], r['max_drawdown'], r['max_drawdown_pct'], r['bridge_skips'], r['continuation_trades'],
           f'[EXTRACT_OK] per_symbol={r["per_symbol"]} :: {it["filename"]}', it['zero_reference'], it['buf_a'], it['buf_b'],
           r.get('fill_model'), r.get('cost_model'), r.get('expectancy_r_low'), r.get('expectancy_r_high'),
           r.get('is_trades'), r.get('is_expectancy_r'), r.get('is_r_low'), r.get('oos_trades'),
-          r.get('oos_expectancy_r'), int(bool(r.get('oos_pass')))))
+          r.get('oos_expectancy_r'), int(bool(r.get('oos_pass'))), r.get('repaint_test')))
     conn.commit()
 
 LEADERBOARD_COLUMNS = (
@@ -1250,7 +1394,7 @@ LEADERBOARD_COLUMNS = (
     'oos_trades', 'oos_expectancy_r', 'oos_pass', 'expectancy_r', 'expectancy_r_ci95', 'expectancy_r_low',
     'expectancy_r_high', 'expectancy_pips', 'expectancy_pips_breaker', 'win_rate', 'profit_factor',
     'max_drawdown_pips', 'max_drawdown_pct', 'dd_breaker_skips', 'bridge_skips', 'continuation_trades',
-    'volume_skips', 'news_skips', 'symbols_traded', 'fill_model', 'cost_model')
+    'volume_skips', 'news_skips', 'symbols_traded', 'fill_model', 'cost_model', 'repaint_test')
 
 
 def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN_TRADES, holdout_from=HOLDOUT_FROM):
@@ -1263,6 +1407,7 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
     results = _read_jsonl(out / 'nnfx_batch_results.jsonl')
     statuses = {r['symbol']: r for r in results if 'symbol' in r and 'status' in r}
     failures = job_failures(results)
+    verdicts = repaint_verdicts(results)
     symbols = [s for s in job_json['symbols'] if (out / f'nnfx_batch_extract_{s}.csv').exists()]
     if statuses:
         symbols, dropped = usable_symbols(statuses, symbols, history_from)
@@ -1286,6 +1431,11 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
             rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'],
                              status=f'EXTRACT_GARBAGE: {garbage}', trades=0, sufficient_sample=False, expectancy_r=0.0))
             continue
+        rp = repaint_label(verdicts, j['key'])
+        if rp.startswith('repaints'):  # same gate as run()
+            rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status=f'EXTRACT_REPAINTS: {rp}',
+                             trades=0, sufficient_sample=False, expectancy_r=0.0, repaint_test=rp))
+            continue
         r = score_candidate(symbol_data, symbols, j['role'], j['key'] + '_a', col_b, None, score_from=history_from,
                             holdout_from=holdout_from)
         rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status='scored', trades=r['trades'],
@@ -1300,7 +1450,7 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
                          bridge_skips=r['bridge_skips'], continuation_trades=r['continuation_trades'],
                          volume_skips=r['volume_skips'], news_skips=r['news_skips'],
                          symbols_traded=sum(1 for n in r['per_symbol'].values() if n),
-                         fill_model=r['fill_model'], cost_model=r['cost_model']))
+                         fill_model=r['fill_model'], cost_model=r['cost_model'], repaint_test=rp))
     rows = leaderboard_order(rows, min_trades)
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = _csv.DictWriter(f, fieldnames=LEADERBOARD_COLUMNS, restval='')

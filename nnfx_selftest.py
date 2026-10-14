@@ -966,6 +966,24 @@ def unit_tests() -> Check:
            dest is not None and sorted(f.name for f in dest.iterdir()) == ['nnfx_batch.json', 'nnfx_batch_extract_EURUSD.csv',
            'nnfx_batch_results.jsonl'] and (dest / 'nnfx_batch_extract_EURUSD.csv').read_text() == 'nnfx_batch_extract_EURUSD.csv'
            and sorted(f.name for f in arch_dir.iterdir()) == ['keep.txt', 'nnfx_archive'], detail=str(dest))
+    ctl_ok = [{'repaint_control': 'Examples\\Custom Moving Average', 'repaint': 'aligned'},
+              {'repaint_control': 'Examples\\ZigZag', 'repaint': 'repaints'}]
+    cand = [{'key': 'zz', 'repaint': 'repaints', 'compared': 400, 'diffs': 400, 'deepest': 399},
+            {'key': 'ma', 'repaint': 'aligned', 'compared': 400, 'diffs': 0, 'deepest': -1}]
+    v_ok = nb.repaint_verdicts(ctl_ok + cand)
+    v_bad = nb.repaint_verdicts([dict(ctl_ok[0], repaint='repaints'), ctl_ok[1]] + cand)
+    c.that('P1.2 repaint verdicts are trusted only when the session controls behave (MetaTrader MA aligned, '
+           'MetaTrader ZigZag repaints); a repainter is labelled with its counts, an older extract is not_run',
+           nb.repaint_label(v_ok, 'zz').startswith('repaints (400 of 400') and nb.repaint_label(v_ok, 'ma') == 'aligned'
+           and nb.repaint_label(v_bad, 'zz') == 'untested_controls_failed'
+           and nb.repaint_label(nb.repaint_verdicts([]), 'zz') == 'not_run', detail=str(v_bad))
+    tail0 = [dict(r) for r in two_line]
+    for r in tail0:
+        r['cand_b'] = r['cand_a']
+    for r in tail0[-12:]:
+        r['cand_a'] = '0.00000000'
+    c.that('P1.2 stops-writing gate: trailing 0/EMPTY bars are counted from the newest bar back',
+           nb.trailing_blank(tail0, 'cand_a') == 12 and nb.trailing_blank(tail0, 'cand_b') == 0)
     c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
            'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
            and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)
