@@ -28,7 +28,8 @@
         "enable": true,
         "scope": [
           "$APPDATA/previews/*",
-          "$APPDATA/previews/**"
+          "$APPDATA/previews/**",
+          "$APPDATA/selftest/*"
         ]
       }
     }

@@ -129,6 +129,16 @@ function invalidatePreview(reason){
 }
 
 window.__mqlPreviewCancelForBatch=()=>invalidatePreview('batch preview starting');
+
+// P2: cancellation rejects by design while a render process is still terminating -- handle it at the call
+// sites instead of leaking an unhandled rejection, and tell the user what is going on
+function cancelPreviewQuietly(reason){
+  invalidatePreview(reason).catch(e=>{
+    void appLog('WARN','preview_cancel_pending',{reason,error:String(e?.message||e)});
+    const s=document.getElementById('previewStatus');
+    if(s)s.textContent='Render process still terminating…';
+  });
+}
 window.addEventListener('mql-batch-preview-result',event=>{
   const result=event.detail||{};
   if(!result.source||detailSource()!==result.source||!result.image)return;
@@ -412,11 +422,11 @@ function boot(){
 document.addEventListener('pointerdown',e=>{
   if(e.target.closest?.('#rows tr,#reviewRows tr')){
     previewState={source:null,phase:'idle',message:'',image:null,kind:null};
-    void invalidatePreview('new indicator selected');
+    cancelPreviewQuietly('new indicator selected');
   }
   if(e.target.closest?.('#closeDetail')){
     previewState={source:null,phase:'idle',message:'',image:null,kind:null};
-    void invalidatePreview('detail closed');
+    cancelPreviewQuietly('detail closed');
   }
   if(e.target.closest?.('[data-view="settings"]'))queueMicrotask(ensureClearCard);
   if(e.target.closest?.('[data-view="scan"]'))queueMicrotask(enhanceSourceRemoval);
@@ -425,7 +435,7 @@ document.addEventListener('pointerdown',e=>{
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){
     previewState={source:null,phase:'idle',message:'',image:null,kind:null};
-    void invalidatePreview('escape');
+    cancelPreviewQuietly('escape');
   }
 });
 
