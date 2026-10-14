@@ -140,5 +140,46 @@ class RepairPoolTest(unittest.TestCase):
         self.assertEqual(self.ra.RT_POOL.qsize(), self.size)
 
 
+class DriversRunningTest(unittest.TestCase):
+    """orchestrate.qa() waits while drivers_running(); the query must not count itself."""
+
+    def test_only_python_running_qa_driver_counts(self):
+        import orchestrate
+        ps = ("powershell -NoProfile -Command \"Get-CimInstance Win32_Process | Where-Object "
+              "{ $_.CommandLine -match 'qa_driver.py' }\"")
+        self.assertFalse(orchestrate.is_qa_driver('powershell.exe', ps))
+        self.assertFalse(orchestrate.is_qa_driver('bash.exe', 'bash -c "python qa_driver.py A"'))
+        self.assertFalse(orchestrate.is_qa_driver('python.exe', r'python F:\x\orchestrate.py'))
+        self.assertFalse(orchestrate.is_qa_driver('python.exe', None))
+        self.assertTrue(orchestrate.is_qa_driver(
+            'python.exe', r'"C:\Py312\python.exe" C:\tools\qa_driver.py A --rt F:\MQLFIX_RT\rt1 --shard 0/4'))
+        self.assertTrue(orchestrate.is_qa_driver('py.exe', 'py qa_driver.py B'))
+
+    @unittest.skipUnless(sys.platform == 'win32', 'queries live Windows processes')
+    def test_live_non_driver_mentioning_qa_driver_is_not_counted(self):
+        # e.g. an editor with qa_driver.py open. With the old query this process plus the query's own
+        # PowerShell made 2 matches -> drivers_running() stayed True and qa() never started.
+        # (A lone self-match did not show: PowerShell 5.1 gives no .Count for a single CimInstance.)
+        import orchestrate
+        import subprocess
+        listing = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                  "@(Get-CimInstance Win32_Process -Filter \"Name LIKE 'py%'\" | "
+                                  "Where-Object { $_.CommandLine -match 'qa_driver\\.py' }).Count"],
+                                 capture_output=True, text=True).stdout.strip()
+        if listing not in ('', '0'):
+            self.skipTest('a python process mentioning qa_driver.py is running on this machine')
+        bystander = subprocess.Popen('cmd /c "ping -n 30 127.0.0.1 >nul & rem qa_driver.py"',
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.assertFalse(orchestrate.drivers_running())
+            driver = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)', 'qa_driver.py'])
+            try:
+                self.assertTrue(orchestrate.drivers_running())     # a real python driver is still seen
+            finally:
+                driver.kill()
+        finally:
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(bystander.pid)], capture_output=True)
+
+
 if __name__ == '__main__':
     unittest.main()
