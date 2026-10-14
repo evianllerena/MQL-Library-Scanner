@@ -10,7 +10,7 @@ const state={
   page:0,reviewPage:0,pageSize:500,totalRows:0,totalReview:0,
   folderPreview:null,browserPath:null,browserData:null,sortBy:'name',sortDir:'asc',
   backtestRunning:false,btScored:0,
-  backtest:{CONFIRMATION_1:{rows:[],sortBy:'expectancy',sortDir:'desc'},CONFIRMATION_2:{rows:[],sortBy:'expectancy',sortDir:'desc'},BASELINE:{rows:[],sortBy:'expectancy',sortDir:'desc'},VOLUME:{rows:[],sortBy:'expectancy',sortDir:'desc'}}
+  backtest:{CONFIRMATION_1:{rows:[],sortBy:'rank',sortDir:'desc'},CONFIRMATION_2:{rows:[],sortBy:'rank',sortDir:'desc'},BASELINE:{rows:[],sortBy:'rank',sortDir:'desc'},VOLUME:{rows:[],sortBy:'rank',sortDir:'desc'}}
 };
 let dbPath='';
 const bootStarted=performance.now();

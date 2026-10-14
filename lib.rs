@@ -662,6 +662,21 @@ fn db_stats(db_path: String) -> Result<Value, String> {
     }))
 }
 
+// P2: user text in LIKE patterns is literal -- %, _ and the escape char itself are escaped (with ESCAPE '\\')
+fn like_pattern(search: &str) -> String {
+    let escaped = search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    format!("%{}%", escaped)
+}
+
+// P2: NULL-safe column reads -- several indicators columns have no default (engine.py schema), and one
+// NULL used to fail the whole page with "Invalid column type Null"
+fn col_text(r: &rusqlite::Row, i: usize) -> rusqlite::Result<String> {
+    Ok(r.get::<_, Option<String>>(i)?.unwrap_or_default())
+}
+fn col_int(r: &rusqlite::Row, i: usize) -> rusqlite::Result<i64> {
+    Ok(r.get::<_, Option<i64>>(i)?.unwrap_or(0))
+}
+
 fn sort_sql(sort_by: &str, sort_dir: &str) -> String {
     let col = match sort_by {
         "name" => "filename COLLATE NOCASE",
@@ -755,14 +770,15 @@ fn preview_queue_stats(db_path:String) -> Result<Value,String> {
 #[tauri::command]
 fn db_query(db_path:String, search:String, platform:String, category:String, review_only:bool, limit:i64, offset:i64, sort_by:Option<String>, sort_dir:Option<String>) -> Result<Value,String> {
     let conn=open_db(&db_path)?;
+    ensure_preview_columns(&conn)?; // P2: it selects the preview_* columns, which an older DB lacks
     let mut clauses:Vec<String>=Vec::new();
-    let mut vals:Vec<String>=Vec::new();
+    let mut vals:Vec<rusqlite::types::Value>=Vec::new();
     if !search.trim().is_empty() {
-        clauses.push("(filename LIKE ? OR primary_category LIKE ? OR secondary_categories LIKE ? OR behavior_tags LIKE ? OR techniques LIKE ? OR standard_indicators LIKE ?)".into());
-        let like=format!("%{}%",search); for _ in 0..6 { vals.push(like.clone()); }
+        clauses.push("(filename LIKE ?1x OR primary_category LIKE ?1x OR secondary_categories LIKE ?1x OR behavior_tags LIKE ?1x OR techniques LIKE ?1x OR standard_indicators LIKE ?1x)".replace("?1x","? ESCAPE '\\'"));
+        let like=like_pattern(&search); for _ in 0..6 { vals.push(rusqlite::types::Value::Text(like.clone())); }
     }
-    if platform!="ALL" { clauses.push("platform=?".into()); vals.push(platform); }
-    if category!="ALL" { clauses.push("COALESCE(verified_primary,primary_category)=?".into()); vals.push(category); }
+    if platform!="ALL" { clauses.push("platform=?".into()); vals.push(rusqlite::types::Value::Text(platform)); }
+    if category!="ALL" { clauses.push("COALESCE(verified_primary,primary_category)=?".into()); vals.push(rusqlite::types::Value::Text(category)); }
     if review_only { clauses.push("human_verified=0 AND classification_status IN ('Needs Review','Unknown')".into()); }
     let where_sql=if clauses.is_empty(){String::new()}else{format!(" WHERE {}",clauses.join(" AND "))};
     let total_sql=format!("SELECT COUNT(*) FROM indicators{}",where_sql);
@@ -770,28 +786,28 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
     let total:i64=total_stmt.query_row(rusqlite::params_from_iter(vals.iter()),|r|r.get(0)).map_err(|e|e.to_string())?;
     let order=sort_sql(sort_by.as_deref().unwrap_or("name"),sort_dir.as_deref().unwrap_or("asc"));
     let sql=format!("SELECT id,path,filename,platform,source_structure,display_location,primary_category,secondary_categories,visual_category,behavior_tags,techniques,evidence,classification_status,review_reason,classifier_version,standard_indicators,custom_dependencies,confidence,warnings,duplicate_of,user_favorite,user_tags,human_verified,verified_primary,verified_secondary,family_fingerprint,analyzed_at,draw_types,line_plots,histogram_plots,arrow_plots,filling_plots,object_usage,declared_buffers,declared_plots,active_buffers,preview_status,preview_path,preview_hash,sha256,preview_error,preview_updated_at,preview_attempts FROM indicators{} ORDER BY {} LIMIT ? OFFSET ?",where_sql,order);
-    let mut all=vals.clone(); all.push(limit.clamp(1,500).to_string()); all.push(offset.max(0).to_string());
+    let mut all=vals.clone(); all.push(rusqlite::types::Value::Integer(limit.clamp(1,500))); all.push(rusqlite::types::Value::Integer(offset.max(0)));
     let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;
     let mapped=stmt.query_map(rusqlite::params_from_iter(all.iter()),|r| {
-        let verified: i64=r.get(22)?;
-        let primary:String=r.get(6)?;
+        let verified: i64=col_int(r,22)?;
+        let primary:String=col_text(r,6)?;
         let verified_primary:Option<String>=r.get(23)?;
-        let second:String=r.get(7)?;
-        let verified_second:String=r.get(24)?;
+        let second:String=col_text(r,7)?;
+        let verified_second:String=col_text(r,24)?;
         Ok(json!({
-          "id":r.get::<_,i64>(0)?,"path":r.get::<_,String>(1)?,"filename":r.get::<_,String>(2)?,"platform":r.get::<_,String>(3)?,
-          "source_structure":r.get::<_,String>(4)?,"display_location":r.get::<_,String>(5)?,
+          "id":r.get::<_,i64>(0)?,"path":col_text(r,1)?,"filename":col_text(r,2)?,"platform":col_text(r,3)?,
+          "source_structure":col_text(r,4)?,"display_location":col_text(r,5)?,
           "primary_category": if verified==1 { verified_primary.unwrap_or(primary) } else { primary },
           "secondary_categories": if verified==1 { parse_json_text(verified_second) } else { parse_json_text(second) },
-          "visual_category":r.get::<_,String>(8)?,"behavior_tags":parse_json_text(r.get::<_,String>(9)?),"techniques":parse_json_text(r.get::<_,String>(10)?),
-          "evidence":parse_json_text(r.get::<_,String>(11)?),"classification_status": if verified==1 {"Verified".to_string()} else {r.get::<_,String>(12)?},
-          "review_reason":r.get::<_,String>(13)?,"classifier_version":r.get::<_,String>(14)?,"standard_indicators":parse_json_text(r.get::<_,String>(15)?),
-          "custom_dependencies":parse_json_text(r.get::<_,String>(16)?),"confidence":r.get::<_,i64>(17)?,"warnings":parse_json_text(r.get::<_,String>(18)?),
-          "duplicate_of":r.get::<_,Option<String>>(19)?,"user_favorite":r.get::<_,i64>(20)?==1,"user_tags":parse_json_text(r.get::<_,String>(21)?),
-          "human_verified":verified==1,"family_fingerprint":r.get::<_,String>(25)?,"analyzed_at":r.get::<_,Option<String>>(26)?,
-          "draw_types":parse_json_text(r.get::<_,String>(27)?),"line_plots":r.get::<_,i64>(28)?,"histogram_plots":r.get::<_,i64>(29)?,
-          "arrow_plots":r.get::<_,i64>(30)?,"filling_plots":r.get::<_,i64>(31)?,"object_usage":r.get::<_,i64>(32)?==1,
-          "declared_buffers":r.get::<_,i64>(33)?,"declared_plots":r.get::<_,i64>(34)?,"active_buffers":r.get::<_,i64>(35)?,
+          "visual_category":col_text(r,8)?,"behavior_tags":parse_json_text(col_text(r,9)?),"techniques":parse_json_text(col_text(r,10)?),
+          "evidence":parse_json_text(col_text(r,11)?),"classification_status": if verified==1 {"Verified".to_string()} else {col_text(r,12)?},
+          "review_reason":col_text(r,13)?,"classifier_version":col_text(r,14)?,"standard_indicators":parse_json_text(col_text(r,15)?),
+          "custom_dependencies":parse_json_text(col_text(r,16)?),"confidence":col_int(r,17)?,"warnings":parse_json_text(col_text(r,18)?),
+          "duplicate_of":r.get::<_,Option<String>>(19)?,"user_favorite":col_int(r,20)?==1,"user_tags":parse_json_text(col_text(r,21)?),
+          "human_verified":verified==1,"family_fingerprint":col_text(r,25)?,"analyzed_at":r.get::<_,Option<String>>(26)?,
+          "draw_types":parse_json_text(col_text(r,27)?),"line_plots":col_int(r,28)?,"histogram_plots":col_int(r,29)?,
+          "arrow_plots":col_int(r,30)?,"filling_plots":col_int(r,31)?,"object_usage":col_int(r,32)?==1,
+          "declared_buffers":col_int(r,33)?,"declared_plots":col_int(r,34)?,"active_buffers":col_int(r,35)?,
           "preview_status":r.get::<_,Option<String>>(36)?,"preview_path":r.get::<_,Option<String>>(37)?,"preview_hash":r.get::<_,Option<String>>(38)?,
           "sha256":r.get::<_,Option<String>>(39)?,"preview_error":r.get::<_,Option<String>>(40)?,"preview_updated_at":r.get::<_,Option<String>>(41)?,
           "preview_attempts":r.get::<_,Option<i64>>(42)?.unwrap_or(0)
@@ -800,6 +816,22 @@ fn db_query(db_path:String, search:String, platform:String, category:String, rev
     let mut rows_out=Vec::new();
     for row in mapped { rows_out.push(row.map_err(|e|e.to_string())?); }
     Ok(json!({"rows":rows_out,"total":total,"limit":limit,"offset":offset,"sort_by":sort_by,"sort_dir":sort_dir}))
+}
+
+// P1.4 columns the ranked board reads; added here too so an older DB (scored before P1.4) still loads
+fn ensure_backtest_rank_columns(conn:&Connection) -> Result<(),String> {
+    let exists: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='backtest_results'",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if exists==0 { return Ok(()); }
+    let mut stmt=conn.prepare("PRAGMA table_info(backtest_results)").map_err(|e|e.to_string())?;
+    let cols:Vec<String>=stmt.query_map([],|r|r.get::<_,String>(1)).map_err(|e|e.to_string())?.filter_map(Result::ok).collect();
+    for (name,decl) in [("expectancy_r","REAL"),("is_trades","INTEGER"),("is_expectancy_r","REAL"),("is_r_low","REAL"),
+                        ("oos_trades","INTEGER"),("oos_expectancy_r","REAL"),("oos_pass","INTEGER"),
+                        ("repaint_test","TEXT"),("fill_model","TEXT"),("cost_model","TEXT")] {
+        if !cols.iter().any(|c| c==name) {
+            conn.execute(&format!("ALTER TABLE backtest_results ADD COLUMN {} {}",name,decl),[]).map_err(|e|e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn backtest_sort_sql(sort_by: &str, sort_dir: &str) -> String {
@@ -819,14 +851,15 @@ fn backtest_sort_sql(sort_by: &str, sort_dir: &str) -> String {
 #[tauri::command]
 fn db_backtest_query(db_path:String, slot:String, bed:String, search:String, min_trades:Option<i64>, limit:i64, offset:i64, sort_by:Option<String>, sort_dir:Option<String>) -> Result<Value,String> {
     let conn=open_db(&db_path)?;
+    ensure_backtest_rank_columns(&conn)?;
     let min_trades=min_trades.unwrap_or(30).max(0);
     let mut clauses:Vec<String>=vec!["bt.bed != ''".into()]; // '' rows are pre-test candidacy from nnfx_map, not results
-    let mut vals:Vec<String>=Vec::new();
-    if slot!="ALL" && !slot.is_empty() { clauses.push("bt.slot=?".into()); vals.push(slot); }
-    if !bed.is_empty() { clauses.push("bt.bed=?".into()); vals.push(bed); }
+    let mut vals:Vec<rusqlite::types::Value>=Vec::new();
+    if slot!="ALL" && !slot.is_empty() { clauses.push("bt.slot=?".into()); vals.push(rusqlite::types::Value::Text(slot)); }
+    if !bed.is_empty() { clauses.push("bt.bed=?".into()); vals.push(rusqlite::types::Value::Text(bed)); }
     if !search.trim().is_empty() {
-        clauses.push("i.filename LIKE ?".into());
-        vals.push(format!("%{}%",search));
+        clauses.push("i.filename LIKE ? ESCAPE '\\'".into());
+        vals.push(rusqlite::types::Value::Text(like_pattern(&search)));
     }
     let where_sql=format!(" WHERE {}",clauses.join(" AND "));
     let total_sql=format!("SELECT COUNT(*) FROM backtest_results bt JOIN indicators i ON i.sha256=bt.sha256{}",where_sql);
@@ -836,27 +869,37 @@ fn db_backtest_query(db_path:String, slot:String, bed:String, search:String, min
     // insufficient-sample rows (trades < min_trades) never rank above real
     // results, regardless of the chosen sort column (NNFX_INTEGRATION_PLAN.txt
     // STEP 5B: "Rows with trades < MIN ... never rank at the top").
-    let order=format!("CASE WHEN bt.trades>=? THEN 0 ELSE 1 END, {}", backtest_sort_sql(sort_by.as_deref().unwrap_or("expectancy"),sort_dir.as_deref().unwrap_or("desc")));
+    // P1.4 'rank' (the default): the CSV leaderboard's order -- enough IN-SAMPLE trades first, then candidates
+    // that also made money out-of-sample, then the bottom of the in-sample 95% R range, best first. Rows
+    // scored before P1.4 (no is_trades) fall back to trades.
+    let sort_key=sort_by.as_deref().unwrap_or("rank");
+    let order=if sort_key=="rank" {
+        "CASE WHEN COALESCE(bt.is_trades,bt.trades)>=? THEN 0 ELSE 1 END, COALESCE(bt.oos_pass,0) DESC, \
+         (bt.is_r_low IS NULL), bt.is_r_low DESC".to_string()
+    } else {
+        format!("CASE WHEN bt.trades>=? THEN 0 ELSE 1 END, {}", backtest_sort_sql(sort_key,sort_dir.as_deref().unwrap_or("desc")))
+    };
     let sql=format!(
         "SELECT bt.id,bt.sha256,bt.slot,bt.signal_type,bt.bed,bt.stage,bt.trades,bt.wins,bt.losses,bt.win_rate,\
          bt.expectancy_pips,bt.profit_factor,bt.max_drawdown,bt.net_pips,bt.net_pips_saved,bt.bridge_skips,\
          bt.continuation_trades,bt.trade_log_path,bt.tested_at,bt.mapping_source,bt.mapping_reason,\
-         bt.zero_reference,bt.buf_a,bt.buf_b,i.filename,i.path,i.platform \
+         bt.zero_reference,bt.buf_a,bt.buf_b,i.filename,i.path,i.platform,\
+         bt.expectancy_r,bt.is_trades,bt.is_r_low,bt.oos_trades,bt.oos_expectancy_r,bt.oos_pass,bt.repaint_test,bt.fill_model \
          FROM backtest_results bt JOIN indicators i ON i.sha256=bt.sha256{} ORDER BY {} LIMIT ? OFFSET ?",
         where_sql, order
     );
     let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;
     // params order: [min_trades_for_case, ...where-clause-vals..., limit, offset]
-    let mut bind:Vec<String>=Vec::new();
-    bind.push(min_trades.to_string());
+    let mut bind:Vec<rusqlite::types::Value>=Vec::new();
+    bind.push(rusqlite::types::Value::Integer(min_trades));
     bind.extend(vals.iter().cloned());
-    bind.push(limit.clamp(1,500).to_string());
-    bind.push(offset.max(0).to_string());
+    bind.push(rusqlite::types::Value::Integer(limit.clamp(1,500)));
+    bind.push(rusqlite::types::Value::Integer(offset.max(0)));
     let mapped=stmt.query_map(rusqlite::params_from_iter(bind.iter()),|r| {
-        let trades:i64=r.get(6)?;
+        let trades:i64=col_int(r,6)?;
         Ok(json!({
-          "id":r.get::<_,i64>(0)?, "sha256":r.get::<_,String>(1)?, "slot":r.get::<_,String>(2)?,
-          "signal_type":r.get::<_,Option<String>>(3)?, "bed":r.get::<_,String>(4)?, "stage":r.get::<_,Option<i64>>(5)?,
+          "id":r.get::<_,i64>(0)?, "sha256":col_text(r,1)?, "slot":col_text(r,2)?,
+          "signal_type":r.get::<_,Option<String>>(3)?, "bed":col_text(r,4)?, "stage":r.get::<_,Option<i64>>(5)?,
           "trades":trades, "wins":r.get::<_,Option<i64>>(7)?, "losses":r.get::<_,Option<i64>>(8)?,
           "win_rate":r.get::<_,Option<f64>>(9)?, "expectancy_pips":r.get::<_,Option<f64>>(10)?,
           "profit_factor":r.get::<_,Option<f64>>(11)?, "max_drawdown":r.get::<_,Option<f64>>(12)?,
@@ -865,8 +908,12 @@ fn db_backtest_query(db_path:String, slot:String, bed:String, search:String, min
           "trade_log_path":r.get::<_,Option<String>>(17)?, "tested_at":r.get::<_,Option<String>>(18)?,
           "mapping_source":r.get::<_,Option<String>>(19)?, "mapping_reason":r.get::<_,Option<String>>(20)?,
           "zero_reference":r.get::<_,Option<f64>>(21)?, "buf_a":r.get::<_,Option<i64>>(22)?, "buf_b":r.get::<_,Option<i64>>(23)?,
-          "filename":r.get::<_,String>(24)?, "path":r.get::<_,String>(25)?, "platform":r.get::<_,String>(26)?,
-          "insufficient_sample": trades < min_trades
+          "filename":col_text(r,24)?, "path":col_text(r,25)?, "platform":col_text(r,26)?,
+          "expectancy_r":r.get::<_,Option<f64>>(27)?, "is_trades":r.get::<_,Option<i64>>(28)?,
+          "is_r_low":r.get::<_,Option<f64>>(29)?, "oos_trades":r.get::<_,Option<i64>>(30)?,
+          "oos_expectancy_r":r.get::<_,Option<f64>>(31)?, "oos_pass":r.get::<_,Option<i64>>(32)?.unwrap_or(0)==1,
+          "repaint_test":r.get::<_,Option<String>>(33)?, "fill_model":r.get::<_,Option<String>>(34)?,
+          "insufficient_sample": r.get::<_,Option<i64>>(28)?.unwrap_or(trades) < min_trades  // in-sample trades (P1.4)
         }))
     }).map_err(|e|e.to_string())?;
     let mut rows_out=Vec::new();
