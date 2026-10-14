@@ -898,6 +898,10 @@ def _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref):
                 c1f, c1s = fnum(r['macd_m']), fnum(r['macd_s'])
                 c2v = fnum(r['rvi']); base = fnum(r['ma']); c2z = 0.0
                 volv = cand_a[i]; volavg = vol_avg[i]
+                if volv is None or volavg is None:
+                    # P1.5: no reading / no 20-bar average yet (warm-up) -> the filter cannot pass, but
+                    # the bar still feeds C1 history (same protection as the reference-volume path above)
+                    volv, volavg = 0.0, 1.0
             if None in (c1f, c1s, c2v, base, volv, volavg, atrv):
                 prev_close = fnum(r['close'])
                 if base is not None:

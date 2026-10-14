@@ -945,6 +945,18 @@ def unit_tests() -> Check:
            recs_old[-1]['reason'] == 'skip:dd_breaker' and acct_old.tripped_at is not None and acct_old.resumes == 0,
            detail=str(recs_old[-1]['reason']))
 
+    # VOLUME-role warm-up (P1.5): same bug class as the G9 warm-up fix. C1 is long on all 22 bars, so at the
+    # cross C1 has run 22 bars -> bridge-too-far must skip; the candidate's own 20-bar average does not
+    # exist for the first 19 bars, and dropping those bars left 3 bars of C1 history and let it through.
+    vol_rows = batch_rows(200.0)
+    for k, row in enumerate(vol_rows):
+        row['macd_m'] = '1.0'
+        row['cand_a'] = str(100.0 + k)                # the VOLUME candidate's own reading, rising
+    fp_vol = nb.score_candidate({'EURUSD': {'rows': vol_rows}}, ['EURUSD'], 'VOLUME', 'cand_a', None, None)['fingerprints']['EURUSD']
+    c.that('P1.5 VOLUME warm-up: bars before the candidate\'s 20-bar average exists still feed C1 history -- the '
+           '22-bar C1 run is skipped as bridge-too-far, not let through by a truncated history',
+           len(fp_vol) == 22 and fp_vol[-1][1:] == ('skip', 'skip:bridge_too_far'), detail=str(fp_vol[-2:]))
+
     # --- P1.4 statistics --------------------------------------------------------------------
     straddle = [dict(date='2024.03.29', action='enter', pips=''), dict(date='2024.03.30', action='exit_half', pips=10.0),
                 dict(date='2024.04.02', action='exit', pips=20.0, r=0.9),
