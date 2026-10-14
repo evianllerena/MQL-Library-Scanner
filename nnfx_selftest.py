@@ -914,6 +914,8 @@ def unit_tests() -> Check:
     c.that('P1.4 profit factor: gross wins / gross losses (30/10 = 3.0); undefined (None) with no losing trade '
            'or no trades -- never the old 999.0 stand-in', nb.profit_factor_of([20.0, 10.0, -10.0]) == 3.0
            and nb.profit_factor_of([5.0, 7.0]) is None and nb.profit_factor_of([]) is None)
+    c.that('P1.7 fill_model never claims a model it did not use: no usable bars on any pair -> "none", not '
+           'next_open+gaps', nb.fill_model({'EURUSD': [], 'GBPUSD': []}) == 'none (no usable bars)')
     c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
            'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
            and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)

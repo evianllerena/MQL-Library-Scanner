@@ -711,7 +711,10 @@ def round_trip_cost_pips(symbol):
 def fill_model(prepared):
     """'next_open+gaps' when every symbol's bars carry the open (P1.3/P1.7); otherwise the legacy
     close fill, which is named in the results so an old extract is never mistaken for the new model."""
-    has_open = all(bars and 'open' in bars[0] for bars in prepared.values() if bars)
+    filled = [bars for bars in prepared.values() if bars]
+    if not filled:
+        return 'none (no usable bars)'
+    has_open = all('open' in bars[0] for bars in filled)
     return 'next_open+gaps' if has_open else 'close (legacy extract: no open column)'
 
 
