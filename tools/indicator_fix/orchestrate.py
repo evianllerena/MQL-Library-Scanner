@@ -6,8 +6,9 @@ r"""Unattended orchestration of the fix pipeline after the variants are built.
    already aligned in A). Progress -> F:\MQLFIX_BUILD\orchestrate.log"""
 import shutil, subprocess, sys, time
 from pathlib import Path
+from fix_paths import BUILD, rt
 
-W = Path(r'F:\MQLFIX_BUILD')
+W = BUILD
 HERE = Path(__file__).resolve().parent
 LOG = W / 'orchestrate.log'
 
@@ -43,7 +44,7 @@ def drivers_running():
 def qa(v):
     while drivers_running():          # never two drivers on one runtime copy
         time.sleep(30)
-    procs = [subprocess.Popen([sys.executable, str(HERE / 'qa_driver.py'), v, '--rt', rf'F:\MQLFIX_RT\rt{k + 1}',
+    procs = [subprocess.Popen([sys.executable, str(HERE / 'qa_driver.py'), v, '--rt', str(rt(k + 1)),
                                '--shard', f'{k}/4'], cwd=HERE,
                               stdout=open(W / f'qa_{v}_s{k}.progress.txt', 'a'), stderr=subprocess.STDOUT)
              for k in range(4)]

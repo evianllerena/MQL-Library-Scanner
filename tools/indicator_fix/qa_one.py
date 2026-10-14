@@ -3,9 +3,9 @@ Usage: python qa_one.py <file.mq5> <runtime number 1-4>      exit 0 = PASS (load
 Used as the repair agent's checker (via c.py) and by finalize.py."""
 import json, shutil, subprocess, sys, time
 from pathlib import Path
+from fix_paths import MQLC, rt as rt_dir
 
-MQLC = r'F:\MQLFIX_BUILD\tools\mqlc.py'
-src = Path(sys.argv[1]).resolve(); rt = Path(rf'F:\MQLFIX_RT\rt{sys.argv[2]}')
+src = Path(sys.argv[1]).resolve(); rt = rt_dir(sys.argv[2])
 files = rt / 'MQL5' / 'Files'
 
 c = subprocess.run([sys.executable, MQLC, str(src)], capture_output=True, text=True)

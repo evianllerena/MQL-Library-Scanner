@@ -8,12 +8,11 @@ result is then re-verified by an independent compile. Results -> F:\MQLFIX_BUILD
 import hashlib, json, re, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from fix_paths import BUILD, CLAUDE, CONVERTED, MQLC, READY
 
-W = Path(r'F:\MQLFIX_BUILD'); R = W / 'R'; R.mkdir(parents=True, exist_ok=True)
-CLAUDE = r'C:\Users\Evision\.local\bin\claude.exe'
-MQLC = r'F:\MQLFIX_BUILD\tools\mqlc.py'
+W = BUILD; R = W / 'R'
 QA_ONE = str(Path(__file__).resolve().parent / 'qa_one.py')   # compile + MT5 runtime + look-ahead test
-INCLUDE_DIRS = [Path(r'F:\Converted Indicators'), Path(r'F:\Ready MQL5 Indicators')]
+INCLUDE_DIRS = [CONVERTED, READY]
 
 def arg(flag, default):
     return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
@@ -115,6 +114,7 @@ def run_job(job):
     return rec
 
 if __name__ == '__main__':
+    OUT.parent.mkdir(parents=True, exist_ok=True)
     jobs = json.load(open(sys.argv[1], encoding='utf-8'))
     skip = done_names()
     todo = [j for j in jobs if j['name'] not in skip]

@@ -2,10 +2,9 @@ r"""Compile every .mq5 of one variant folder (F:\MQLFIX_BUILD\<V>) in chunks of 
 per chunk. Writes <V>_compile.json: {name: {'ok': bool, 'errors': n, 'first_errors': [...]}}."""
 import json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
+from fix_paths import BUILD, METAEDITOR as ME, MQL5_INC as INC   # INC: standard + user includes
 V = sys.argv[1]
-root = Path(r'F:\MQLFIX_BUILD') / V
-ME = r'C:\Program Files\MetaTrader 5\MetaEditor64.exe'
-INC = r'C:\Users\Evision\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5'  # standard + user includes
+root = BUILD / V
 files = sorted(p for p in root.glob('*.mq5'))
 for i in range(0, len(files), 500):           # move loose files into chunk folders
     d = root / f'c{i // 500:03d}'; d.mkdir(exist_ok=True)
@@ -29,5 +28,5 @@ for d in chunks:
         r = results.setdefault(p.stem, {'errors': 0, 'first_errors': []})
         ex = p.with_suffix('.ex5'); r['ok'] = ex.exists() and ex.stat().st_size > 0
     print(V, d.name, 'done', round(time.time() - t), 's', flush=True)
-json.dump(results, open(Path(r'F:\MQLFIX_BUILD') / f'{V}_compile.json', 'w'), indent=0)
+json.dump(results, open(BUILD / f'{V}_compile.json', 'w'), indent=0)
 print(V, 'compiled ok', sum(1 for r in results.values() if r.get('ok')), 'of', len(results), round(time.time() - t), 's')

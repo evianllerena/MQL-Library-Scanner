@@ -8,8 +8,9 @@ Excluded: trading tools, Windows-DLL dependent, no entry point. Already-working 
 import json, re
 from pathlib import Path
 import importlib.util
+from fix_paths import BUILD
 
-HERE = Path(__file__).resolve().parent; W = Path(r'F:\MQLFIX_BUILD')
+HERE = Path(__file__).resolve().parent; W = BUILD
 spec = importlib.util.spec_from_file_location('pk', HERE / 'package.py'); pk = importlib.util.module_from_spec(spec); spec.loader.exec_module(pk)
 best = pk.load_qa()
 variants = json.load(open(W / 'variants.json', encoding='utf-8'))
