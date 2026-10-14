@@ -665,6 +665,23 @@ def fill_model(prepared):
     return 'next_open+gaps' if has_open else 'close (legacy extract: no open column)'
 
 
+def closed_trades(records):
+    """Whole trades from one symbol's engine records: entry/exit date ('YYYY.MM.DD'), pips (the two
+    equal halves averaged) and R (both halves). A trade still open at the end is not a trade."""
+    out, cur = [], None
+    for r in records:
+        date = r['date'][:10].replace('-', '.')
+        if r['action'] == 'enter':
+            cur = {'entry_date': date, 'half1': None}
+        elif r['action'] == 'exit_half' and cur is not None:
+            cur['half1'] = r['pips']
+        elif r['action'] == 'exit' and cur is not None:
+            pips = (cur['half1'] + r['pips']) / 2.0 if cur['half1'] is not None else r['pips']
+            out.append({'entry_date': cur['entry_date'], 'exit_date': date, 'pips': pips, 'r': r['r']})
+            cur = None
+    return out
+
+
 def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_FROM, costs=True):
     """One scoring pass over prepared bars at a given breaker setting. Fresh engines + a fresh
     shared account each call, so the two runs (off/on) are independent."""
@@ -693,17 +710,12 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
         volume_skips += sum(1 for r in window if r['reason'] == 'skip:volume_filter')
         dd_breaker_skips += sum(1 for r in window if r['reason'] == 'skip:dd_breaker')
         news_skips += sum(1 for r in window if r['reason'] == 'skip:news')
-        trades = []
-        pending_half1 = None
-        for r in window:
-            if r['action'] == 'exit_half':
-                pending_half1 = r['pips']
-            elif r['action'] == 'exit':
-                trades.append((pending_half1 + r['pips']) / 2.0 if pending_half1 is not None else r['pips'])
-                pooled_r.append(r['r'])
-                pending_half1 = None
+        # P1.4: a trade belongs to the window by its ENTRY date, with both halves kept together
+        # (a TP1 half before score_from and the runner after it used to lose the half-pairing)
+        trades = [t for t in closed_trades(all_records[sym]) if t['entry_date'] >= score_from]
         per_symbol[sym] = len(trades)
-        pooled_trades.extend(trades)
+        pooled_trades.extend(t['pips'] for t in trades)
+        pooled_r.extend(t['r'] for t in trades)
         fingerprints[sym] = tuple((r['date'], r['action'], r['reason']) for r in window)
 
     n = len(pooled_trades)

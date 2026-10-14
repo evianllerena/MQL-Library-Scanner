@@ -877,6 +877,17 @@ def unit_tests() -> Check:
            and by_date['2024.03.10']['next_open'] == float(gap_rows[11]['open'])
            and by_date['2024.03.12']['next_open'] == float(gap_rows[13]['open']) and prep[-1]['next_open'] is None,
            detail=str([(b['date'], b['next_open']) for b in prep[8:14]]))
+    # --- P1.4 statistics --------------------------------------------------------------------
+    straddle = [dict(date='2024.03.29', action='enter', pips=''), dict(date='2024.03.30', action='exit_half', pips=10.0),
+                dict(date='2024.04.02', action='exit', pips=20.0, r=0.9),
+                dict(date='2024.04.03', action='enter', pips=''), dict(date='2024.04.04', action='exit_half', pips=10.0),
+                dict(date='2024.04.05', action='exit', pips=-4.0, r=0.1),
+                dict(date='2024.04.08', action='enter', pips='')]                 # still open at the end
+    tr = [t for t in nb.closed_trades(straddle) if t['entry_date'] >= '2024.04.01']
+    c.that('P1.4 window boundary: a trade belongs to the scoring window by its ENTRY date with both halves '
+           'paired -- the 03.29 trade (TP1 half before 04.01, runner after) is out, not counted as a lone '
+           '+20 runner; the 04.03 trade averages its halves (+3.0); an open trade is not a trade',
+           tr == [{'entry_date': '2024.04.03', 'exit_date': '2024.04.05', 'pips': 3.0, 'r': 0.1}], detail=str(tr))
     c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
            'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
            and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)
