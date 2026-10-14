@@ -10,6 +10,7 @@ on:
       - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
+      - 'mql_text.py'
       - 'requirements-build.txt'
       - 'preview_bridge.py'
       - 'preview_batch.py'
@@ -35,6 +36,7 @@ on:
       - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
+      - 'mql_text.py'
       - 'requirements-build.txt'
       - 'preview_bridge.py'
       - 'preview_batch.py'
@@ -83,6 +85,7 @@ jobs:
           Set-Location $env:APP_DIR
           Copy-Item "$r/engine.py" 'engine/engine.py' -Force
           Copy-Item "$r/engine_core.py" 'engine/engine_core.py' -Force
+          Copy-Item "$r/mql_text.py" 'engine/mql_text.py' -Force
           Copy-Item "$r/requirements-build.txt" 'engine/requirements-build.txt' -Force
           Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
           Copy-Item "$r/preview_batch.py" 'engine/preview_batch.py' -Force
@@ -117,7 +120,7 @@ jobs:
         shell: pwsh
         run: |
           Set-Location $env:APP_DIR
-          python -m py_compile engine/engine.py engine/engine_core.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py engine/nnfx_backtest_batch.py engine/nnfx_engine.py engine/nnfx_selftest.py
+          python -m py_compile engine/engine.py engine/engine_core.py engine/mql_text.py engine/preview_bridge.py engine/preview_batch.py engine/preview_control.py engine/nnfx_backtest_batch.py engine/nnfx_engine.py engine/nnfx_selftest.py
           if($LASTEXITCODE -ne 0){throw 'Python source validation failed'}
           python engine/nnfx_selftest.py
           if($LASTEXITCODE -ne 0){throw 'NNFX backtester self-test failed'}

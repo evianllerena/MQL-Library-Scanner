@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse, concurrent.futures, ctypes, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, zipfile
 from pathlib import Path
+from mql_text import decode_mql_bytes, read_log_text, read_mql_text
 
 CREATE_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
 SW_HIDE=0
@@ -159,11 +160,15 @@ def emit_stage(job_id,name,message=None,**details):
     emit(payload)
 
 def read_text(p):
-    if not p.exists(): return ''
-    for enc in ('utf-16','utf-8','cp1252','latin1'):
-        try:return p.read_text(encoding=enc,errors='ignore')
-        except Exception:pass
-    return ''
+    # BOM/NUL-pattern sniffing via the shared reader (same text engine_core sees). The old
+    # trial loop let utf-8+errors='ignore' win before cp1252, dropping legacy characters.
+    return read_mql_text(p)
+
+def _same_source(path,expected):
+    # write_text() on Windows writes CRLF, so compare with normalized newlines; otherwise a
+    # freshly written EA/script never matches its own source and is rewritten+recompiled.
+    norm=lambda t:t.replace('\r\n','\n')
+    return norm(read_text(Path(path)))==norm(expected)
 
 def decode_origin_bytes(data):
     encodings=('utf-16','utf-8-sig','cp1252','latin1') if data[:2] in (b'\xff\xfe',b'\xfe\xff') else ('utf-8-sig','cp1252','latin1','utf-16')
@@ -450,13 +455,13 @@ def compile_file(editor,src,mqlroot):
         end=time.monotonic()+3.0
         latest=''
         while time.monotonic()<end:
-            if expected.exists() and expected.stat().st_size:return expected,attempts,read_text(log)
-            latest=read_text(log)
+            if expected.exists() and expected.stat().st_size:return expected,attempts,read_log_text(log)
+            latest=read_log_text(log)
             if compile_has_errors(latest):return None,attempts,latest
             time.sleep(.15)
-        latest=read_text(log)
+        latest=read_log_text(log)
         if compile_has_errors(latest):return None,attempts,latest
-    return None,attempts,read_text(log)
+    return None,attempts,read_log_text(log)
 
 def existing_binary(src,ext):
     if src.suffix.lower()==ext and src.exists():return src
@@ -794,7 +799,7 @@ def latest_logs(root):
         for p in root.rglob('*.log'):
             try:rows.append((p.stat().st_mtime_ns,p))
             except Exception:pass
-    return '\n\n'.join(f'[{p}]\n{read_text(p)[-2200:]}' for _,p in sorted(rows,reverse=True)[:4])
+    return '\n\n'.join(f'[{p}]\n{read_log_text(p)[-2200:]}' for _,p in sorted(rows,reverse=True)[:4])
 
 def preview_trace(logs):
     lines=[]
@@ -1007,7 +1012,7 @@ def _wait_for_resident_startup(hb,proc,timeout=60):
 def _install_resident_ea(mql,editor,job_id):
     experts=Path(mql)/'Experts';experts.mkdir(parents=True,exist_ok=True)
     src=experts/'MQLLibRenderServer.mq5';built=src.with_suffix('.ex5')
-    changed=read_text(src)!=RESIDENT_EA_SOURCE
+    changed=not _same_source(src,RESIDENT_EA_SOURCE)
     if changed:
         src.write_text(RESIDENT_EA_SOURCE,encoding='utf-8')
         try:built.unlink(missing_ok=True)
@@ -1779,7 +1784,7 @@ def _render_chunk(rows, dest, sel, rt, sym, job_id, item_timeout):
     cap=scripts/f'MQLLibraryChunkCapture_{job_id}.mq5'
     cap_source=mt5_batch_capture_source_v2(manifest_name,cur_prefix,done_marker)
     built=cap.with_suffix('.ex5')
-    if not built.exists() or not built.stat().st_size or read_text(cap)!=cap_source:
+    if not built.exists() or not built.stat().st_size or not _same_source(cap,cap_source):
         cap.write_text(cap_source,encoding='utf-8')
         emit_stage(job_id,'capture_compile','Compiling watchdog-enabled MT5 batch capture script.')
         built,_,log=compile_file(editor,cap,mql)
@@ -2742,6 +2747,9 @@ def self_test():
         'mql_dir_name_mt4':mql_dir_name('MT4')=='MQL4',
         'origin_utf8_decode':decode_origin_bytes(b'C:\\Program Files\\OANDA TMS MT5')=='C:\\Program Files\\OANDA TMS MT5',
         'origin_utf16_decode':decode_origin_bytes(('C:\\Program Files\\MetaTrader 4').encode('utf-16'))=='C:\\Program Files\\MetaTrader 4',
+        'mql_text_utf8_source':'indicator_separate_window' in decode_mql_bytes(b'#property indicator_separate_window\r\n'),
+        'mql_text_utf16le_source':'indicator_separate_window' in decode_mql_bytes(b'\xff\xfe'+'#property indicator_separate_window\r\n'.encode('utf-16-le')),
+        'mql_text_bomless_utf16le':decode_mql_bytes('Result: 0 errors'.encode('utf-16-le'))=='Result: 0 errors',
         'mql_str_backslash_escape':_mql_str(r'MQLLibraryPreview\\abc\\demo')==r'MQLLibraryPreview\\\\abc\\\\demo',
         'resident_ea_timer':'EventSetMillisecondTimer(150)' in RESIDENT_EA_SOURCE,
         'resident_ea_job_protocol':all(x in RESIDENT_EA_SOURCE for x in ('current.job','current.done','heartbeat.txt')),
