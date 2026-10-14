@@ -11,6 +11,20 @@ use tauri::Emitter;
 use zip::write::SimpleFileOptions;
 
 static PREVIEW_LIBRARY_RUNNING: AtomicBool = AtomicBool::new(false);
+static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
+static BACKTEST_RUNNING: AtomicBool = AtomicBool::new(false);
+
+// P2: one scan / one backtest batch at a time. The flag is cleared when the guard drops -- on any early
+// return, or (once moved into the child's waiter thread) when the child process exits.
+struct RunGuard(&'static AtomicBool);
+impl RunGuard {
+    fn take(flag: &'static AtomicBool, what: &str) -> Result<RunGuard, String> {
+        if flag.swap(true, Ordering::SeqCst) { Err(format!("{} is already running", what)) } else { Ok(RunGuard(flag)) }
+    }
+}
+impl Drop for RunGuard {
+    fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
+}
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
@@ -82,7 +96,12 @@ fn parse_json_text(value: String) -> Value {
     serde_json::from_str(&value).unwrap_or_else(|_| json!([]))
 }
 
-fn walk_preview(root: &Path, files: &mut Vec<String>, total: &mut u64, errors: &mut u64, max_preview: usize) {
+// P2: bounded walk -- a user picking C:\ used to walk the whole disk on the UI thread
+const WALK_MAX_DEPTH: usize = 32;
+const WALK_MAX_FILES: u64 = 500_000;
+
+fn walk_preview(root: &Path, files: &mut Vec<String>, total: &mut u64, errors: &mut u64, max_preview: usize, depth: usize, truncated: &mut bool) {
+    if depth > WALK_MAX_DEPTH || *total >= WALK_MAX_FILES { *truncated = true; return; }
     let entries = match fs::read_dir(root) {
         Ok(v) => v,
         Err(_) => { *errors += 1; return; }
@@ -91,8 +110,9 @@ fn walk_preview(root: &Path, files: &mut Vec<String>, total: &mut u64, errors: &
         let entry = match entry { Ok(v) => v, Err(_) => { *errors += 1; continue; } };
         let path: PathBuf = entry.path();
         let meta = match entry.file_type() { Ok(v) => v, Err(_) => { *errors += 1; continue; } };
+        if *total >= WALK_MAX_FILES { *truncated = true; return; }
         if meta.is_dir() {
-            walk_preview(&path, files, total, errors, max_preview);
+            walk_preview(&path, files, total, errors, max_preview, depth + 1, truncated);
         } else if meta.is_file() {
             *total += 1;
             if files.len() < max_preview {
@@ -102,8 +122,14 @@ fn walk_preview(root: &Path, files: &mut Vec<String>, total: &mut u64, errors: &
     }
 }
 
+// async + spawn_blocking (P2): synchronous commands run on the main thread and froze the window
 #[tauri::command]
-fn folder_preview(path: String, max_preview: Option<usize>) -> Result<Value, String> {
+async fn folder_preview(path: String, max_preview: Option<usize>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || folder_preview_blocking(path, max_preview))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn folder_preview_blocking(path: String, max_preview: Option<usize>) -> Result<Value, String> {
     let started = Instant::now();
     let root = Path::new(&path);
     if !root.exists() { return Err(format!("Path does not exist: {}", path)); }
@@ -111,8 +137,9 @@ fn folder_preview(path: String, max_preview: Option<usize>) -> Result<Value, Str
     let mut files = Vec::new();
     let mut total: u64 = 0;
     let mut errors: u64 = 0;
-    walk_preview(root, &mut files, &mut total, &mut errors, max_preview.unwrap_or(250).clamp(1, 1000));
-    Ok(json!({"path":path,"total_files":total,"preview_files":files,"access_errors":errors,"elapsed_ms":started.elapsed().as_millis()}))
+    let mut truncated = false;
+    walk_preview(root, &mut files, &mut total, &mut errors, max_preview.unwrap_or(250).clamp(1, 1000), 0, &mut truncated);
+    Ok(json!({"path":path,"total_files":total,"preview_files":files,"access_errors":errors,"truncated":truncated,"elapsed_ms":started.elapsed().as_millis()}))
 }
 
 #[tauri::command]
@@ -166,6 +193,7 @@ fn start_scan_engine(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, 
     if args.first().map(String::as_str) != Some("scan") {
         return Err("Only the scan command is permitted through start_scan_engine".into());
     }
+    let guard = RunGuard::take(&SCAN_RUNNING, "A library scan")?;
     let db_path = args.windows(2).find(|w| w[0] == "--db").map(|w| w[1].clone()).unwrap_or_default();
     let current = std::env::current_exe().map_err(|e| format!("Cannot resolve app executable: {}", e))?;
     let dir = current.parent().ok_or_else(|| "Cannot resolve application folder".to_string())?;
@@ -214,6 +242,7 @@ fn start_scan_engine(app: tauri::AppHandle, args: Vec<String>) -> Result<Value, 
         }
     });
     std::thread::spawn(move || {
+        let _guard = guard;
         let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
         append_log(&db_path, if code==0{"INFO"}else{"ERROR"}, "scan_engine_done", json!({"code":code}), None);
         let _ = app.emit("scan-engine-done", json!({"code": code}));
@@ -253,6 +282,10 @@ fn run_preview_worker_supervisor(
     group_failed:Arc<AtomicBool>
 ) {
     const HEARTBEAT_TIMEOUT_SECS:u64=120;
+    // P2: until a worker's FIRST heartbeat, the first-use runtime clone / dependency seed / resident-EA
+    // compile can legitimately run for minutes while emitting only stage lines -- killing it at 120 s
+    // looped kill/restart up to 20x. Stage lines also count as liveness.
+    const STARTUP_GRACE_SECS:u64=900;
     const MAX_RESTARTS:u32=20;
     let mut restarts=0u32;
     let mut final_code=0i32;
@@ -300,17 +333,21 @@ fn run_preview_worker_supervisor(
         let stdout=child.stdout.take();
         let stderr=child.stderr.take();
         let last_heartbeat=Arc::new(AtomicU64::new(now_secs()));
+        let first_beat=Arc::new(AtomicBool::new(false));
 
         let out_thread=stdout.map(|stdout|{
             let app_out=app.clone();
             let db_out=db_path.clone();
             let hb=last_heartbeat.clone();
+            let fb=first_beat.clone();
             let wid=worker_id.clone();
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     if let Ok(v)=serde_json::from_str::<Value>(&line) {
-                        if matches!(v.get("type").and_then(Value::as_str),Some("heartbeat")|Some("progress")) {
-                            hb.store(now_secs(),Ordering::SeqCst);
+                        match v.get("type").and_then(Value::as_str) {
+                            Some("heartbeat")|Some("progress")=>{ hb.store(now_secs(),Ordering::SeqCst); fb.store(true,Ordering::SeqCst); }
+                            Some("stage")=>{ hb.store(now_secs(),Ordering::SeqCst); }
+                            _=>{}
                         }
                     }
                     append_log(&db_out,"INFO","preview_library_stdout",json!({"line":line,"worker_id":wid}),None);
@@ -346,7 +383,8 @@ fn run_preview_worker_supervisor(
                 }
             }
             let age=now_secs().saturating_sub(last_heartbeat.load(Ordering::SeqCst));
-            if age>HEARTBEAT_TIMEOUT_SECS {
+            let limit=if first_beat.load(Ordering::SeqCst) { HEARTBEAT_TIMEOUT_SECS } else { STARTUP_GRACE_SECS };
+            if age>limit {
                 restart_reason=Some("heartbeat_timeout");
                 final_code=-2;
                 append_log(&db_path,"ERROR","preview_library_heartbeat_timeout",json!({
@@ -585,6 +623,7 @@ fn start_backtest_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Valu
     if cmd0 != Some("plan") && cmd0 != Some("run") {
         return Err("Only the plan and run commands are permitted through start_backtest_batch".into());
     }
+    let guard = RunGuard::take(&BACKTEST_RUNNING, "A backtest batch")?;
     let db_path = args.windows(2).find(|w| w[0] == "--db").map(|w| w[1].clone()).unwrap_or_default();
     let current = std::env::current_exe().map_err(|e| format!("Cannot resolve app executable: {}", e))?;
     let dir = current.parent().ok_or_else(|| "Cannot resolve application folder".to_string())?;
@@ -631,6 +670,7 @@ fn start_backtest_batch(app: tauri::AppHandle, args: Vec<String>) -> Result<Valu
         }
     });
     std::thread::spawn(move || {
+        let _guard = guard;
         let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
         append_log(&db_path, if code==0{"INFO"}else{"ERROR"}, "backtest_batch_done", json!({"code":code}), None);
         let _ = app.emit("backtest-batch-done", json!({"code": code}));
@@ -944,7 +984,12 @@ fn zip_add_file(zip: &mut zip::ZipWriter<File>, name: &str, path: &Path) -> Resu
 }
 
 #[tauri::command]
-fn export_diagnostics(db_path:String) -> Result<Value,String> {
+async fn export_diagnostics(db_path:String) -> Result<Value,String> {
+    tauri::async_runtime::spawn_blocking(move || export_diagnostics_blocking(db_path))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn export_diagnostics_blocking(db_path:String) -> Result<Value,String> {
     let started=Instant::now();
     append_log(&db_path,"INFO","diagnostics_export_start",json!({}),None);
     let userprofile=std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
