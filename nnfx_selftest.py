@@ -956,26 +956,55 @@ def unit_tests() -> Check:
     prob = nb.extraction_problem({'EURUSD': {'rows': leaky}}, ['EURUSD'], 'cand_a', None)
     c.that('P1.2 extraction gate: a column holding a reference indicator\'s exact values (here Momentum on the newest '
            '25 bars, as found in 14 of 40 candidates of the 2026-10-04 extraction) is a corrupt extraction',
-           'reference column mom (25 bars)' in prob, detail=prob)
+           'reference column mom (partial: EURUSD 25/40 bars)' in prob, detail=prob)
+    clone = [dict(r, cand_a=r['mom']) for r in two_line]                     # equal to Momentum on EVERY bar
+    halfway = [dict(r) for r in two_line]
+    c.that('P1.2 leak vs clone: a candidate equal to a reference on every bar of every pair is a genuine clone (e.g. a '
+           'tick-volume VOLUME candidate) and passes; equal on every bar of one pair but not of another is a leak',
+           nb.extraction_problem({'EURUSD': {'rows': clone}}, ['EURUSD'], 'cand_a', None) == ''
+           and 'all bars on 1 of 2 pairs only' in nb.extraction_problem({'EURUSD': {'rows': clone}, 'GBPUSD': {'rows': halfway}},
+                                                                        ['EURUSD', 'GBPUSD'], 'cand_a', None))
+    base200 = [dict(two_line[k % 40], date=f'{2020 + k // 300}.{k // 25 % 12 + 1:02d}.{k % 25 + 1:02d}',
+                    cand_a=f'{1.0 + k / 10:.8f}') for k in range(200)]
+    hist = [dict(r) for r in base200]
+    for r in hist[20:80]:
+        r['cand_a'] = '0.00000000'                                            # a 60-bar blank stretch earlier
+    for r in hist[-55:]:
+        r['cand_a'] = '0.00000000'                                            # 55 blank at the end
+    stopped = [dict(r) for r in base200]
+    for r in stopped[-55:]:
+        r['cand_a'] = '0.00000000'
+    c.that('P1.2 stops-writing gate allows the long blank stretches a two-colour histogram buffer has by design: a '
+           'trailing run of 55 after an earlier 60-bar stretch passes; the same 55 with no earlier stretch is flagged',
+           nb.longest_blank_run(hist, 'cand_a') == 60
+           and nb.extraction_problem({'EURUSD': {'rows': hist}}, ['EURUSD'], 'cand_a', None) == ''
+           and 'stops writing' in nb.extraction_problem({'EURUSD': {'rows': stopped}}, ['EURUSD'], 'cand_a', None))
     arch_dir = Path(tempfile.mkdtemp(prefix='nnfx_arch_'))
     for name in ('nnfx_batch.json', 'nnfx_batch_results.jsonl', 'nnfx_batch_extract_EURUSD.csv', 'keep.txt'):
         (arch_dir / name).write_text(name)
-    dest = nb.archive_previous_outputs(arch_dir)
-    c.that('Runtime safety: a new session ARCHIVES the previous job file, results and extraction CSVs into '
-           'Files/nnfx_archive/<time>/ (the runtime is shared, so they may be the only copy) and leaves other files',
+    arch_root = Path(tempfile.mkdtemp(prefix='nnfx_archroot_'))
+    dest = nb.archive_previous_outputs(arch_dir, arch_root)
+    c.that('Runtime safety: a new session ARCHIVES the previous job file, results and extraction CSVs into an archive '
+           'folder OUTSIDE the runtime (the runtime is shared and clone_runtime deletes it on an MT5 update) and leaves '
+           'other files',
            dest is not None and sorted(f.name for f in dest.iterdir()) == ['nnfx_batch.json', 'nnfx_batch_extract_EURUSD.csv',
            'nnfx_batch_results.jsonl'] and (dest / 'nnfx_batch_extract_EURUSD.csv').read_text() == 'nnfx_batch_extract_EURUSD.csv'
-           and sorted(f.name for f in arch_dir.iterdir()) == ['keep.txt', 'nnfx_archive'], detail=str(dest))
+           and dest.parent == arch_root and sorted(f.name for f in arch_dir.iterdir()) == ['keep.txt'], detail=str(dest))
     ctl_ok = [{'repaint_control': 'Examples\\Custom Moving Average', 'repaint': 'aligned'},
-              {'repaint_control': 'Examples\\ZigZag', 'repaint': 'repaints'}]
+              {'repaint_control': 'Examples\\ZigZag', 'repaint': 'repaints'},
+              {'repaint_control_end': 'Examples\\Custom Moving Average', 'repaint': 'aligned'}]
     cand = [{'key': 'zz', 'repaint': 'repaints', 'compared': 400, 'diffs': 400, 'deepest': 399},
             {'key': 'ma', 'repaint': 'aligned', 'compared': 400, 'diffs': 0, 'deepest': -1}]
     v_ok = nb.repaint_verdicts(ctl_ok + cand)
     v_bad = nb.repaint_verdicts([dict(ctl_ok[0], repaint='repaints'), ctl_ok[1]] + cand)
-    c.that('P1.2 repaint verdicts are trusted only when the session controls behave (MetaTrader MA aligned, '
-           'MetaTrader ZigZag repaints); a repainter is labelled with its counts, an older extract is not_run',
+    c.that('P1.2 repaint verdicts are trusted only when the session controls behave (MetaTrader MA aligned at the '
+           'start AND the end, MetaTrader ZigZag repaints); a repainter is labelled with its counts; a difference on '
+           'the newest bar only is reported (newest_bar_only), not gated; an older extract is not_run',
            nb.repaint_label(v_ok, 'zz').startswith('repaints (400 of 400') and nb.repaint_label(v_ok, 'ma') == 'aligned'
            and nb.repaint_label(v_bad, 'zz') == 'untested_controls_failed'
+           and nb.repaint_label(nb.repaint_verdicts(ctl_ok[:2] + cand), 'zz') == 'untested_controls_failed'
+           and nb.repaint_label(nb.repaint_verdicts(ctl_ok + [dict(cand[0], repaint='newest_bar_only', deepest=0)]), 'zz')
+               == 'newest_bar_only'
            and nb.repaint_label(nb.repaint_verdicts([]), 'zz') == 'not_run', detail=str(v_bad))
     tail0 = [dict(r) for r in two_line]
     for r in tail0:

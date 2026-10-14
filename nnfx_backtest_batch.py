@@ -375,14 +375,17 @@ bool SyncHistory(string sym,datetime from,uint timeout_ms){
 // pivots appear and disappear); bars EMPTY/0 on both sides are not compared.
 #define RP_CUT 150
 #define RP_CMP 400
-long g_tick_msc=0;
-// custom symbols get no ticks; indicators that wait for a tick before finishing would never calculate
+int g_bars_full=0, g_bars_cut=0;   // bar counts at creation; a change voids the comparison
+// custom symbols get no ticks; indicators that wait for a tick before finishing would never calculate.
+// Each symbol keeps its OWN clock (its last tick) and a pump never leaves the last bar's day -- a
+// shared clock once put CUT's ticks 150 days ahead, adding a bar and shifting every comparison.
 void PumpTick(string sym){
   if(StringFind(sym,"NNFXR_")!=0) return;
   MqlRates r[]; if(CopyRates(sym,PERIOD_D1,0,1,r)!=1) return;
-  long t=(long)r[0].time*1000+3600000;
-  if(g_tick_msc<t) g_tick_msc=t; g_tick_msc+=1000;
-  MqlTick tk[1]; tk[0].time=(datetime)(g_tick_msc/1000); tk[0].time_msc=g_tick_msc;
+  long day0=(long)r[0].time*1000;
+  long t=MathMax(SymbolInfoInteger(sym,SYMBOL_TIME_MSC)+1000, day0+3600000);
+  if(t>=day0+86400000-1000) return;
+  MqlTick tk[1]; tk[0].time=(datetime)(t/1000); tk[0].time_msc=t;
   tk[0].bid=r[0].close; tk[0].ask=r[0].close+10*SymbolInfoDouble(sym,SYMBOL_POINT); tk[0].last=r[0].close;
   tk[0].volume=1; tk[0].flags=TICK_FLAG_BID|TICK_FLAG_ASK;
   CustomTicksAdd(sym,tk);
@@ -421,6 +424,8 @@ string RepaintTest(string rel,int bufA,int bufB,uint timeout){
   if(st1!="ok"){ if(h1!=INVALID_HANDLE) IndicatorRelease(h1); return("\"repaint\":\"untested_cut_"+st1+"\""); }
   int h2=LoadCalc("NNFXR_FULL",rel,timeout,st2);
   if(st2!="ok"){ IndicatorRelease(h1); if(h2!=INVALID_HANDLE) IndicatorRelease(h2); return("\"repaint\":\"untested_full_"+st2+"\""); }
+  if(Bars("NNFXR_CUT",PERIOD_D1)!=g_bars_cut || Bars("NNFXR_FULL",PERIOD_D1)!=g_bars_full){
+    IndicatorRelease(h1); IndicatorRelease(h2); return("\"repaint\":\"untested_history_changed\""); }
   int compared=0,diffs=0,deepest=-1;
   for(int q=0;q<2;q++){
     int b=(q==0)?bufA:bufB; if(b<0) continue;
@@ -436,7 +441,9 @@ string RepaintTest(string rel,int bufA,int bufB,uint timeout){
     }
   }
   IndicatorRelease(h1); IndicatorRelease(h2);
-  string v=(compared<50)?"untested_no_comparable_values":((diffs==0)?"aligned":"repaints");
+  // only the newest shared bar differs: a not-yet-final last value or tick volume from the pumps --
+  // reported, not treated as repainting
+  string v=(compared<50)?"untested_no_comparable_values":((diffs==0)?"aligned":((deepest==0)?"newest_bar_only":"repaints"));
   return("\"repaint\":\""+v+"\",\"compared\":"+IntegerToString(compared)+",\"diffs\":"+IntegerToString(diffs)+
          ",\"deepest\":"+IntegerToString(deepest));
 }
@@ -566,6 +573,7 @@ void OnStart(){
   // the indicator, not of the pair). Skipped for candidates that already struck out.
   string rsym=syms[0];
   bool rp_ok=nsyms>0 && MakeCustom("NNFXR_FULL",rsym,0) && MakeCustom("NNFXR_CUT",rsym,RP_CUT);
+  g_bars_full=Bars("NNFXR_FULL",PERIOD_D1); g_bars_cut=Bars("NNFXR_CUT",PERIOD_D1);
   AppendResult("{\"info\":\"repaint_test\",\"symbol\":\""+rsym+"\",\"custom_symbols\":"+(rp_ok?"true":"false")+"}");
   // controls, every session: MetaTrader's own moving average must come out aligned and its own ZigZag
   // must come out repainting -- otherwise no verdict of this session is trusted (checked in Python)
@@ -580,6 +588,8 @@ void OnStart(){
     else rj=RepaintTest(rels[k],bufA[k],bufB[k],jobTimeout);
     AppendResult("{\"key\":\""+keys[k]+"\",\"repaint_symbol\":\""+rsym+"\","+rj+"}");
   }
+  // the moving-average control again at the END: any drift during the session fails it
+  if(rp_ok) AppendResult("{\"repaint_control_end\":\"Examples\\\\Custom Moving Average\","+RepaintTest("Examples\\Custom Moving Average",0,-1,jobTimeout)+"}");
   int f=FileOpen("nnfx_batch_done.flag",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
   if(f!=INVALID_HANDLE){ FileWriteString(f,"done"); FileClose(f); }
   TerminalClose(0);
@@ -723,16 +733,39 @@ REFERENCE_COLUMNS = ('ma', 'macd_m', 'macd_s', 'rvi', 'atr', 'mom', 'vol')
 LEAK_MIN_BARS = 20  # exact 8-decimal matches with a reference indicator on this many bars cannot be chance
 
 
-def leak_source(rows, col):
-    """The reference column whose values appear verbatim in `col` (EMPTY and 0 excluded), else ''.
-    The 2026-10-04 extraction had Examples\\Momentum's values inside 14 of 40 candidates' columns --
-    some on every bar of a pair, some on the newest 64 -- which classify_column cannot see because
-    the leaked values vary like a real indicator."""
+CLONE_SHARE = 0.95   # a column equal to a reference on >= 95% of its values is a clone of it, not a leak
+
+
+def reference_matches(rows, col):
+    """{reference column: (bars equal to it, non-blank bars of col)} for references matching >= LEAK_MIN_BARS."""
+    out = {}
+    usable = sum(1 for r in rows if r[col] not in ('EMPTY', 'FAILED', '', '0.00000000'))
     for ref in REFERENCE_COLUMNS:
         if rows and ref in rows[0]:
             n = sum(1 for r in rows if r[col] == r[ref] and r[col] not in ('EMPTY', 'FAILED', '', '0.00000000'))
             if n >= LEAK_MIN_BARS:
-                return f'{ref} ({n} bars)'
+                out[ref] = (n, usable)
+    return out
+
+
+def leak_source(symbol_rows, col):
+    """The reference whose values LEAKED into `col`, else ''. The 2026-10-04 extraction had
+    Examples\\Momentum's values inside 14 of 40 candidates' columns -- on every bar of some pairs and on
+    none of others, or on the newest 64 bars only -- which classify_column cannot see because the leaked
+    values vary like a real indicator. A genuine clone (a tick-volume VOLUME candidate equal to `vol`, an
+    ATR / SMA / Momentum copy) matches on >= 95% of its values on EVERY pair and is not a leak.
+    symbol_rows = {symbol: rows}."""
+    per = {sym: reference_matches(rows, col) for sym, rows in symbol_rows.items()}
+    for ref in REFERENCE_COLUMNS:
+        hits = {sym: m[ref] for sym, m in per.items() if ref in m}
+        if not hits:
+            continue
+        full = {sym for sym, (n, u) in hits.items() if u and n >= CLONE_SHARE * u}
+        partial = [f'{sym} {n}/{u}' for sym, (n, u) in hits.items() if sym not in full]
+        if partial:
+            return f'{ref} (partial: {partial[0]} bars)'
+        if len(full) < len(symbol_rows):
+            return f'{ref} (all bars on {len(full)} of {len(symbol_rows)} pairs only)'
     return ''
 
 
@@ -750,15 +783,28 @@ def trailing_blank(rows, col):
     return n
 
 
+def longest_blank_run(rows, col):
+    """Longest run of exactly 0 / EMPTY values in col (a two-colour histogram or arrow buffer has long
+    blank stretches by design; only a trailing run far longer than any earlier one means 'stopped')."""
+    best = cur = 0
+    for r in rows:
+        if r[col] in ('EMPTY', 'FAILED', '', '0.00000000'):
+            cur += 1; best = max(best, cur)
+        else:
+            cur = 0
+    return best
+
+
 def repaint_verdicts(results):
     """{candidate key: the controller's repaint-test line} (P1.2), or {'__controls__': False} when the
-    session's controls did not behave (MetaTrader's moving average must be 'aligned', its ZigZag
-    'repaints'): then no verdict of that session is trusted. Extractions made before the test existed
+    session's controls did not behave (MetaTrader's moving average must be 'aligned' at the start AND at
+    the end of the session, its ZigZag 'repaints'): then no verdict of that session is trusted. Extractions made before the test existed
     have no such lines ({})."""
     controls = {r['repaint_control']: r['repaint'] for r in results if 'repaint_control' in r}
+    end = [r['repaint'] for r in results if 'repaint_control_end' in r]
     verdicts = {r['key']: r for r in results if 'key' in r and 'repaint' in r}
     if verdicts and controls.get('Examples\\Custom Moving Average') == 'aligned' \
-            and controls.get('Examples\\ZigZag') == 'repaints':
+            and controls.get('Examples\\ZigZag') == 'repaints' and end and end[-1] == 'aligned':
         return verdicts
     return {'__controls__': False} if verdicts else {}
 
@@ -787,12 +833,13 @@ def extraction_problem(symbol_data, symbols, col_a, col_b):
         if status != 'EXTRACT_OK':
             return f'{sym}: {detail}'
         for col in (col_a, col_b):
-            src = leak_source(rows, col) if col else ''
-            if src:
-                return f'{sym}: {col[-2:]} holds the values of reference column {src} -- corrupt extraction'
             blank = trailing_blank(rows, col) if col else 0
-            if blank >= STOPS_WRITING_BARS:
+            if blank >= STOPS_WRITING_BARS and blank >= 3 * longest_blank_run(rows[:len(rows) - blank], col):
                 return f'{sym}: {col[-2:]} is 0/EMPTY on the newest {blank} bars -- the indicator stops writing'
+    for col in (col_a, col_b):
+        src = leak_source({sym: symbol_data[sym]['rows'] for sym in symbols}, col) if col else ''
+        if src:
+            return f'{col[-2:]} holds the values of reference column {src} -- corrupt extraction'
     return ''
 
 # ---- engine wiring (same roles as run_pilot_mass.py, generalized) -----------
@@ -1017,15 +1064,19 @@ def score_candidate(symbol_data, symbols, role, col_a, col_b, zero_ref, score_fr
 
 # ---- run ----------------------------------------------------------------------
 
-def archive_previous_outputs(files_dir):
+ARCHIVE_ROOT = Path(os.environ.get('LOCALAPPDATA', tempfile.gettempdir())) / 'nnfx-backtest-runtime' / 'archive'
+
+
+def archive_previous_outputs(files_dir, archive_root=None):
     """Move the previous session's job file, results, done flag and extraction CSVs into
-    Files/nnfx_archive/<timestamp>/ instead of deleting them: the runtime is shared (one per
-    terminal+data folder), so its last extraction may be the only copy."""
+    <archive_root>/<timestamp>/ instead of deleting them: the runtime is shared (one per terminal+data
+    folder), so its last extraction may be the only copy. The archive lives OUTSIDE the runtime folder,
+    which pb.clone_runtime() deletes whenever the MT5 build changes."""
     old = [files_dir / fn for fn in ('nnfx_batch.json', 'nnfx_batch_results.jsonl', 'nnfx_batch_done.flag')
            if (files_dir / fn).exists()] + sorted(files_dir.glob('nnfx_batch_extract_*.csv'))
     if not old:
         return None
-    dest = files_dir / 'nnfx_archive' / time.strftime('%Y%m%d-%H%M%S')
+    dest = Path(archive_root or ARCHIVE_ROOT) / time.strftime('%Y%m%d-%H%M%S')
     dest.mkdir(parents=True, exist_ok=True)
     for f in old:
         shutil.move(str(f), str(dest / f.name))
@@ -1065,7 +1116,6 @@ def _prepare_runtime(symbols, history_from):
     files_dir = mqlroot / 'Files'
     for d in (indicators_dir, scripts_dir, files_dir):
         d.mkdir(parents=True, exist_ok=True)
-    archive_previous_outputs(files_dir)
 
     terminal_exe = rt / Path(mt5['terminal']).name
     editor = rt / Path(mt5['editor']).name
@@ -1102,8 +1152,12 @@ def _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_
     try:
         # ceiling: ~20 s per candidate per pair, + 2 time limits per candidate (strikes), + up to
         # 2.5 min per symbol for the controller's history download/sync
-        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * len(job_json['jobs']) * len(symbols)
-                                                            + 2 * job_timeout * len(job_json['jobs']) + 150 * len(symbols)))
+        n_jobs = len(job_json['jobs'])
+        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * n_jobs * len(symbols)
+                                                            + 2 * job_timeout * n_jobs + 150 * len(symbols)
+                                                            # P1.2 repaint pass: queue check + 2 loads per job,
+                                                            # 3 control runs, custom-symbol setup
+                                                            + (60 + 2 * job_timeout) * n_jobs + 6 * job_timeout + 60))
     finally:
         pb.terminate_tree(proc)
     if not finished:
@@ -1143,6 +1197,7 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
         conn.close()
         return
     rt, mqlroot, indicators_dir, scripts_dir, files_dir, terminal_exe, editor = env
+    archive_previous_outputs(files_dir)
 
     # 1) stage every candidate source (mirrors render_shard's staging loop)
     prepared = {}
@@ -1304,10 +1359,10 @@ def reextract(out, source_runtime, symbols=None, keys=None, history_from=DEFAULT
     so neither the user's terminal nor the source runtime is touched. Use it after a controller change
     (e.g. the open column, the repaint test); then `rescore --out <out>`."""
     out = Path(out)
-    job_json = json.loads((out / 'nnfx_batch.json').read_text(encoding='utf-8'))
     source_copy = out / 'nnfx_batch.source.json'  # the session writes its (filtered) job file back to out
     if not source_copy.exists():
         shutil.copy2(out / 'nnfx_batch.json', source_copy)
+    job_json = json.loads(source_copy.read_text(encoding='utf-8'))  # always the ORIGINAL full job list
     if keys:
         job_json['jobs'] = [j for j in job_json['jobs'] if any(j['key'].startswith(k) for k in keys)]
     symbols = symbols or job_json['symbols']
@@ -1328,10 +1383,11 @@ def reextract(out, source_runtime, symbols=None, keys=None, history_from=DEFAULT
     if env is None:
         return
     rt, mqlroot, indicators_dir, scripts_dir, files_dir, terminal_exe, editor = env
-    if files_dir.resolve() == out.resolve():
+    if files_dir.resolve() == out.resolve():  # checked before anything is archived
         emit({'type': 'fatal', 'error': '--out must not be the runtime Files folder'})
         return
     archive_previous_outputs(files_dir)
+    archive_previous_outputs(out)  # an earlier reextract's CSVs must not mix with this session's
     for j in job_json['jobs']:
         shutil.copytree(staged / j['key'], indicators_dir / j['key'], dirs_exist_ok=True)
     if not _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_json, symbols, job_timeout, out):
