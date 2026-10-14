@@ -8,6 +8,5 @@ dist/
 node_modules/
 src-tauri/target/
 src-tauri/binaries/
-src-tauri/icons/
 build-sidecar/
 build-pyinstaller*/
