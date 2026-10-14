@@ -1075,7 +1075,6 @@ fn export_diagnostics_blocking(db_path:String) -> Result<Value,String> {
 pub fn run() {
     std::panic::set_hook(Box::new(|info| log_startup_error(&format!("panic: {}",info))));
     let result=tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![db_stats,db_query,db_verify,folder_preview,browse_directory,start_scan_engine,start_preview_library,preview_queue_update,preview_queue_stats,preview_worker_pause,app_log,export_diagnostics,start_backtest_batch,db_backtest_query])
         .run(tauri::generate_context!());
