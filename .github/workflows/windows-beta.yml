@@ -267,7 +267,9 @@ jobs:
           Remove-Item $appData -Recurse -Force -ErrorAction SilentlyContinue
           $p=Start-Process -FilePath $exe -PassThru
           $ready=$false
-          for($i=0;$i -lt 25;$i++){
+          # 60 s: a cold WebView2 start on the hosted runner occasionally needed more than 25 s (run 38644966637
+          # failed, its re-run of the same commit passed)
+          for($i=0;$i -lt 60;$i++){
             Start-Sleep -Seconds 1
             if($p.HasExited){break}
             if(Test-Path $diag){
