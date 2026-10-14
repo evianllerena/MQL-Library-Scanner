@@ -317,15 +317,22 @@ class NNFXEngine:
     # for a whole-account curve across symbols; by default each engine has its own.
     equity: EquityTracker = field(default_factory=EquityTracker)
     _date: str = ''  # date of the bar being processed (stamps realized results)
+    # R of exits decided on a close that fill at the NEXT open: booked into the (possibly shared)
+    # equity tracker when that next bar is processed, so no other symbol's breaker decision on the
+    # decision date can see a price from the following day.
+    _deferred_r: list = field(default_factory=list)
 
     def _pips(self, entry: float, exitp: float, direction: int) -> float:
         return ((exitp - entry) if direction > 0 else (entry - exitp)) / self.params.pip_size
 
-    def _realize(self, pos: Position, exit_price: float, fraction: float) -> None:
+    def _realize(self, pos: Position, exit_price: float, fraction: float, defer: bool = False) -> None:
         """Book `fraction` of the position (0.5 = one half) closed at exit_price, in R."""
         r = (exit_price - pos.entry_price) * pos.direction / (self.params.sl_mult * pos.atr_at_entry)
         pos.realized_r += fraction * r
-        self.equity.realize(fraction * r, self.params.risk_pct, self._date)
+        if defer:
+            self._deferred_r.append(fraction * r)
+        else:
+            self.equity.realize(fraction * r, self.params.risk_pct, self._date)
 
     def _cost(self, direction: int) -> float:
         """Half the round-trip cost as a price offset AGAINST a fill in `direction`."""
@@ -336,6 +343,9 @@ class NNFXEngine:
         if self.params.fill_at == 'close':
             return bar['close']
         return bar.get('next_open')
+
+    def _fills_next_bar(self, bar: dict) -> bool:
+        return self.params.fill_at != 'close' and bar.get('next_open') is not None
 
     def _close_decided_fill(self, bar: dict) -> float:
         """An exit decided on this close: next bar's open, or this close at the end of the data."""
@@ -352,11 +362,11 @@ class NNFXEngine:
         o = bar['open']
         return min(level, o) if direction > 0 else max(level, o)
 
-    def _close_all(self, market_price: float, reason: str) -> dict:
+    def _close_all(self, market_price: float, reason: str, defer: bool = False) -> dict:
         pos = self.position
         exit_price = market_price - self._cost(pos.direction)
         pips = self._pips(pos.entry_price, exit_price, pos.direction)
-        self._realize(pos, exit_price, 0.5 if pos.tp1_hit else 1.0)  # after TP1 only the runner is left
+        self._realize(pos, exit_price, 0.5 if pos.tp1_hit else 1.0, defer)  # after TP1 only the runner is left
         self.last_exit_dir = pos.direction
         self.realized_pips += pips
         self.position = None
@@ -441,6 +451,9 @@ class NNFXEngine:
         Optional: exit_value + exit_zero_reference (X2 exit indicator)."""
         p = self.params
         self._date = bar['date']
+        for r in self._deferred_r:  # exits decided on the previous close filled at this bar's open
+            self.equity.realize(r, p.risk_pct, self._date)
+        self._deferred_r.clear()
         self.c1_history.append((bar['c1_fast'], bar['c1_slow']))
         idx = len(self.c1_history) - 1
 
@@ -516,7 +529,7 @@ class NNFXEngine:
 
             # hard exit: whole remaining position closes immediately on a C1 flip
             if pos.half2_open and c1dir != 0 and c1dir != pos.direction:
-                rec = self._close_all(self._close_decided_fill(bar), 'exit:c1_flip')
+                rec = self._close_all(self._close_decided_fill(bar), 'exit:c1_flip', self._fills_next_bar(bar))
                 # If TP1 ALSO fired on this same bar, blend half#1's TP1 pips with half#2's
                 # flip-exit pips the same way every other round trip is blended (equal-weighted
                 # average -- both halves are equal size). A prior version string-concatenated
@@ -550,7 +563,7 @@ class NNFXEngine:
                 if small_or_losing:
                     on_close_exit = 'exit:news'
             if on_close_exit:
-                rec = self._close_all(self._close_decided_fill(bar), on_close_exit)
+                rec = self._close_all(self._close_decided_fill(bar), on_close_exit, self._fills_next_bar(bar))
                 if record['action'] == 'exit_half':
                     rec['pips'] = round((record['pips'] + rec['pips']) / 2.0, 1)
                 record.update(rec)

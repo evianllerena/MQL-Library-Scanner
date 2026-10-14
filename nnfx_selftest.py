@@ -854,6 +854,29 @@ def unit_tests() -> Check:
         raised = True
     c.that('P1.3 model_gaps never guesses: a bar with no open while gap fills are on raises instead of '
            'filling at the stop level', raised)
+    acct = EquityTracker()
+    e, _ = ex_setup()
+    e.equity = acct
+    ex_next(e, 100.7, 100.3, 100.9, c1=(0.9, 1.0), next_open=100.2)        # C1-flip exit decided on 'x1'
+    eq_after_decision = acct.equity
+    b2 = _bar('x2', 100.3, 100.0, 0.9, 1.0, -5.0, 10.0, close_prev=100.5)
+    b2.update(open=100.2, next_open=None)
+    e.process_bar(b2)
+    c.that('P1.7 no lookahead into the breaker: an exit decided on x1 that fills at x2\'s open is booked into the '
+           '(shared) equity on x2, not on x1 -- equity unchanged after x1, -0.4R x 2% after x2, dated x2',
+           eq_after_decision == 100.0 and acct.curve and acct.curve[-1][0] == 'x2'
+           and abs(acct.equity - 100.0 * (1 - 0.4 * 0.02)) < 1e-9, detail=f'{eq_after_decision} {acct.curve}')
+    gap_rows = [dict(r, open=str(99.0 + k / 100)) for k, r in enumerate(batch_rows(200.0))]  # distinct opens
+    gap_rows[10]['cand_a'] = 'EMPTY'                                         # row 10 is dropped (no baseline)
+    gap_rows[12]['open'] = 'EMPTY'                                           # row 12 is dropped too
+    prep = nb._prepare_bars({'EURUSD': {'rows': gap_rows}}, ['EURUSD'], 'BASELINE', 'cand_a', None, None)['EURUSD']
+    by_date = {b['date']: b for b in prep}
+    c.that('P1.7 batch: next_open is the open of the next bar the engine PROCESSES -- a dropped row (missing '
+           'value or missing open) is never the fill bar',
+           '2024.03.11' not in by_date and '2024.03.13' not in by_date
+           and by_date['2024.03.10']['next_open'] == float(gap_rows[11]['open'])
+           and by_date['2024.03.12']['next_open'] == float(gap_rows[13]['open']) and prep[-1]['next_open'] is None,
+           detail=str([(b['date'], b['next_open']) for b in prep[8:14]]))
     c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
            'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
            and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)

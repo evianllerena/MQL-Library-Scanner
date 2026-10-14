@@ -630,11 +630,18 @@ def _prepare_bars(symbol_data, symbols, role, col_a, col_b, zero_ref):
                        exit_value=fnum(r.get('mom')), exit_zero_reference=REF_EXIT_ZERO_REFERENCE)
             if 'open' in r:  # P1.3 gap fills + P1.7 next-open fills (a pre-P1 extract has no open)
                 bar['open'] = fnum(r['open'])
-                bar['next_open'] = fnum(rows[i + 1]['open']) if i + 1 < len(rows) else None
+                if bar['open'] is None:  # no open: dropped like any bar missing a value
+                    prev_close = fnum(r['close']); prev_baseline = base
+                    continue
             if ref.enable_news_filter:  # N1/X5 (FIX 7): dormant unless switched on
                 bar.update(symbol=sym, time_utc=bar_close_utc(r['date'], ref.server_utc_offset_hours))
             bars.append(bar)
             prev_close = fnum(r['close']); prev_baseline = base
+        # an order decided on a bar fills at the open of the NEXT BAR THE ENGINE PROCESSES, so the
+        # fill bar's high/low are always managed (a skipped raw row can never be the fill bar)
+        for j, bar in enumerate(bars):
+            if 'open' in bar:
+                bar['next_open'] = bars[j + 1]['open'] if j + 1 < len(bars) else None
     return prepared
 
 
