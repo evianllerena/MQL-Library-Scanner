@@ -27,7 +27,7 @@ from pathlib import Path
 from nnfx_engine import (
     NNFXEngine, NNFXParams,
     c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction, bar_close_utc,
-    EquityTracker, run_lockstep,
+    EquityTracker, Position, run_lockstep,
 )
 
 
@@ -967,6 +967,10 @@ def unit_tests() -> Check:
     c.that('P1.5 lockstep ties: on the same date symbols run in name order (EURUSD before GBPUSD) whatever '
            'order the basket was given in', _Order.calls == [('d1', 'EURUSD'), ('d1', 'GBPUSD'),
                                                              ('d2', 'EURUSD'), ('d2', 'GBPUSD')], detail=str(_Order.calls))
+
+    hold_rec = NNFXEngine(P()).process_bar(_bar('h0', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0))
+    c.that('P1.5 record pips is None or a number (never the empty string that used to be added to floats)',
+           hold_rec['pips'] is None and not hasattr(Position(1, 1.0, 0.5, 1.5, 0.1), 'half2_open'), detail=str(hold_rec['pips']))
 
     # --- P1.4 statistics --------------------------------------------------------------------
     straddle = [dict(date='2024.03.29', action='enter', pips=''), dict(date='2024.03.30', action='exit_half', pips=10.0),

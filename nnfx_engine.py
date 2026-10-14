@@ -143,8 +143,6 @@ class Position:
     sl: float
     tp1: float
     atr_at_entry: float
-    half1_open: bool = True
-    half2_open: bool = True
     tp1_hit: bool = False
     is_continuation: bool = False
     trail_active: bool = False  # FIX 6: sticky once a close has reached trail_activate_atr beyond entry
@@ -522,7 +520,7 @@ class NNFXEngine:
             'volume_value': bar['volume_value'], 'volume_avg': bar['volume_avg'],
             'exit_value': exit_value if exit_value is not None else '', 'exit_dir': exitdir if exit_value is not None else '',
             'direction_decision': cross if cross != 0 else side,
-            'action': 'hold', 'reason': '', 'lots': '', 'atr': bar['atr'], 'pips': '',
+            'action': 'hold', 'reason': '', 'lots': '', 'atr': bar['atr'], 'pips': None,  # P1.5: Optional[float], set on exit records
         }
 
         # --- manage / hard-exit open position -------------------------------
@@ -541,7 +539,6 @@ class NNFXEngine:
                 hit_tp1 = (bar['high'] >= pos.tp1) if pos.direction > 0 else (bar['low'] <= pos.tp1)
                 if hit_tp1:
                     pos.tp1_hit = True
-                    pos.half1_open = False
                     # remaining half's stop -> breakeven immediately (NNFX_RULESET_THE_TRUTH.txt SS5)
                     pos.sl = pos.entry_price
                     tp1_fill = pos.tp1 - self._cost(pos.direction)  # limit order: fills at its level
@@ -552,7 +549,7 @@ class NNFXEngine:
             # T4: after TP1 the runner sits at breakeven until a close reaches trail_activate_atr
             # beyond entry; from then on (sticky) it trails trail_distance_atr behind each close,
             # never backward.
-            if pos.tp1_hit and pos.half2_open:
+            if pos.tp1_hit:
                 ref_atr = pos.atr_at_entry if p.trail_atr_ref == 'entry' else bar['atr']
                 if not pos.trail_active:
                     beyond = (bar['close'] - pos.entry_price) * pos.direction
@@ -564,7 +561,7 @@ class NNFXEngine:
                         pos.sl = trail
 
             # hard exit: whole remaining position closes immediately on a C1 flip
-            if pos.half2_open and c1dir != 0 and c1dir != pos.direction:
+            if c1dir != 0 and c1dir != pos.direction:
                 rec = self._close_all(self._close_decided_fill(bar), 'exit:c1_flip', self._fills_next_bar(bar))
                 # If TP1 ALSO fired on this same bar, blend half#1's TP1 pips with half#2's
                 # flip-exit pips the same way every other round trip is blended (equal-weighted
@@ -585,13 +582,13 @@ class NNFXEngine:
             # Both branches return before the continuation bookkeeping below, so they
             # apply its wrong-side reset themselves (SS6: no baseline cross since entry).
             on_close_exit = None
-            if p.enable_exit_indicator and pos.half2_open and exitdir != 0 and exitdir != pos.direction:
+            if p.enable_exit_indicator and exitdir != 0 and exitdir != pos.direction:
                 on_close_exit = 'exit:exit_indicator'
-            elif p.enable_baseline_exit and pos.half2_open and side != 0 and side != pos.direction:
+            elif p.enable_baseline_exit and side != 0 and side != pos.direction:
                 on_close_exit = 'exit:baseline_cross'
             # X5 (FIX 7, dormant): a High-impact event for either currency is within the window ->
             # close at the close, per x5_cutoff. Runs after X2/X4, so those keep their own reason.
-            if not on_close_exit and pos.half2_open and self._news_ahead(bar):
+            if not on_close_exit and self._news_ahead(bar):
                 if p.x5_cutoff == 'not_past_tp1':
                     small_or_losing = not pos.tp1_hit
                 else:  # 'handoff': losing, or in profit by less than x5_profit_atr x ATR
