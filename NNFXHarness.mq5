@@ -499,6 +499,8 @@ bool NewsAhead(int shift)
    if(!EnableNewsFilter || ArraySize(g_newsCur)==0) return(false);
    datetime t = iTime(_Symbol,PERIOD_D1,shift) + 86400 - (datetime)(ServerUTCOffsetHours*3600);
    datetime until = t + (datetime)(NewsWindowHours*3600);
+   MqlDateTime u; TimeToStruct(until,u);
+   while(u.day_of_week==0 || u.day_of_week==6) { until+=86400; TimeToStruct(until,u); } // P1.5: skip the weekend
    string base=StringSubstr(_Symbol,0,3), quote=StringSubstr(_Symbol,3,3);
    for(int i=0;i<ArraySize(g_newsCur);i++)
       if((g_newsCur[i]==base || g_newsCur[i]==quote) && g_newsTime[i]>t && g_newsTime[i]<=until)

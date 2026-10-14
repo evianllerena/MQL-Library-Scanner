@@ -27,7 +27,7 @@ from pathlib import Path
 from nnfx_engine import (
     NNFXEngine, NNFXParams,
     c2_direction, baseline_cross_closed, c1_direction_run_length, exit_direction, bar_close_utc,
-    EquityTracker, Position, run_lockstep,
+    EquityTracker, Position, run_lockstep, news_window_end,
 )
 
 
@@ -968,6 +968,14 @@ def unit_tests() -> Check:
            'order the basket was given in', _Order.calls == [('d1', 'EURUSD'), ('d1', 'GBPUSD'),
                                                              ('d2', 'EURUSD'), ('d2', 'GBPUSD')], detail=str(_Order.calls))
 
+    fri = datetime(2025, 4, 4, 21, 0, tzinfo=timezone.utc)          # Friday's decision moment
+    bf = _bar('fri', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5)
+    bf.update(symbol='EURUSD', time_utc=fri)
+    mon_event = news_params('eur_monday', [('EUR', datetime(2025, 4, 7, 10, 0, tzinfo=timezone.utc).isoformat(), 'High')])
+    r_fri = NNFXEngine(mon_event).process_bar(dict(bf))
+    c.that('P1.5 news window over a weekend: a Friday close\'s 24h window would end Saturday; it is pushed to Monday, '
+           'so a High EUR event Monday 10:00 UTC blocks the Friday entry (skip:news)', r_fri['reason'] == 'skip:news'
+           and str(news_window_end(fri)) == '2025-04-07 21:00:00+00:00', detail=f"{r_fri['reason']} {news_window_end(fri)}")
     hold_rec = NNFXEngine(P()).process_bar(_bar('h0', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0))
     c.that('P1.5 record pips is None or a number (never the empty string that used to be added to floats)',
            hold_rec['pips'] is None and not hasattr(Position(1, 1.0, 0.5, 1.5, 0.1), 'half2_open'), detail=str(hold_rec['pips']))

@@ -132,6 +132,16 @@ def bar_close_utc(date: str, server_utc_offset_hours: float) -> datetime:
     return (opened + timedelta(days=1) - timedelta(hours=server_utc_offset_hours)).replace(tzinfo=timezone.utc)
 
 
+def news_window_end(t: datetime, hours: float = 24.0) -> datetime:
+    """End of the N1/X5 news window that starts at decision moment t (UTC). P1.5: a window that ends on
+    a Saturday or Sunday is pushed day by day to Monday -- the market is closed, so a Friday close's
+    24 h would otherwise cover only the weekend and miss the events before the next trading close."""
+    until = t + timedelta(hours=hours)
+    while until.weekday() >= 5:
+        until += timedelta(days=1)
+    return until
+
+
 # ---------------------------------------------------------------------------
 # Position / engine state
 # ---------------------------------------------------------------------------
@@ -415,7 +425,7 @@ class NNFXEngine:
 
     def _news_ahead(self, bar: dict) -> bool:
         """N1/X5 test: a High-impact event for EITHER currency of the pair falls in
-        (time_utc, time_utc + news_window_hours]. Always False while the hook is dormant."""
+        (time_utc, news_window_end(time_utc)]. Always False while the hook is dormant."""
         p = self.params
         if not p.enable_news_filter or not p.news_calendar:
             return False
@@ -423,7 +433,7 @@ class NNFXEngine:
             raise ValueError("enable_news_filter needs 'symbol' and 'time_utc' on every bar")
         events = load_news_calendar(p.news_calendar)
         t = bar['time_utc']
-        until = t + timedelta(hours=p.news_window_hours)
+        until = news_window_end(t, p.news_window_hours)
         for cur in (bar['symbol'][:3].upper(), bar['symbol'][3:6].upper()):
             ts = events.get(cur, [])
             i = bisect.bisect_right(ts, t)  # first event strictly after t
