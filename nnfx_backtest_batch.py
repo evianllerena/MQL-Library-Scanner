@@ -1,7 +1,7 @@
 """
 NNFX backtest batch engine for the MQL Indicator Library.
 
-Mirrors preview_batch.py's architecture exactly (same JSONL stdout protocol,
+Mirrors the former preview_batch.py's architecture (removed in P1.8) (same JSONL stdout protocol,
 same PRAGMA-guarded migration idiom, same `import preview_bridge as pb` reuse
 of runtime discovery/clone/compile/prime helpers, same bulk-stage ->
 bulk-compile -> one controller script -> one MT5 session -> JSONL
@@ -9,7 +9,7 @@ results + done-flag pattern used by render_shard/MT5_BATCH_SRC) so the two
 batch engines stay consistent instead of diverging into two MT5 automation
 styles.
 
-What's different from preview_batch.py: instead of screenshotting each
+What was different from preview_batch.py: instead of screenshotting each
 indicator, the controller script extracts REAL per-bar buffer values (via
 iCustom + CopyBuffer -- proven throughout the NNFX pilot work this session,
 never the Strategy Tester, which was unreliable for headless automation) for
@@ -46,7 +46,7 @@ pb = _LazyPreviewBridge()
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from nnfx_engine import NNFXEngine, NNFXParams, EquityTracker, bar_close_utc, run_lockstep
 
-# ---- output (identical protocol to preview_batch.py) ------------------------
+# ---- output (the JSONL protocol the other sidecars use) ------------------------
 
 _emit_lock = threading.Lock()
 
@@ -236,7 +236,7 @@ def connect(db):
     return conn
 
 def ensure_backtest_table(conn):
-    """Defensive, idempotent guard mirroring preview_batch.py's
+    """Defensive, idempotent guard mirroring the former preview_batch.py's
     ensure_preview_columns -- the table already exists in engine.py's
     migrate() (STEP 1 of NNFX_INTEGRATION_PLAN.txt), but a batch engine
     should never assume it's talking to an up-to-date DB."""
@@ -308,7 +308,7 @@ def plan(db, limit=None):
           'items': [{'sha256': r['sha256'], 'slot': r['slot'], 'filename': r['filename']} for r in rows]})
     conn.close()
 
-# ---- MT5 controller script (mirrors preview_batch.py's MT5_BATCH_SRC) --------
+# ---- MT5 controller script (pattern of the former preview_batch MT5_BATCH_SRC) --------
 
 CONTROLLER_SRC = r'''
 #property strict
