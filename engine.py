@@ -186,7 +186,7 @@ def save_analysis(conn,a:Analysis,mtime_ns:int):
 
 def unchanged(conn,p):
     st=p.stat(); row=conn.execute('SELECT size,mtime_ns,scan_status,classifier_version FROM indicators WHERE path=?',(display_path(p),)).fetchone()
-    return bool(row and row['scan_status']=='complete' and row['size']==st.st_size and row['mtime_ns']==st.st_mtime_ns and row['classifier_version']=='evidence-v5')
+    return bool(row and row['scan_status']=='complete' and row['size']==st.st_size and row['mtime_ns']==st.st_mtime_ns and row['classifier_version']==Analysis.classifier_version)
 
 def empty_scan_message(diagnostics):
     parts=[]

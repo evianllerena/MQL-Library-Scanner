@@ -2,6 +2,7 @@ from __future__ import annotations
 import hashlib, re
 from dataclasses import dataclass, field
 from pathlib import Path
+from mql_text import decode_mql_bytes
 
 DRAW_TYPES = [
     'DRAW_LINE','DRAW_SECTION','DRAW_HISTOGRAM','DRAW_HISTOGRAM2','DRAW_ARROW','DRAW_COLOR_ARROW',
@@ -57,13 +58,11 @@ class Analysis:
     family_fingerprint: str = ''
 
 def read_text(path: Path) -> str:
-    raw = path.read_bytes()
-    for enc in ('utf-8-sig','utf-8','cp1252','latin1'):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            pass
-    return raw.decode('latin1', errors='replace')
+    # Shared with preview_bridge so classifier and renderer see identical text. Handles the
+    # UTF-16LE that MetaEditor saves .mq5 in by default; the old utf-8/cp1252/latin1 chain
+    # decoded it as latin1, hashing the BOM residue and corrupting non-ASCII comments.
+    # Raises on unreadable files (callers rely on that), unlike mql_text.read_mql_text.
+    return decode_mql_bytes(Path(path).read_bytes())
 
 def strip_comments(text: str) -> str:
     text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)

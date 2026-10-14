@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import engine_core  # noqa: E402
 import mql_text  # noqa: E402
 import preview_bridge  # noqa: E402
 
@@ -74,6 +75,19 @@ class PreviewBridgeTests(unittest.TestCase):
             p = Path(d) / 'mt4ish.mq5'
             p.write_text('double x=MarketInfo(Symbol(),MODE_BID);\n', encoding='utf-8')
             self.assertIsNotNone(preview_bridge._mt5_static_fast_fail(p))
+
+
+class EngineCoreTests(unittest.TestCase):
+    def test_engine_core_and_bridge_agree(self):
+        for p in (UTF8, UTF16):
+            with self.subTest(p=p.name):
+                self.assertEqual(engine_core.read_text(p), preview_bridge.read_text(p))
+
+    def test_fingerprint_identical_across_encodings(self):
+        a = engine_core.analyze(UTF8)
+        b = engine_core.analyze(UTF16)
+        self.assertEqual(a.family_fingerprint, b.family_fingerprint)
+        self.assertEqual(a.source_structure, b.source_structure)
 
 
 if __name__ == '__main__':
