@@ -943,6 +943,20 @@ def unit_tests() -> Check:
     c.that('P1.4 DB: a later failure row clears the earlier scores (trades 0, R/range NULL, oos_pass 0) instead of '
            'leaving a stale score ranked under a failure reason', (row['trades'], row['expectancy_r'], row['is_r_low'],
            row['oos_pass']) == (0, None, None, 0) and 'EXTRACT_GARBAGE' in row['mapping_reason'], detail=str(row))
+    two_line = [dict(batch_rows(200.0)[k % 22], date=f'2024.{k // 28 + 1:02d}.{k % 28 + 1:02d}',
+                     cand_a=f'{1.0 + k / 10:.8f}', cand_b='EMPTY', mom=f'{100.0 + k / 7:.8f}') for k in range(40)]
+    prob = nb.extraction_problem({'EURUSD': {'rows': two_line}}, ['EURUSD'], 'cand_a', 'cand_b')
+    c.that('P1.2 extraction gate: a two-line candidate whose buffer B is EMPTY on every bar is EXTRACT_GARBAGE '
+           '(it used to pass on buffer A alone and score 0 trades); run() and rescore() share this one gate',
+           prob.startswith('EURUSD: buffer B:') and nb.extraction_problem({'EURUSD': {'rows': two_line}}, ['EURUSD'],
+                                                                           'cand_a', None) == '', detail=prob)
+    leaky = [dict(r) for r in two_line]
+    for r in leaky[-25:]:
+        r['cand_a'] = r['mom']                                                # the newest 25 bars hold Momentum
+    prob = nb.extraction_problem({'EURUSD': {'rows': leaky}}, ['EURUSD'], 'cand_a', None)
+    c.that('P1.2 extraction gate: a column holding a reference indicator\'s exact values (here Momentum on the newest '
+           '25 bars, as found in 14 of 40 candidates of the 2026-10-04 extraction) is a corrupt extraction',
+           'reference column mom (25 bars)' in prob, detail=prob)
     c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
            'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
            and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)

@@ -612,6 +612,54 @@ def classify_column(rows, col):
         return 'EXTRACT_GARBAGE', f'only {distinct_recent} distinct recent values -- degenerate'
     return 'EXTRACT_OK', ''
 
+
+def candidate_columns_status(rows, col_a, col_b):
+    """classify_column for buffer A AND, for a two-line candidate, buffer B. A two-line C1 whose second
+    line never has a value used to pass on buffer A alone and then score 0 trades, because every bar
+    without both lines is dropped (seen on 10 of 15 C1 candidates in the 2026-10-04 extraction)."""
+    status, detail = classify_column(rows, col_a)
+    if status == 'EXTRACT_OK' and col_b:
+        status, detail = classify_column(rows, col_b)
+        if status != 'EXTRACT_OK':
+            detail = f'buffer B: {detail}'
+    return status, detail
+
+
+REFERENCE_COLUMNS = ('ma', 'macd_m', 'macd_s', 'rvi', 'atr', 'mom', 'vol')
+LEAK_MIN_BARS = 20  # exact 8-decimal matches with a reference indicator on this many bars cannot be chance
+
+
+def leak_source(rows, col):
+    """The reference column whose values appear verbatim in `col` (EMPTY and 0 excluded), else ''.
+    The 2026-10-04 extraction had Examples\\Momentum's values inside 14 of 40 candidates' columns --
+    some on every bar of a pair, some on the newest 64 -- which classify_column cannot see because
+    the leaked values vary like a real indicator."""
+    for ref in REFERENCE_COLUMNS:
+        if rows and ref in rows[0]:
+            n = sum(1 for r in rows if r[col] == r[ref] and r[col] not in ('EMPTY', 'FAILED', '', '0.00000000'))
+            if n >= LEAK_MIN_BARS:
+                return f'{ref} ({n} bars)'
+    return ''
+
+
+def extraction_problem(symbol_data, symbols, col_a, col_b):
+    """'' when the candidate's columns are usable on every symbol, else the first reason they are not.
+    The one gate both run() and rescore() apply before scoring."""
+    for sym in symbols:
+        rows = symbol_data[sym]['rows']
+        if not rows:
+            return f'{sym}: no extraction rows'
+        if col_b and col_b not in rows[0]:
+            return f'{sym}: expected column {col_b} missing from extraction (buf_b resolution mismatch)'
+        status, detail = candidate_columns_status(rows, col_a, col_b)
+        if status != 'EXTRACT_OK':
+            return f'{sym}: {detail}'
+        for col in (col_a, col_b):
+            src = leak_source(rows, col) if col else ''
+            if src:
+                return f'{sym}: {col[-2:]} holds the values of reference column {src} -- corrupt extraction'
+    return ''
+
 # ---- engine wiring (same roles as run_pilot_mass.py, generalized) -----------
 
 def rolling_avg(vals, window=20):
@@ -1061,21 +1109,8 @@ def run(db, out, symbols, limit=None, min_trades=30, force=False, history_from=D
                 write_status_row(conn, it, bed, 'EXTRACT_FAILED', failure_reason(fails))
                 emit({'type': 'item_error', 'filename': it['filename'], 'error': failure_reason(fails)})
                 continue
-            bad = False
-            bad_reason = ''
-            for sym in symbols:
-                rows = symbol_data[sym]['rows']
-                if not rows:
-                    bad, bad_reason = True, f'{sym}: no extraction rows'
-                    break
-                if col_b and col_b not in rows[0]:
-                    bad, bad_reason = True, f'{sym}: expected column {col_b} missing from extraction (buf_b resolution mismatch)'
-                    break
-                status, detail = classify_column(rows, col_a)
-                if status != 'EXTRACT_OK':
-                    bad, bad_reason = True, f'{sym}: {detail}'
-                    break
-            if bad:
+            bad_reason = extraction_problem(symbol_data, symbols, col_a, col_b)
+            if bad_reason:
                 write_status_row(conn, it, bed, 'EXTRACT_GARBAGE', bad_reason)
                 continue
             result = score_candidate(symbol_data, symbols, it['slot'], col_a, col_b, it['zero_reference'],
@@ -1177,6 +1212,11 @@ def rescore(db, out, csv_path, history_from=DEFAULT_HISTORY_FROM, min_trades=MIN
                              status=failure_reason(fails), trades=0, sufficient_sample=False, expectancy_r=0.0))
             continue
         col_b = j['key'] + '_b' if j['buf_b'] >= 0 else None
+        garbage = extraction_problem(symbol_data, symbols, j['key'] + '_a', col_b)
+        if garbage:  # same gate as run(): never scored on garbage columns
+            rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'],
+                             status=f'EXTRACT_GARBAGE: {garbage}', trades=0, sufficient_sample=False, expectancy_r=0.0))
+            continue
         r = score_candidate(symbol_data, symbols, j['role'], j['key'] + '_a', col_b, None, score_from=history_from,
                             holdout_from=holdout_from)
         rows.append(dict(indicator=names.get(j['key'], j['key'][:12]), slot=j['role'], status='scored', trades=r['trades'],
