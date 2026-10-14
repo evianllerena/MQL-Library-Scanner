@@ -957,6 +957,17 @@ def unit_tests() -> Check:
            '22-bar C1 run is skipped as bridge-too-far, not let through by a truncated history',
            len(fp_vol) == 22 and fp_vol[-1][1:] == ('skip', 'skip:bridge_too_far'), detail=str(fp_vol[-2:]))
 
+    class _Order:  # stand-in engine that records the order it is driven in
+        calls = []
+        def __init__(self, sym): self.sym = sym
+        def process_bar(self, bar):
+            _Order.calls.append((bar['date'], self.sym)); return {}
+    two = {'GBPUSD': [{'date': 'd1'}, {'date': 'd2'}], 'EURUSD': [{'date': 'd1'}, {'date': 'd2'}]}
+    run_lockstep({s: _Order(s) for s in two}, two)
+    c.that('P1.5 lockstep ties: on the same date symbols run in name order (EURUSD before GBPUSD) whatever '
+           'order the basket was given in', _Order.calls == [('d1', 'EURUSD'), ('d1', 'GBPUSD'),
+                                                             ('d2', 'EURUSD'), ('d2', 'GBPUSD')], detail=str(_Order.calls))
+
     # --- P1.4 statistics --------------------------------------------------------------------
     straddle = [dict(date='2024.03.29', action='enter', pips=''), dict(date='2024.03.30', action='exit_half', pips=10.0),
                 dict(date='2024.04.02', action='exit', pips=20.0, r=0.9),

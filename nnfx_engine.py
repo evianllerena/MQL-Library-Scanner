@@ -727,11 +727,12 @@ class NNFXEngine:
 
 def run_lockstep(engines: dict, bars: dict) -> dict:
     """Drive several symbols' engines together in CHRONOLOGICAL order: every symbol's bar for a
-    date is processed before any later date (ties in `bars` key order). Engines that share one
+    date is processed before any later date; same-date ties in SYMBOL NAME order (P1.5: by
+    construction, not by however the caller happened to list the basket). Engines that share one
     EquityTracker then see the candidate's whole-account equity as it stood on each date (R1).
     bars = {symbol: [bar, ...] oldest-first}; returns {symbol: [record, ...]}. Engines that do
     NOT share a tracker give the same records as driving each symbol on its own."""
-    streams = [[(b['date'], k, i, sym) for i, b in enumerate(bars[sym])] for k, sym in enumerate(bars)]
+    streams = [[(b['date'], k, i, sym) for i, b in enumerate(bars[sym])] for k, sym in enumerate(sorted(bars))]
     records = {sym: [] for sym in bars}
     for _date, _k, i, sym in heapq.merge(*streams):
         records[sym].append(engines[sym].process_bar(bars[sym][i]))
