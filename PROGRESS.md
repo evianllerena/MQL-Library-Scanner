@@ -35,7 +35,8 @@ Conventions: additive only; `nnfx_engine.py` is the source of truth; MQL5 harnes
 - Continuation E6 default `vp_c2`: C2 flips back to the trade direction AND C1 currently on-side;
   ignores volume + 1xATR; sequence must be unbroken since entry. [USER-CONFIRMED]. Also `lesson11`
   (exit indicator as the signal) and `c1_signal` (legacy) as settings.
-- Exits: X1 (SL 1.5xATR, TP1 1xATR on half, breakeven, then trail) · X2 (exit indicator vs own
+- Exits: X1 (SL 1.5xATR, TP1 1xATR on half, breakeven, then trail; a D1 bar touching both SL and TP1
+  is resolved stop-first, the worse case, since the intrabar order is unknown) · X2 (exit indicator vs own
   zero_reference) · X3 (C1 flip) · X4 (wrong-side baseline close) · X5 (news; close if losing OR
   profit < 1xATR). [X5 cutoff USER-CONFIRMED]
 - Trailing T4: activates once a close is >= 2xATR beyond entry (ATR fixed at entry), then trails

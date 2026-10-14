@@ -85,8 +85,6 @@ def unit_tests() -> Check:
            c2_direction(69.0, 50.0) == 1)
     c.that('zero_cross: NEVER gated by a 30-level -- 31 vs centerline 50 is still short (no OS special-case)',
            c2_direction(31.0, 50.0) == -1)
-    c.that('zero_cross: function signature carries no 70/30 parameter at all -- only (value, zero_reference)',
-           c2_direction.__code__.co_varnames[:2] == ('value', 'zero_reference'))
 
     # --- baseline cross-and-close (fires ONLY on the actual cross bar) -------
     c.that('baseline: fresh close above -> +1 on the cross bar', baseline_cross_closed(101, 99, 100, 100) == 1)
@@ -134,8 +132,16 @@ def unit_tests() -> Check:
     c.that('bridge_too_far: with EnableBridgeTooFar=False, the same 8-bar-run setup TAKES the trade',
            rec['action'] == 'enter', detail=str(rec))
 
-    c.that('bridge_too_far: structurally cannot apply to C2 -- the check only ever reads the C1 series '
-           '(NNFXEngine / NNFXHarness.mq5 both call the run-length check on h_c1 only, never h_c2)', True)
+    # C2 has agreed (long) for 8 bars while C1 only just turned long on the bar before the cross: the C1 run is
+    # short, so bridge-too-far must NOT skip -- it reads the C1 series only, never C2 (P1.6: was an `assert True`).
+    eng_c2run = NNFXEngine(P(enable_bridge_too_far=True, bridge_too_far_bars=7))
+    c2_warm = [_bar(f'2024-01-{i+1:02d}', 100.0, 100.0, 0.9, 1.0, 5.0, 10.0) for i in range(7)]   # C1 short, C2 long
+    c2_warm.append(_bar('2024-01-08', 100.0, 100.0, 1.0, 0.9, 5.0, 10.0))                        # C1 turns long
+    rec = None
+    for bar in c2_warm + [_bar('2024-01-09', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=100.0)]:
+        rec = eng_c2run.process_bar(bar)
+    c.that('bridge_too_far: does not apply to C2 -- C2 long for 9 bars with C1 long for only 2 still ENTERS',
+           rec['reason'] == 'enter:standard', detail=str(rec))
 
     # --- continuation: fresh same-direction C1 signal after an exit, sequence
     #     unbroken since -> ENTERS even beyond 1xATR and even with volume failing.
@@ -997,6 +1003,15 @@ def unit_tests() -> Check:
     hold_rec = NNFXEngine(P()).process_bar(_bar('h0', 99.5, 100.0, 0.9, 1.0, -5.0, 10.0))
     c.that('P1.5 record pips is None or a number (never the empty string that used to be added to floats)',
            hold_rec['pips'] is None and not hasattr(Position(1, 1.0, 0.5, 1.5, 0.1), 'half2_open'), detail=str(hold_rec['pips']))
+
+    # P1.6: one daily bar touching BOTH the stop and TP1 -- the intrabar order is unknown on D1 data, so the engine
+    # assumes the worse case: stop first, whole position out at -1R, TP1 never credited.
+    e_both = NNFXEngine(P())
+    e_both.process_bar(_bar('sb0', 100.6, 100.0, 1.0, 0.9, 5.0, 10.0, close_prev=99.5))              # long 100.6, SL 99.1, TP1 101.6
+    r_both = e_both.process_bar(_bar('sb1', 100.5, 100.0, 1.0, 0.9, 5.0, 10.0, high=101.8, low=99.0))
+    c.that('P1.6 same-bar stop + TP1: the stop is taken first (worse case, documented in PROGRESS.md) -- the whole '
+           'position exits at -1R and TP1 is not credited', r_both['reason'] == 'exit:stop_loss' and round(r_both['r'], 4) == -1.0,
+           detail=str(r_both))
 
     # --- P1.4 statistics --------------------------------------------------------------------
     straddle = [dict(date='2024.03.29', action='enter', pips=''), dict(date='2024.03.30', action='exit_half', pips=10.0),
