@@ -14,6 +14,8 @@ on:
       - 'engine_core.py'
       - 'tests/**'
       - 'tools/indicator_fix/**'
+      - 'README.md'
+      - 'BUILD_WINDOWS.md'
   pull_request:
     paths:
       - 'nnfx_engine.py'
@@ -24,6 +26,8 @@ on:
       - 'engine_core.py'
       - 'tests/**'
       - 'tools/indicator_fix/**'
+      - 'README.md'
+      - 'BUILD_WINDOWS.md'
   workflow_dispatch:
 jobs:
   selftest:

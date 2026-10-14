@@ -102,10 +102,8 @@ early.
 (Historical: `build_windows.ps1` was removed in P0.7; CI builds this sidecar.)
 `build_windows.ps1` built `mql-preview-batch` via PyInstaller. Because
 `preview_batch.py` imports `preview_bridge.py`, both must sit in the folder passed
-to PyInstaller (`--paths` is set for that). Adjust the source path to match your
-build layout. **Note:** the pre-existing `mql-preview` and `mql-preview-control`
-sidecars are declared in `tauri.conf.json` but were never built by this script —
-they need their own build lines too, following the same pattern.
+to PyInstaller (`--paths` is set for that). The CI workflow (`.github/workflows/windows-beta.yml`)
+now builds all five sidecars declared in `tauri.conf.json`.
 
 ## Performance envelope (20k files)
 
