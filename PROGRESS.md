@@ -56,6 +56,14 @@ Conventions: additive only; `nnfx_engine.py` is the source of truth; MQL5 harnes
   with the legacy close fill and labelled `fill_model=close (legacy extract...)`. Part C fixtures keep
   the legacy fill explicitly (`P()`); the model has its own checks (142/142).
 
+- Leaderboard statistics (P1.4, owner decision 2026-10-14: 2A holdout). Trades belong to the scoring
+  window by entry date (halves paired). Trades entered before 2024-01-01 are in-sample, from it on
+  out-of-sample (`--holdout-from`). Ranking per slot: enough in-sample trades (>= 30) first; then
+  candidates that ALSO made money out-of-sample (`oos_pass`); then by the BOTTOM of the in-sample 95%
+  R range (`is_r_low`). The R range is a cluster bootstrap by entry month (correlated pairs), not
+  1.96 x stdev / sqrt(n). Pips drawdown is chronological across the basket; profit factor is blank
+  (not 999) with no losing trades.
+
 ## Open / STUB-TO-CONFIRM (working defaults in place; confirm against VP's videos)
 - E4 scope: implemented C1-OR-C2 symmetric. Source unclear; revisit if VP restricts it.
 - dd_resume_rule: `below_threshold` (resume when drawdown back under 10%). Confirm.

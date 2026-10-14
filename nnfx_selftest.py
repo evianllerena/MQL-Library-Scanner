@@ -783,13 +783,23 @@ def unit_tests() -> Check:
            nb.r_interval(corr) == (mean, lo, hi) and nb.r_interval(corr[:10])[1:] == (None, None)
            and nb.r_interval([]) == (0.0, None, None))
     board = nb.leaderboard_order([
-        dict(slot='BASELINE', trades=11, expectancy_r=0.096),   # higher R, but only 11 trades
-        dict(slot='BASELINE', trades=1272, expectancy_r=0.015),
-        dict(slot='BASELINE', trades=1632, expectancy_r=0.016),
-        dict(slot='CONFIRMATION_1', trades=1933, expectancy_r=0.022)])
-    c.that('Leaderboard order: within a slot by expectancy_r, best first; an insufficient sample (<30 trades) sorts '
-           'last however high its R', [(r['slot'], r['trades']) for r in board] ==
-           [('BASELINE', 1632), ('BASELINE', 1272), ('BASELINE', 11), ('CONFIRMATION_1', 1933)], detail=str(board))
+        dict(slot='BASELINE', trades=15, is_trades=11, is_r_low=0.30, oos_pass=True, expectancy_r=0.096),  # 11 trades
+        dict(slot='BASELINE', trades=900, is_trades=700, is_r_low=0.05, oos_pass=False, expectancy_r=0.09),  # fails OOS
+        dict(slot='BASELINE', trades=1272, is_trades=1000, is_r_low=0.01, oos_pass=True, expectancy_r=0.015),
+        dict(slot='BASELINE', trades=1632, is_trades=1300, is_r_low=0.02, oos_pass=True, expectancy_r=0.012),
+        dict(slot='BASELINE', trades=800, is_trades=600, is_r_low=None, oos_pass=True, expectancy_r=0.2),   # no range
+        dict(slot='CONFIRMATION_1', trades=1933, is_trades=1500, is_r_low=-0.01, oos_pass=True, expectancy_r=0.022)])
+    c.that('Leaderboard order (P1.4): within a slot, OOS-passing candidates by the BOTTOM of the in-sample R range '
+           '(0.02 before 0.01 even though its average is lower), then a row with no range, then one that lost money '
+           'out-of-sample however good in-sample, then insufficient in-sample samples (<30) however high their R',
+           [(r['slot'], r['trades']) for r in board] ==
+           [('BASELINE', 1632), ('BASELINE', 1272), ('BASELINE', 800), ('BASELINE', 900), ('BASELINE', 15),
+            ('CONFIRMATION_1', 1933)], detail=str([r['trades'] for r in board]))
+    hs = nb.holdout_stats([{'entry_date': '2023.12.29', 'r': 1.0}, {'entry_date': '2023.11.02', 'r': -0.5},
+                           {'entry_date': '2024.01.02', 'r': -0.2}, {'entry_date': '2024.02.05', 'r': 0.1}])
+    c.that('P1.4 holdout (owner 2A): trades entered before 2024.01.01 are in-sample (2 trades, +0.25R), from it on '
+           'out-of-sample (2 trades, -0.05R -> oos_pass False)', (hs['is_trades'], hs['is_expectancy_r'],
+           hs['oos_trades'], hs['oos_expectancy_r'], hs['oos_pass']) == (2, 0.25, 2, -0.05, False), detail=str(hs))
 
     # --- P1.7 / P1.3 / P1.1 execution model: next-open fills, gap fills, trading costs -----------
     # Long setup on 'x0' (cross above 100.0, C1+C2 long, within 1xATR, ATR 1.0, pip_size 1.0).
