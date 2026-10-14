@@ -5,7 +5,6 @@ import { getVersion } from '@tauri-apps/api/app';
 
 
 let previewToken=0;
-let previewTimer=null;
 let activeJob=null;
 let cancellationBarrier=Promise.resolve();
 let desiredSource=null;
@@ -43,11 +42,6 @@ function detailSource(){
     if(section.querySelector('.label')?.textContent?.trim()==='File')return section.querySelector('.value')?.textContent?.trim()||null;
   }
   return null;
-}
-
-function newJobId(){
-  try{return crypto.randomUUID().replace(/[^A-Za-z0-9_.-]/g,'-');}
-  catch{return `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;}
 }
 
 function currentPreviewCard(source){
@@ -126,7 +120,6 @@ function queueCancellation(reason){
 function invalidatePreview(reason){
   desiredSource=null;
   previewToken++;
-  if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
   return queueCancellation(reason);
 }
 
@@ -146,7 +139,6 @@ window.addEventListener('mql-batch-preview-result',event=>{
   if(!result.source||detailSource()!==result.source||!result.image)return;
   desiredSource=null;
   previewToken++;
-  if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
   setPreviewState(result.source,{
     phase:'success',
     kind:result.kind||'MT5',
@@ -231,7 +223,6 @@ function injectPreview(){
       detail.dataset.previewError='';
       desiredSource=null;
       previewToken++;
-      if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
       previewState={
         source,
         phase:cachedPath?'success':'pending',
@@ -261,7 +252,6 @@ function injectPreview(){
 
   desiredSource=null;
   previewToken++;
-  if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}
   const queueStatus=detail.dataset.previewStatus||'pending';
   const queueError=detail.dataset.previewError||'';
   previewState={

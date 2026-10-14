@@ -917,7 +917,7 @@ fn db_backtest_query(db_path:String, slot:String, bed:String, search:String, min
         "CASE WHEN COALESCE(bt.is_trades,bt.trades)>=? THEN 0 ELSE 1 END, COALESCE(bt.oos_pass,0) DESC, \
          (bt.is_r_low IS NULL), bt.is_r_low DESC".to_string()
     } else {
-        format!("CASE WHEN bt.trades>=? THEN 0 ELSE 1 END, {}", backtest_sort_sql(sort_key,sort_dir.as_deref().unwrap_or("desc")))
+        format!("CASE WHEN COALESCE(bt.is_trades,bt.trades)>=? THEN 0 ELSE 1 END, {}", backtest_sort_sql(sort_key,sort_dir.as_deref().unwrap_or("desc")))
     };
     let sql=format!(
         "SELECT bt.id,bt.sha256,bt.slot,bt.signal_type,bt.bed,bt.stage,bt.trades,bt.wins,bt.losses,bt.win_rate,\

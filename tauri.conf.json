@@ -29,7 +29,7 @@
         "scope": [
           "$APPDATA/previews/*",
           "$APPDATA/previews/**",
-          "$APPDATA/selftest/*"
+          "$APPDATA/selftest/*.png"
         ]
       }
     }
