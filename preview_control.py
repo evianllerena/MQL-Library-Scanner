@@ -112,9 +112,18 @@ def remove_item(item:Path):
     return last
 
 
+APP_ID='com.mqlindicatorlibrary.app'   # tauri.conf.json "identifier" = the app data folder's name
+DB_NAME='library.sqlite3'
+
+
 def clear_app(db:str):
     p=Path(db).resolve()
     app=p.parent
+    # P2 safety: this deletes EVERYTHING in the --db file's folder. Only ever do that to the app's own
+    # data folder (<appDataDir>/library.sqlite3, folder named after the app identifier); a mis-passed
+    # --db must not wipe an arbitrary directory.
+    if p.name!=DB_NAME or app.name!=APP_ID:
+        raise RuntimeError(f'refusing to clear {app}: --db must be {APP_ID}{os.sep}{DB_NAME} (got {p})')
     failed=[]
 
     conn=None
@@ -150,6 +159,16 @@ def clear_app(db:str):
     })
 
 
+def _refuses_foreign_folder():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        keep=Path(d)/'keep.txt'; keep.write_text('x')
+        try:
+            clear_app(str(Path(d)/DB_NAME)); return False
+        except RuntimeError:
+            return keep.exists()
+
+
 def self_test():
     checks={
         'taskkill_available':True if os.name!='nt' else bool(subprocess.run(
@@ -157,6 +176,7 @@ def self_test():
             creationflags=CREATE_NO_WINDOW
         ).returncode==0),
         'clear_scoped_to_db_parent':True,
+        'clear_refuses_foreign_folder':_refuses_foreign_folder(),
         'cancel_verifies_process_exit':False
     }
     proc=None

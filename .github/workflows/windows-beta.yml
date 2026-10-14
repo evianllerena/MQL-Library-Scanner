@@ -244,7 +244,7 @@ jobs:
           $s | ForEach-Object {Write-Host $_}
           if($LASTEXITCODE -ne 0 -or ($s -join "`n") -notmatch 'scan_complete'){throw 'Packaged scanner validation failed'}
 
-          $clearRoot=Join-Path $env:RUNNER_TEMP 'mql-clear-test'
+          $clearRoot=Join-Path $env:RUNNER_TEMP 'com.mqlindicatorlibrary.app'
           $outside=Join-Path $env:RUNNER_TEMP 'source-file-must-survive.mq5'
           Remove-Item $clearRoot -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item $outside -Force -ErrorAction SilentlyContinue
@@ -257,6 +257,11 @@ jobs:
           if($LASTEXITCODE -ne 0 -or ($clear -join "`n") -notmatch '"ok": true'){throw 'Clear application control failed'}
           if((Get-ChildItem $clearRoot -Force | Measure-Object).Count -ne 0){throw 'Clear application left app data behind'}
           if(-not(Test-Path $outside)){throw 'Clear application touched a source file outside app data'}
+          $foreign=Join-Path $env:RUNNER_TEMP 'not-the-app-folder'
+          New-Item -ItemType Directory -Force -Path $foreign | Out-Null
+          'keep' | Set-Content "$foreign/keep.txt"
+          $refused=& 'build-sidecar/mql-preview-control.exe' clear-app --db "$foreign/library.sqlite3" 2>&1
+          if($LASTEXITCODE -eq 0 -or -not(Test-Path "$foreign/keep.txt")){throw 'Clear application must refuse a folder that is not the app data folder'}
 
       - name: Install frontend dependencies
         shell: pwsh
