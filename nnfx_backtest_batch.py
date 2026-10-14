@@ -682,6 +682,14 @@ def closed_trades(records):
     return out
 
 
+def profit_factor_of(pips):
+    """Gross wins / gross losses. Undefined (None: blank in the CSV, NULL in the DB) when there are no
+    losing trades -- the old 999.0 stand-in looked like a real, huge number on small samples."""
+    gains = sum(t for t in pips if t > 0)
+    loss_sum = -sum(t for t in pips if t < 0)
+    return round(gains / loss_sum, 2) if loss_sum > 0 else None
+
+
 def max_drawdown_pips(dated):
     """Largest peak-to-trough fall (<= 0) of cumulative pips over the basket's trades in EXIT-DATE
     order (ties by symbol). Concatenating each symbol's trades, as before P1.4, is not a curve anyone
@@ -735,9 +743,7 @@ def _score_run(symbols, prepared, enable_dd_breaker, score_from=DEFAULT_HISTORY_
     losses = sum(1 for t in pooled_trades if t < 0)
     win_rate = round(100 * wins / n, 1) if n else 0.0
     expectancy = round(sum(pooled_trades) / n, 2) if n else 0.0
-    gains = sum(t for t in pooled_trades if t > 0)
-    loss_sum = -sum(t for t in pooled_trades if t < 0)
-    profit_factor = round(gains / loss_sum, 2) if loss_sum > 0 else (999.0 if gains > 0 else 0.0)
+    profit_factor = profit_factor_of(pooled_trades)
     maxdd = max_drawdown_pips(dated)
     exp_r, ci_r = r_stats(pooled_r)
     return dict(trades=n, wins=wins, losses=losses, win_rate=win_rate, expectancy_pips=expectancy,

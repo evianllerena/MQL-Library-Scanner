@@ -892,6 +892,9 @@ def unit_tests() -> Check:
                                ('2024.01.02', 'EURUSD', -15.0), ('2024.01.04', 'EURUSD', -15.0)])
     c.that('P1.4 pips drawdown in date order: +10, -15, +10, -15 across two pairs is -20 from the +10 peak '
            '(per-pair concatenation +10, +10, -15, -15 would say -30)', dd == -20.0, detail=str(dd))
+    c.that('P1.4 profit factor: gross wins / gross losses (30/10 = 3.0); undefined (None) with no losing trade '
+           'or no trades -- never the old 999.0 stand-in', nb.profit_factor_of([20.0, 10.0, -10.0]) == 3.0
+           and nb.profit_factor_of([5.0, 7.0]) is None and nb.profit_factor_of([]) is None)
     c.that('P1.1 batch costs (owner choice 1B): majors 1.0 spread + 0.7 commission = 1.7 pips round trip, '
            'crosses 2.0 + 0.7 = 2.7', nb.round_trip_cost_pips('EURUSD') == 1.7 and nb.round_trip_cost_pips('USDJPY') == 1.7
            and nb.round_trip_cost_pips('EURGBP') == 2.7 and nb.round_trip_cost_pips('CADJPY') == 2.7)
