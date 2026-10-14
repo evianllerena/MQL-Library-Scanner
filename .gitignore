@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 *.ex5
 nnfx_selftest_output/
+# local build outputs (P2: the repo is the Tauri project)
+engine/
+dist/
+node_modules/
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/icons/
+build-sidecar/
+build-pyinstaller*/

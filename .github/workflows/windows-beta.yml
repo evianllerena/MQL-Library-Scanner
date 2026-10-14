@@ -7,7 +7,6 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/windows-beta.yml'
-      - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
       - 'mql_text.py'
@@ -17,22 +16,14 @@ on:
       - 'nnfx_backtest_batch.py'
       - 'nnfx_engine.py'
       - 'nnfx_selftest.py'
-      - 'main.js'
-      - 'preview_ui.js'
       - 'index.html'
-      - 'styles.css'
-      - 'Cargo.toml'
-      - 'lib.rs'
-      - 'main.rs'
-      - 'default.json'
       - 'package.json'
-      - 'tauri.conf.json'
-      - 'windows/**'
+      - 'ui/**'
+      - 'src-tauri/**'
   push:
     branches: [main]
     paths:
       - '.github/workflows/windows-beta.yml'
-      - 'MQL-Indicator-Library-Repo-Ready.zip'
       - 'engine.py'
       - 'engine_core.py'
       - 'mql_text.py'
@@ -42,17 +33,10 @@ on:
       - 'nnfx_backtest_batch.py'
       - 'nnfx_engine.py'
       - 'nnfx_selftest.py'
-      - 'main.js'
-      - 'preview_ui.js'
       - 'index.html'
-      - 'styles.css'
-      - 'Cargo.toml'
-      - 'lib.rs'
-      - 'main.rs'
-      - 'default.json'
       - 'package.json'
-      - 'tauri.conf.json'
-      - 'windows/**'
+      - 'ui/**'
+      - 'src-tauri/**'
 
 concurrency:
   group: windows-beta-${{ github.ref }}
@@ -65,44 +49,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract baseline
+      - name: Stage the Python engine
         shell: pwsh
         run: |
-          $work=Join-Path $env:RUNNER_TEMP 'mql-indicator-library-build'
-          if(Test-Path $work){Remove-Item -Recurse -Force $work}
-          New-Item -ItemType Directory -Force -Path $work | Out-Null
-          Expand-Archive 'MQL-Indicator-Library-Repo-Ready.zip' $work -Force
-          $app=Get-ChildItem $work -Directory | Select-Object -First 1
-          if(-not $app){throw 'Baseline app folder missing'}
-          "APP_DIR=$($app.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Apply repo source
-        shell: pwsh
-        run: |
+          # P2: the repo IS the Tauri project (ui/, src-tauri/, index.html, package.json); only the Python
+          # sidecar sources, which live at the repo root, are staged into engine/ for PyInstaller.
           $r=$env:GITHUB_WORKSPACE
-          Set-Location $env:APP_DIR
-          Copy-Item "$r/engine.py" 'engine/engine.py' -Force
-          Copy-Item "$r/engine_core.py" 'engine/engine_core.py' -Force
-          Copy-Item "$r/mql_text.py" 'engine/mql_text.py' -Force
-          Copy-Item "$r/requirements-build.txt" 'engine/requirements-build.txt' -Force
-          Copy-Item "$r/preview_bridge.py" 'engine/preview_bridge.py' -Force
-          Copy-Item "$r/preview_control.py" 'engine/preview_control.py' -Force
-          Copy-Item "$r/nnfx_backtest_batch.py" 'engine/nnfx_backtest_batch.py' -Force
-          Copy-Item "$r/nnfx_engine.py" 'engine/nnfx_engine.py' -Force
-          Copy-Item "$r/nnfx_selftest.py" 'engine/nnfx_selftest.py' -Force
-          Copy-Item "$r/main.js" 'ui/main.js' -Force
-          Copy-Item "$r/preview_ui.js" 'ui/preview_ui.js' -Force
-          Copy-Item "$r/index.html" 'index.html' -Force
-          Copy-Item "$r/styles.css" 'ui/styles.css' -Force
-          Copy-Item "$r/Cargo.toml" 'src-tauri/Cargo.toml' -Force
-          Copy-Item "$r/lib.rs" 'src-tauri/src/lib.rs' -Force
-          Copy-Item "$r/main.rs" 'src-tauri/src/main.rs' -Force
-          Copy-Item "$r/default.json" 'src-tauri/capabilities/default.json' -Force
-          Copy-Item "$r/package.json" 'package.json' -Force
-          Copy-Item "$r/tauri.conf.json" 'src-tauri/tauri.conf.json' -Force
-          if(Test-Path "$r/windows"){
-            New-Item -ItemType Directory -Force -Path 'src-tauri/windows' | Out-Null
-            Copy-Item "$r/windows/*" 'src-tauri/windows/' -Force
+          "APP_DIR=$r" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path "$r/engine" | Out-Null
+          foreach($f in 'engine.py','engine_core.py','mql_text.py','requirements-build.txt','preview_bridge.py','preview_control.py','nnfx_backtest_batch.py','nnfx_engine.py','nnfx_selftest.py'){
+            Copy-Item "$r/$f" "$r/engine/$f" -Force
           }
 
       - uses: actions/setup-python@v5
