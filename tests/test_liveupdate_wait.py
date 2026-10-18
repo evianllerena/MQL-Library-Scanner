@@ -65,7 +65,8 @@ class WaitFollowsLiveUpdateRelaunch(unittest.TestCase):
                   ['C:\\Program Files\\MetaTrader 5\\terminal64.exe']),
             _Proc(4, 'notepad.exe', rts + '\\notepad.exe', []),
         ]
-        with mock.patch('psutil.process_iter', return_value=procs):
+        fake_psutil = mock.Mock(process_iter=mock.Mock(return_value=procs))  # CI's Linux job has no psutil
+        with mock.patch.dict(sys.modules, {'psutil': fake_psutil}):
             self.assertEqual(sorted(p.pid for p in nb._runtime_terminals(rt)), [1, 2])
 
 
