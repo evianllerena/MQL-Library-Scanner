@@ -463,11 +463,14 @@ _PLOT_BUFFERS = {
 _LINE_TYPES = ('DRAW_LINE', 'DRAW_COLOR_LINE', 'DRAW_SECTION', 'DRAW_ZIGZAG')
 
 
-def plot_line_buffers(plot_decls, logic: str) -> set[int]:
-    """Buffer index of the value buffer of every line plot declared by plot index (P2 follow-up).
-    A plot is resolved only when every plot before it has a known draw type; an index the file itself
-    binds as INDICATOR_COLOR_INDEX or INDICATOR_CALCULATIONS is dropped. Treating plot N as buffer N
-    picked SHL_MA_Band's histogram + colour buffers (1, 2) instead of its two lines (3, 4)."""
+def plot_line_buffers(plot_decls, logic: str, declared_plots: int = 0) -> set[int]:
+    """Buffer index of the value buffer of every MQL5 line plot declared by plot index (P2 follow-up).
+    A plot is resolved only when every plot before it has a known draw type, and only below
+    `#property indicator_plots` when that is declared (higher plots are never drawn). Plots bind to
+    buffers by position whatever the buffer kind, so a line on an INDICATOR_CALCULATIONS buffer is kept;
+    a line start the file binds as INDICATOR_COLOR_INDEX means the layout does not match the table, so
+    resolution stops there. Treating plot N as buffer N picked SHL_MA_Band's histogram + colour buffers
+    (1, 2) instead of its two lines (3, 4)."""
     types = {}
     for idx_s, t in plot_decls:
         idx_s = idx_s.strip()
@@ -475,12 +478,17 @@ def plot_line_buffers(plot_decls, logic: str) -> set[int]:
             types.setdefault(int(idx_s), t.upper())
     kinds = {int(i): k.upper() for i, k in re.findall(
         r'SetIndexBuffer\s*\(\s*(\d+)\s*,[^,;)]+,\s*(INDICATOR_DATA|INDICATOR_COLOR_INDEX|INDICATOR_CALCULATIONS)', logic, re.I)}
+    last = max(types) + 1 if types else 0
+    if declared_plots:
+        last = min(last, declared_plots)
     out, start = set(), 0
-    for plot in range(max(types) + 1 if types else 0):
+    for plot in range(last):
         t = types.get(plot)
         if t not in _PLOT_BUFFERS:
             break  # unknown or undeclared plot type: later plots' buffers cannot be located
-        if t in _LINE_TYPES and kinds.get(start, 'INDICATOR_DATA') == 'INDICATOR_DATA':
+        if t in _LINE_TYPES:
+            if kinds.get(start) == 'INDICATOR_COLOR_INDEX':
+                break
             out.add(start)
         start += _PLOT_BUFFERS[t]
     return out
@@ -516,11 +524,13 @@ def analyze(path: Path) -> Analysis:
     # indices are mapped to buffer indices by plot_line_buffers(). Sorted
     # ascending: ascending buffer index is the near-universal plot-stacking convention.
     line_idx=set()
-    for idx_s,t in style_calls:  # MQL4 SetIndexStyle: the index IS the buffer index
+    # MQL4: SetIndexStyle's index and indicator_typeN-1 ARE buffer indices (one buffer per plot)
+    for idx_s,t in style_calls+(prop_calls if platform=='MQL4' else []):
         if t.upper() not in ('DRAW_LINE','DRAW_COLOR_LINE','DRAW_SECTION','DRAW_ZIGZAG'): continue
         idx_s=idx_s.strip()
         if re.fullmatch(r'\d+',idx_s): line_idx.add(int(idx_s))
-    line_idx|=plot_line_buffers(prop_calls+plot_calls,logic)
+    if platform=='MQL5':
+        line_idx|=plot_line_buffers(prop_calls+plot_calls,logic,a.declared_plots or 0)
     a.line_buffer_indices=sorted(line_idx)
     a.object_usage=bool(re.search(r'ObjectCreate\s*\(|OBJ_(?:HLINE|VLINE|TREND|RECTANGLE|TEXT|LABEL|ARROW|FIBO)',logic,re.I))
     stds=[]

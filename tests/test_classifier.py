@@ -83,10 +83,10 @@ int OnInit(){
 class PlotIndexIsNotBufferIndex(unittest.TestCase):
     """MQL5 numbers plots, not buffers: a colour/two-value/filling plot uses several buffers."""
 
-    def _indices(self, src):
+    def _indices(self, src, ext='.mq5'):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / 'x.mq5'
+            p = Path(d) / ('x' + ext)
             p.write_text(src, encoding='utf-8')
             return engine_core.analyze(p).line_buffer_indices
 
@@ -106,6 +106,28 @@ class PlotIndexIsNotBufferIndex(unittest.TestCase):
     def test_unknown_earlier_plot_leaves_later_lines_unresolved(self):
         src = '#property indicator_type1 DRAW_LINE\n#property indicator_type3 DRAW_LINE\n'
         self.assertEqual(self._indices(src), [0])
+
+    def test_line_on_a_calculations_buffer_is_still_drawn(self):
+        # plots bind to buffers by position whatever the buffer kind (ADXm_smoothed's DI line)
+        src = ('#property indicator_plots 2\n#property indicator_type1 DRAW_LINE\n#property indicator_type2 DRAW_LINE\n'
+               'void f(){SetIndexBuffer(0,a,INDICATOR_CALCULATIONS);SetIndexBuffer(1,b,INDICATOR_DATA);}\n')
+        self.assertEqual(self._indices(src), [0, 1])
+
+    def test_type_properties_beyond_indicator_plots_are_not_drawn(self):
+        src = ('#property indicator_plots 1\n#property indicator_type1 DRAW_LINE\n#property indicator_type2 DRAW_LINE\n')
+        self.assertEqual(self._indices(src), [0])
+
+    def test_color_index_at_a_line_start_stops_resolution(self):
+        # the file disagrees with the buffers-per-type table: later starts cannot be trusted
+        src = ('#property indicator_plots 3\n#property indicator_type1 DRAW_LINE\n#property indicator_type2 DRAW_LINE\n'
+               '#property indicator_type3 DRAW_LINE\n'
+               'void f(){SetIndexBuffer(0,a,INDICATOR_DATA);SetIndexBuffer(1,c,INDICATOR_COLOR_INDEX);SetIndexBuffer(2,b,INDICATOR_DATA);}\n')
+        self.assertEqual(self._indices(src), [0])
+
+    def test_mql4_type_property_is_the_buffer_index(self):
+        # MQL4: one buffer per plot, and gaps in typeN numbering are normal
+        src = '#property indicator_type1 DRAW_LINE\n#property indicator_type11 DRAW_LINE\n'
+        self.assertEqual(self._indices(src, '.mq4'), [0, 10])
 
     def test_mql4_setindexstyle_index_is_the_buffer_index(self):
         self.assertEqual(self._indices('void f(){SetIndexStyle(0,DRAW_HISTOGRAM);SetIndexStyle(1,DRAW_LINE);}\n'), [1])
