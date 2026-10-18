@@ -707,18 +707,60 @@ def _read_jsonl(path):
             pass
     return out
 
-def _wait_batch(files_dir, proc, timeout):
+def _runtime_terminals(rt):
+    """MT5 processes running from, or updating, the private runtime `rt`. MT5 LiveUpdate shuts the
+    launched terminal down ~1 min in, runs liveupdate\\terminal64.exe /update /path:<rt>, then relaunches
+    <rt>\\terminal64.exe with the same /config -- neither is a child of our Popen. The owner's own terminal
+    (another folder, no <rt> on its command line) never matches."""
+    try:
+        import psutil
+    except Exception:
+        return []
+    rd = str(Path(rt).resolve()).lower().rstrip('\\/')
+    out = []
+    for p in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
+        try:
+            if str(p.info.get('name') or '').lower() not in ('terminal64.exe', 'terminal.exe'):
+                continue
+            exe = str(p.info.get('exe') or '').lower()
+            cmd = ' '.join(p.info.get('cmdline') or []).lower()
+            if exe.startswith(rd + os.sep) or rd in cmd:
+                out.append(p)
+        except Exception:
+            pass
+    return out
+
+
+def _wait_batch(files_dir, proc, timeout, rt=None, relaunch_grace=90):
+    """True when the controller wrote its done flag. If the launched terminal exits first, an MT5
+    LiveUpdate relaunch of the same runtime carries on the session, so wait for that instead of
+    declaring a timeout (seen 2026-10-18 when build 6272 shipped: every session died ~1 min in)."""
     done = files_dir / 'nnfx_batch_done.flag'
     end = time.monotonic() + timeout
     last = -1
+    exited_at = None
+    relaunch_seen = False
     while time.monotonic() < end:
         pb.hide_pid(proc.pid)
         res = _read_jsonl(files_dir / 'nnfx_batch_results.jsonl')
         if len(res) != last:
             last = len(res)
             stage_event('batch_progress', events=last)
-        if done.exists() or (proc.poll() is not None):
+        if done.exists():
             break
+        if proc.poll() is not None:
+            others = _runtime_terminals(rt) if rt is not None else []
+            if others:
+                if not relaunch_seen:
+                    relaunch_seen = True
+                    stage_event('mt5_relaunched', pids=[o.pid for o in others])
+                for o in others:
+                    pb.hide_pid(o.pid)
+                exited_at = None
+            else:
+                exited_at = exited_at or time.monotonic()
+                if rt is None or time.monotonic() - exited_at > relaunch_grace:
+                    break
         time.sleep(1.0)
     return done.exists()
 
@@ -1201,13 +1243,18 @@ def _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_
         # ceiling: ~20 s per candidate per pair, + 2 time limits per candidate (strikes), + up to
         # 2.5 min per symbol for the controller's history download/sync
         n_jobs = len(job_json['jobs'])
-        finished = _wait_batch(files_dir, proc, timeout=max(180, 20 * n_jobs * len(symbols)
+        finished = _wait_batch(files_dir, proc, rt=rt, timeout=max(180, 20 * n_jobs * len(symbols)
                                                             + 2 * job_timeout * n_jobs + 150 * len(symbols)
                                                             # P1.2 repaint pass: queue check + 2 loads per job,
                                                             # 3 control runs, custom-symbol setup
                                                             + (60 + 2 * job_timeout) * n_jobs + 6 * job_timeout + 60))
     finally:
         pb.terminate_tree(proc)
+        for other in _runtime_terminals(rt):  # an MT5 LiveUpdate relaunch is not in proc's tree
+            try:
+                other.kill()
+            except Exception:
+                pass
     if not finished:
         stage_event('batch_timeout')
 
