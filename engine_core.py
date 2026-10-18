@@ -50,11 +50,12 @@ class Analysis:
     evidence: list[dict] = field(default_factory=list)
     classification_status: str = 'Unknown'
     review_reason: str = ''
-    classifier_version: str = 'evidence-v7'  # v5: adds line_buffer_indices (NNFX Part B needs real
+    classifier_version: str = 'evidence-v8'  # v5: adds line_buffer_indices (NNFX Part B needs real
                                               # buffer indices, not a 0/1 guess -- see nnfx_slot_signal)
                                               # v6 (P2): volume/OB-OS evidence and string-aware comment
                                               # stripping changed, so every file is re-analyzed once
                                               # v7: converter MQL4_iVolume()/MQL4_iOBV() calls count as volume
+                                              # v8: line_buffer_indices map MQL5 plots to buffers
     confidence: int = 0
     warnings: list[str] = field(default_factory=list)
     duplicate_of: str | None = None
@@ -450,6 +451,49 @@ def classify(filename: str, logic: str, stds: list[str], a: Analysis):
         reason='Some functional evidence exists, but it is insufficient for a definitive standard category'
     return primary,secondary,sorted(set(tags)),sorted(set(techniques)),evidence,confidence,status,reason
 
+# MQL5 buffers per plot by draw type. Plots consume buffers in order, so a plot's first buffer is the
+# sum over the plots before it; `#property indicator_typeN` and PlotIndexSetInteger(N, PLOT_DRAW_TYPE)
+# number PLOTS, not buffers.
+_PLOT_BUFFERS = {
+    'DRAW_NONE': 1, 'DRAW_LINE': 1, 'DRAW_SECTION': 1, 'DRAW_HISTOGRAM': 1, 'DRAW_ARROW': 1,
+    'DRAW_HISTOGRAM2': 2, 'DRAW_ZIGZAG': 2, 'DRAW_FILLING': 2, 'DRAW_BARS': 4, 'DRAW_CANDLES': 4,
+    'DRAW_COLOR_LINE': 2, 'DRAW_COLOR_SECTION': 2, 'DRAW_COLOR_HISTOGRAM': 2, 'DRAW_COLOR_ARROW': 2,
+    'DRAW_COLOR_HISTOGRAM2': 3, 'DRAW_COLOR_ZIGZAG': 3, 'DRAW_COLOR_BARS': 5, 'DRAW_COLOR_CANDLES': 5,
+}
+_LINE_TYPES = ('DRAW_LINE', 'DRAW_COLOR_LINE', 'DRAW_SECTION', 'DRAW_ZIGZAG')
+
+
+def plot_line_buffers(plot_decls, logic: str, declared_plots: int = 0) -> set[int]:
+    """Buffer index of the value buffer of every MQL5 line plot declared by plot index (P2 follow-up).
+    A plot is resolved only when every plot before it has a known draw type, and only below
+    `#property indicator_plots` when that is declared (higher plots are never drawn). Plots bind to
+    buffers by position whatever the buffer kind, so a line on an INDICATOR_CALCULATIONS buffer is kept;
+    a line start the file binds as INDICATOR_COLOR_INDEX means the layout does not match the table, so
+    resolution stops there. Treating plot N as buffer N picked SHL_MA_Band's histogram + colour buffers
+    (1, 2) instead of its two lines (3, 4)."""
+    types = {}
+    for idx_s, t in plot_decls:
+        idx_s = idx_s.strip()
+        if re.fullmatch(r'\d+', idx_s):
+            types.setdefault(int(idx_s), t.upper())
+    kinds = {int(i): k.upper() for i, k in re.findall(
+        r'SetIndexBuffer\s*\(\s*(\d+)\s*,[^,;)]+,\s*(INDICATOR_DATA|INDICATOR_COLOR_INDEX|INDICATOR_CALCULATIONS)', logic, re.I)}
+    last = max(types) + 1 if types else 0
+    if declared_plots:
+        last = min(last, declared_plots)
+    out, start = set(), 0
+    for plot in range(last):
+        t = types.get(plot)
+        if t not in _PLOT_BUFFERS:
+            break  # unknown or undeclared plot type: later plots' buffers cannot be located
+        if t in _LINE_TYPES:
+            if kinds.get(start) == 'INDICATOR_COLOR_INDEX':
+                break
+            out.add(start)
+        start += _PLOT_BUFFERS[t]
+    return out
+
+
 def analyze(path: Path) -> Analysis:
     text=normalize_newlines(read_text(path)); code=strip_comments(text)
     platform='MQL5' if path.suffix.lower()=='.mq5' else 'MQL4'
@@ -474,15 +518,19 @@ def analyze(path: Path) -> Analysis:
     types=[t.upper() for _,t in style_calls]+[t.upper() for _,t in prop_calls]+[t.upper() for _,t in plot_calls]
     a.line_plots=sum(t in ('DRAW_LINE','DRAW_COLOR_LINE','DRAW_SECTION','DRAW_ZIGZAG') for t in types); a.histogram_plots=sum(t in ('DRAW_HISTOGRAM','DRAW_HISTOGRAM2') for t in types); a.arrow_plots=sum(t in ('DRAW_ARROW','DRAW_COLOR_ARROW') for t in types); a.filling_plots=sum(t=='DRAW_FILLING' for t in types)
     # Which buffer INDEX is each line plot -- not just how many exist. Only trusted when the
-    # index argument is a literal integer (#property indicator_typeN always is: N-1; a
+    # index argument is a literal integer (#property indicator_typeN always is: plot N-1; a
     # SetIndexStyle/PlotIndexSetInteger call is only usable when its own index arg is a literal,
-    # not a variable/expression -- those are left unresolved rather than guessed at). Sorted
+    # not a variable/expression -- those are left unresolved rather than guessed at). MQL5 plot
+    # indices are mapped to buffer indices by plot_line_buffers(). Sorted
     # ascending: ascending buffer index is the near-universal plot-stacking convention.
     line_idx=set()
-    for idx_s,t in style_calls+prop_calls+plot_calls:
+    # MQL4: SetIndexStyle's index and indicator_typeN-1 ARE buffer indices (one buffer per plot)
+    for idx_s,t in style_calls+(prop_calls if platform=='MQL4' else []):
         if t.upper() not in ('DRAW_LINE','DRAW_COLOR_LINE','DRAW_SECTION','DRAW_ZIGZAG'): continue
         idx_s=idx_s.strip()
         if re.fullmatch(r'\d+',idx_s): line_idx.add(int(idx_s))
+    if platform=='MQL5':
+        line_idx|=plot_line_buffers(prop_calls+plot_calls,logic,a.declared_plots or 0)
     a.line_buffer_indices=sorted(line_idx)
     a.object_usage=bool(re.search(r'ObjectCreate\s*\(|OBJ_(?:HLINE|VLINE|TREND|RECTANGLE|TEXT|LABEL|ARROW|FIBO)',logic,re.I))
     stds=[]

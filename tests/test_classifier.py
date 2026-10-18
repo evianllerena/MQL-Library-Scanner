@@ -59,7 +59,78 @@ class OverboughtOversold(unittest.TestCase):
 class ClassifierVersion(unittest.TestCase):
     def test_bumped_so_existing_libraries_are_reanalyzed(self):
         # engine.unchanged() skips files whose stored classifier_version matches
-        self.assertEqual(engine_core.Analysis.classifier_version, 'evidence-v7')
+        self.assertEqual(engine_core.Analysis.classifier_version, 'evidence-v8')
+
+
+SHL_LIKE = """#property indicator_separate_window
+#property indicator_buffers 9
+#property indicator_plots   3
+#property indicator_type1   DRAW_COLOR_HISTOGRAM2
+#property indicator_type2   DRAW_LINE
+#property indicator_type3   DRAW_LINE
+int OnInit(){
+   SetIndexBuffer(0,BufferHIST1,INDICATOR_DATA);
+   SetIndexBuffer(1,BufferHIST2,INDICATOR_DATA);
+   SetIndexBuffer(2,BufferHISTColors,INDICATOR_COLOR_INDEX);
+   SetIndexBuffer(3,BufferH,INDICATOR_DATA);
+   SetIndexBuffer(4,BufferL,INDICATOR_DATA);
+   SetIndexBuffer(5,BufferMAH,INDICATOR_CALCULATIONS);
+   return(INIT_SUCCEEDED);
+}
+"""
+
+
+class PlotIndexIsNotBufferIndex(unittest.TestCase):
+    """MQL5 numbers plots, not buffers: a colour/two-value/filling plot uses several buffers."""
+
+    def _indices(self, src, ext='.mq5'):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / ('x' + ext)
+            p.write_text(src, encoding='utf-8')
+            return engine_core.analyze(p).line_buffer_indices
+
+    def test_lines_after_a_color_histogram2_plot(self):
+        # SHL_MA_Band (F:\\True MQL5): the lines are buffers 3 and 4, not the histogram (1) + colour (2)
+        self.assertEqual(self._indices(SHL_LIKE), [3, 4])
+
+    def test_lines_after_a_filling_plot(self):
+        src = SHL_LIKE.replace('DRAW_COLOR_HISTOGRAM2', 'DRAW_FILLING').replace('INDICATOR_COLOR_INDEX', 'INDICATOR_DATA')
+        self.assertEqual(self._indices(src), [2, 3])
+
+    def test_color_line_value_buffer_not_its_color_buffer(self):
+        src = ('#property indicator_plots 2\n#property indicator_type1 DRAW_COLOR_LINE\n#property indicator_type2 DRAW_LINE\n'
+               'void f(){SetIndexBuffer(0,a,INDICATOR_DATA);SetIndexBuffer(1,c,INDICATOR_COLOR_INDEX);SetIndexBuffer(2,b,INDICATOR_DATA);}\n')
+        self.assertEqual(self._indices(src), [0, 2])
+
+    def test_unknown_earlier_plot_leaves_later_lines_unresolved(self):
+        src = '#property indicator_type1 DRAW_LINE\n#property indicator_type3 DRAW_LINE\n'
+        self.assertEqual(self._indices(src), [0])
+
+    def test_line_on_a_calculations_buffer_is_still_drawn(self):
+        # plots bind to buffers by position whatever the buffer kind (ADXm_smoothed's DI line)
+        src = ('#property indicator_plots 2\n#property indicator_type1 DRAW_LINE\n#property indicator_type2 DRAW_LINE\n'
+               'void f(){SetIndexBuffer(0,a,INDICATOR_CALCULATIONS);SetIndexBuffer(1,b,INDICATOR_DATA);}\n')
+        self.assertEqual(self._indices(src), [0, 1])
+
+    def test_type_properties_beyond_indicator_plots_are_not_drawn(self):
+        src = ('#property indicator_plots 1\n#property indicator_type1 DRAW_LINE\n#property indicator_type2 DRAW_LINE\n')
+        self.assertEqual(self._indices(src), [0])
+
+    def test_color_index_at_a_line_start_stops_resolution(self):
+        # the file disagrees with the buffers-per-type table: later starts cannot be trusted
+        src = ('#property indicator_plots 3\n#property indicator_type1 DRAW_LINE\n#property indicator_type2 DRAW_LINE\n'
+               '#property indicator_type3 DRAW_LINE\n'
+               'void f(){SetIndexBuffer(0,a,INDICATOR_DATA);SetIndexBuffer(1,c,INDICATOR_COLOR_INDEX);SetIndexBuffer(2,b,INDICATOR_DATA);}\n')
+        self.assertEqual(self._indices(src), [0])
+
+    def test_mql4_type_property_is_the_buffer_index(self):
+        # MQL4: one buffer per plot, and gaps in typeN numbering are normal
+        src = '#property indicator_type1 DRAW_LINE\n#property indicator_type11 DRAW_LINE\n'
+        self.assertEqual(self._indices(src, '.mq4'), [0, 10])
+
+    def test_mql4_setindexstyle_index_is_the_buffer_index(self):
+        self.assertEqual(self._indices('void f(){SetIndexStyle(0,DRAW_HISTOGRAM);SetIndexStyle(1,DRAW_LINE);}\n'), [1])
 
 
 class StripComments(unittest.TestCase):

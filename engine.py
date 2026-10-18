@@ -225,7 +225,9 @@ def scan(db,sources,force=False):
                 skipped+=1
                 if idx==1 or idx%25==0 or idx==total: emit('progress',current=idx,total=total,processed=processed,skipped=skipped,failed=failed,filename=p.name)
                 continue
-            a=analyze(p); a.duplicate_of=sha_first.get(a.sha256)
+            a=analyze(p); first=sha_first.get(a.sha256)
+            # sha_first is preloaded from the DB, so a re-analyzed file finds its OWN row: not a duplicate
+            a.duplicate_of=first if first and first!=a.path else None
             if a.sha256 not in sha_first: sha_first[a.sha256]=a.path
             save_analysis(conn,a,p.stat().st_mtime_ns); processed+=1; dirty+=1
             if dirty>=25:
