@@ -28,7 +28,7 @@ Commands (JSONL on stdout, like the other sidecars):
        [--symbols EURUSD,...] [--keys sha-prefix,...]
 """
 from __future__ import annotations
-import argparse, json, os, shutil, sqlite3, sys, time, hashlib, threading, tempfile
+import argparse, json, os, re, shutil, sqlite3, sys, time, hashlib, threading, tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -717,6 +717,7 @@ def _runtime_terminals(rt):
     except Exception:
         return []
     rd = str(Path(rt).resolve()).lower().rstrip('\\/')
+    in_cmd = re.compile(re.escape(rd) + r'(?=[\\/"\s]|$)')  # not a sibling like <rt>-render-server
     out = []
     for p in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
         try:
@@ -724,14 +725,14 @@ def _runtime_terminals(rt):
                 continue
             exe = str(p.info.get('exe') or '').lower()
             cmd = ' '.join(p.info.get('cmdline') or []).lower()
-            if exe.startswith(rd + os.sep) or rd in cmd:
+            if exe.startswith(rd + os.sep) or in_cmd.search(cmd):
                 out.append(p)
         except Exception:
             pass
     return out
 
 
-def _wait_batch(files_dir, proc, timeout, rt=None, relaunch_grace=90):
+def _wait_batch(files_dir, proc, timeout, rt=None, relaunch_grace=90, relaunch_allowance=300):
     """True when the controller wrote its done flag. If the launched terminal exits first, an MT5
     LiveUpdate relaunch of the same runtime carries on the session, so wait for that instead of
     declaring a timeout (seen 2026-10-18 when build 6272 shipped: every session died ~1 min in)."""
@@ -753,12 +754,14 @@ def _wait_batch(files_dir, proc, timeout, rt=None, relaunch_grace=90):
             if others:
                 if not relaunch_seen:
                     relaunch_seen = True
+                    end += relaunch_allowance  # the update gap (~3 min) does no extraction work
                     stage_event('mt5_relaunched', pids=[o.pid for o in others])
                 for o in others:
                     pb.hide_pid(o.pid)
                 exited_at = None
             else:
-                exited_at = exited_at or time.monotonic()
+                if exited_at is None:
+                    exited_at = time.monotonic()
                 if rt is None or time.monotonic() - exited_at > relaunch_grace:
                     break
         time.sleep(1.0)
@@ -1237,6 +1240,11 @@ def _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_
     cfg.write_text(f'[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n\n'
                     f'[StartUp]\nSymbol={symbols[0]}\nPeriod=D1\nScript={ctrl.stem}\nShutdownTerminal=0\n', encoding='utf-8')
     stage_event('session_launch', jobs=len(job_json['jobs']), symbols=symbols)
+    for stale in _runtime_terminals(rt):  # a leftover session would take over the launch and stall the wait
+        try:
+            stale.kill()
+        except Exception:
+            pass
     proc = pb.subprocess.Popen([str(terminal_exe), '/portable', f'/config:{cfg}'],
                                 cwd=str(rt), creationflags=pb.CREATE_NO_WINDOW, startupinfo=pb.startupinfo())
     try:

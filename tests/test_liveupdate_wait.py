@@ -45,14 +45,34 @@ class WaitFollowsLiveUpdateRelaunch(unittest.TestCase):
                     mock.patch.object(nb, 'stage_event'):
                 self.assertTrue(nb._wait_batch(files, _Exited(), timeout=60, rt=files))
 
-    def test_no_relaunch_gives_up_after_the_grace(self):
+    def _loops(self, terminals, timeout=3600, **kw):
+        """Run _wait_batch on a 30 s-per-call clock; return (result, sleeps)."""
         with tempfile.TemporaryDirectory() as d:
-            clock = iter(range(0, 10000, 30))
-            with mock.patch.object(nb, '_runtime_terminals', return_value=[]), \
-                    mock.patch.object(nb.pb, 'hide_pid'), mock.patch.object(nb.time, 'sleep'), \
+            clock = iter(range(0, 100000, 30))
+            seq = iter(terminals)
+            with mock.patch.object(nb, '_runtime_terminals', side_effect=lambda _rt: next(seq, [])), \
+                    mock.patch.object(nb.pb, 'hide_pid'), mock.patch.object(nb.time, 'sleep') as sleep, \
                     mock.patch.object(nb.time, 'monotonic', side_effect=lambda: next(clock)), \
                     mock.patch.object(nb, 'stage_event'):
-                self.assertFalse(nb._wait_batch(Path(d), _Exited(), timeout=3600, rt=Path(d), relaunch_grace=90))
+                res = nb._wait_batch(Path(d), _Exited(), timeout=timeout, rt=Path(d), relaunch_grace=90, **kw)
+                return res, sleep.call_count
+
+    def test_no_relaunch_gives_up_after_the_grace_not_before(self):
+        res, sleeps = self._loops([])
+        self.assertFalse(res)
+        self.assertTrue(2 <= sleeps <= 4, sleeps)   # ~90 s of 30 s steps: neither instant nor the full hour
+
+    def test_grace_restarts_when_a_relaunch_appears_after_a_gap(self):
+        r = _Proc(9, 'terminal64.exe', 'x', [])
+        _, base = self._loops([])
+        _, sleeps = self._loops([[], [], [r]])
+        self.assertGreater(sleeps, base + 1)
+
+    def test_relaunch_extends_the_budget(self):
+        r = _Proc(9, 'terminal64.exe', 'x', [])
+        _, short = self._loops([[r]] * 100, timeout=60, relaunch_allowance=0)
+        _, longer = self._loops([[r]] * 100, timeout=60, relaunch_allowance=300)
+        self.assertGreaterEqual(longer - short, 8)  # 300 s more at 30 s per loop
 
     def test_runtime_terminals_match_the_runtime_not_the_owners_terminal(self):
         rt = Path(tempfile.gettempdir()) / 'nnfx-rt-test'
@@ -64,10 +84,13 @@ class WaitFollowsLiveUpdateRelaunch(unittest.TestCase):
             _Proc(3, 'terminal64.exe', 'C:\\Program Files\\MetaTrader 5\\terminal64.exe',
                   ['C:\\Program Files\\MetaTrader 5\\terminal64.exe']),
             _Proc(4, 'notepad.exe', rts + '\\notepad.exe', []),
+            _Proc(5, 'terminal64.exe', rts + '-render-server\\terminal64.exe',          # sibling folder
+                  [rts + '-render-server\\terminal64.exe', f'/config:{rts}-render-server\\x.ini']),
+            _Proc(6, 'terminal64.exe', 'C:\\x\\terminal64.exe', ['terminal64.exe', f'/path:"{rts}"']),
         ]
         fake_psutil = mock.Mock(process_iter=mock.Mock(return_value=procs))  # CI's Linux job has no psutil
         with mock.patch.dict(sys.modules, {'psutil': fake_psutil}):
-            self.assertEqual(sorted(p.pid for p in nb._runtime_terminals(rt)), [1, 2])
+            self.assertEqual(sorted(p.pid for p in nb._runtime_terminals(rt)), [1, 2, 6])
 
 
 if __name__ == '__main__':
