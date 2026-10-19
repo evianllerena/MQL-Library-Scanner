@@ -896,6 +896,11 @@ def repaint_label(verdicts, key):
         return 'not_run'
     if v['repaint'] == 'repaints':
         return f"repaints ({v['diffs']} of {v['compared']} shared values differ, deepest {v['deepest']} bars before the cut)"
+    if v['repaint'] == 'newest_bar_only':
+        # older extractions: the value at the last bar of the cut history -- the bar a trade is decided
+        # on -- differed from the finished history. That IS the hindsight the gate exists for (zigzag and
+        # fractal pivots that later vanish); it was excused as tick-volume noise and ranked at the top.
+        return 'repaints (the decision bar differs from the finished history)'
     return v['repaint']
 
 
