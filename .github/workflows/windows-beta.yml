@@ -12,6 +12,13 @@ on:
       - 'mql_text.py'
       - 'requirements-build.txt'
       - 'preview_bridge.py'
+      - 'mt_common.py'
+      - 'mt_compile.py'
+      - 'mt_discovery.py'
+      - 'mt_runtime.py'
+      - 'preview_db.py'
+      - 'preview_render.py'
+      - 'bridge_selftest.py'
       - 'preview_control.py'
       - 'nnfx_backtest_batch.py'
       - 'nnfx_engine.py'
@@ -30,6 +37,13 @@ on:
       - 'mql_text.py'
       - 'requirements-build.txt'
       - 'preview_bridge.py'
+      - 'mt_common.py'
+      - 'mt_compile.py'
+      - 'mt_discovery.py'
+      - 'mt_runtime.py'
+      - 'preview_db.py'
+      - 'preview_render.py'
+      - 'bridge_selftest.py'
       - 'preview_control.py'
       - 'nnfx_backtest_batch.py'
       - 'nnfx_engine.py'
@@ -59,7 +73,7 @@ jobs:
           $r=$env:GITHUB_WORKSPACE
           "APP_DIR=$r" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           New-Item -ItemType Directory -Force -Path "$r/engine" | Out-Null
-          foreach($f in 'engine.py','engine_core.py','mql_text.py','requirements-build.txt','preview_bridge.py','preview_control.py','nnfx_backtest_batch.py','nnfx_engine.py','nnfx_selftest.py'){
+          foreach($f in 'engine.py','engine_core.py','mql_text.py','requirements-build.txt','preview_bridge.py','mt_common.py','mt_compile.py','mt_discovery.py','mt_runtime.py','preview_db.py','preview_render.py','bridge_selftest.py','preview_control.py','nnfx_backtest_batch.py','nnfx_engine.py','nnfx_selftest.py'){
             Copy-Item "$r/$f" "$r/engine/$f" -Force
           }
 
@@ -75,7 +89,7 @@ jobs:
         shell: pwsh
         run: |
           Set-Location $env:APP_DIR
-          python -m py_compile engine/engine.py engine/engine_core.py engine/mql_text.py engine/preview_bridge.py engine/preview_control.py engine/nnfx_backtest_batch.py engine/nnfx_engine.py engine/nnfx_selftest.py
+          python -m py_compile engine/engine.py engine/engine_core.py engine/mql_text.py engine/preview_bridge.py engine/mt_common.py engine/mt_compile.py engine/mt_discovery.py engine/mt_runtime.py engine/preview_db.py engine/preview_render.py engine/bridge_selftest.py engine/preview_control.py engine/nnfx_backtest_batch.py engine/nnfx_engine.py engine/nnfx_selftest.py
           if($LASTEXITCODE -ne 0){throw 'Python source validation failed'}
           python engine/nnfx_selftest.py
           if($LASTEXITCODE -ne 0){throw 'NNFX backtester self-test failed'}

@@ -19,9 +19,21 @@ def _read(rel):
     return (ROOT / rel).read_text(encoding='utf-8')
 
 
+# preview_bridge.py is the CLI facade; the code lives in these modules (split along the plan's seams, P1.8)
+BRIDGE_MODULES = ('preview_bridge', 'mt_common', 'mt_compile', 'mt_discovery', 'mt_runtime', 'preview_db',
+                  'preview_render', 'bridge_selftest')
+
+
 def bridge_source():
-    """The preview-bridge Python source the static guards search."""
-    return _read('preview_bridge.py')
+    """All preview-bridge Python source, so the guards survive moving code between its modules."""
+    return '\n'.join(_read(f'{m}.py') for m in BRIDGE_MODULES)
+
+
+class BridgeModules(unittest.TestCase):
+    def test_guard_module_list_matches_the_facade_imports(self):
+        import re
+        imported = set(re.findall(r'(?m)^from (\w+) import', _read('preview_bridge.py'))) - {'__future__', 'pathlib', 'mql_text'}
+        self.assertEqual(imported, set(BRIDGE_MODULES) - {'preview_bridge'})
 
 
 class BridgeCli(unittest.TestCase):
