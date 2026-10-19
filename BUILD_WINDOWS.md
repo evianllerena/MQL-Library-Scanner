@@ -21,8 +21,8 @@ installer hook), `index.html` and `package.json` at the root, and the Python sid
 `.github/workflows/windows-beta.yml` is the reference build script; on Windows with Python 3.12, Node 22
 and Rust stable the steps are:
 
-1. copy the Python engine files (`engine*.py`, `mql_text.py`, `preview_*.py`, `nnfx_*.py`,
-   `requirements-build.txt`) into `engine/` and `pip install -r engine/requirements-build.txt`;
+1. copy the Python engine files (`engine*.py`, `mql_text.py`, `preview_*.py`, `mt_*.py`,
+   `bridge_selftest.py`, `nnfx_*.py`, `requirements-build.txt`) into `engine/` and `pip install -r engine/requirements-build.txt`;
 2. build the four sidecars with PyInstaller (`mql-engine`, `mql-preview`, `mql-preview-control`,
    `mql-backtest-batch`) and copy them into `src-tauri/binaries/` with the `-x86_64-pc-windows-msvc.exe` suffix;
 3. `npm install` and `npm run tauri build`.
