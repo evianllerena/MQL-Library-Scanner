@@ -197,7 +197,6 @@ def r_interval(trades, samples=BOOTSTRAP_SAMPLES, seed=0):
 
 
 HOLDOUT_FROM = '2024.01.01'  # P1.4 / owner choice 2A: trades entered from here on are out-of-sample
-RP_WALK = 120               # decision bars the repaint test walks per candidate (controller #define RP_WALK)
 MIN_OOS_TRADES = 20         # oos_pass needs at least this many out-of-sample trades (one lucky trade is not a test)
 
 
@@ -415,8 +414,9 @@ bool MakeCustom(string name,string origin,int keep){
   int n=g_rp_n; if(n<=RP_WALK+400) return(false);
   int m=(keep<n)?keep+1:n;
   SymbolSelect(name,false); CustomSymbolDelete(name);
-  if(!CustomSymbolCreate(name,"NNFXR",origin)) return(false);
-  CustomRatesDelete(name,0,LONG_MAX);
+  bool custom=false;
+  if(!CustomSymbolCreate(name,"NNFXR",origin) && !(SymbolExist(name,custom) && custom)) return(false);
+  CustomRatesDelete(name,0,LONG_MAX); CustomTicksDelete(name,0,LONG_MAX);
   MqlRates k[]; ArrayResize(k,m); for(int i=0;i<m;i++) k[i]=g_rp_rates[i];
   if(keep<n) k[m-1]=OpenOnly(g_rp_rates[m-1]);
   if(CustomRatesReplace(name,k[0].time,k[m-1].time+86400,k)<=0) return(false);
@@ -440,20 +440,37 @@ int LoadCalc(string sym,string rel,uint timeout,string &status){
   return(h);
 }
 bool Blank(double v){ return(v==EMPTY_VALUE || !MathIsValidNumber(v) || v==0.0); }
+// bar t on NNFXR_WALK (shift 1) is the real bar: the open-only one it replaced is gone (bar counts alone
+// cannot tell), waiting briefly for MetaTrader to apply the update
+bool WalkBarIs(const MqlRates &x){
+  double tol=0.5*SymbolInfoDouble(g_rp_sym,SYMBOL_POINT); uint tw=GetTickCount();
+  while(true){
+    MqlRates w[]; ArraySetAsSeries(w,true);
+    if(CopyRates("NNFXR_WALK",PERIOD_D1,1,1,w)==1 && w[0].time==x.time && w[0].tick_volume==x.tick_volume
+       && MathAbs(w[0].open-x.open)<=tol && MathAbs(w[0].high-x.high)<=tol && MathAbs(w[0].low-x.low)<=tol
+       && MathAbs(w[0].close-x.close)<=tol) return(true);
+    if(GetTickCount()-tw>=2000) return(false);
+    Sleep(10);
+  }
+}
 string RepaintTest(string rel,int bufA,int bufB,uint timeout){
   string st2;
   int h2=LoadCalc("NNFXR_FULL",rel,timeout,st2);
   if(st2!="ok"){ if(h2!=INVALID_HANDLE) IndicatorRelease(h2); return("\"repaint\":\"untested_full_"+st2+"\""); }
   int n=g_rp_n, t0=n-RP_WALK-2;          // decision bars t0..n-3; bar n-1 is the live, unfinished one
   if(!MakeCustom("NNFXR_WALK",g_rp_sym,t0+1)){ IndicatorRelease(h2); return("\"repaint\":\"untested_walk_setup\""); }
-  int compared=0,diffs=0,deepest=-1;
-  for(int k=0;k<RP_WALK;k++){
+  int compared=0,diffs=0,deepest=-1; string stop="";
+  uint deadline=GetTickCount()+4*timeout;   // the walk's own budget, inside the session's (Python side)
+  // a repainter is settled by its first difference; clean candidates walk all RP_WALK bars
+  for(int k=0;k<RP_WALK && diffs==0;k++){
     int t=t0+k;                          // NNFXR_WALK: bars 0..t, then bar t+1 at its open
+    if(GetTickCount()>=deadline){ stop="untested_walk_too_slow"; break; }
+    if(Bars("NNFXR_WALK",PERIOD_D1)!=t+2 || !WalkBarIs(g_rp_rates[t])){ stop="untested_history_changed"; break; }
     string st1;
     int h1=LoadCalc("NNFXR_WALK",rel,timeout,st1);
-    if(st1!="ok"){ if(h1!=INVALID_HANDLE) IndicatorRelease(h1); IndicatorRelease(h2); return("\"repaint\":\"untested_walk_"+st1+"\""); }
+    if(st1!="ok"){ if(h1!=INVALID_HANDLE) IndicatorRelease(h1); stop="untested_walk_"+st1; break; }
     if(Bars("NNFXR_WALK",PERIOD_D1)!=t+2 || Bars("NNFXR_FULL",PERIOD_D1)!=g_bars_full){
-      IndicatorRelease(h1); IndicatorRelease(h2); return("\"repaint\":\"untested_history_changed\""); }
+      IndicatorRelease(h1); stop="untested_history_changed"; break; }
     for(int q=0;q<2;q++){
       int b=(q==0)?bufA:bufB; if(b<0) continue;
       double a[],f[]; ArraySetAsSeries(a,true); ArraySetAsSeries(f,true);
@@ -468,19 +485,21 @@ string RepaintTest(string rel,int bufA,int bufB,uint timeout){
       }
     }
     IndicatorRelease(h1);                // reloaded each step: a fresh calculation on the history known then
-    if(k+1<RP_WALK){
+    if(diffs==0 && k+1<RP_WALK){
       // custom symbols keep minute bars: the pump ticks of the open-only day built some, and they would
       // survive the real bar written over it (its close came out equal to its open) -- delete both first
       datetime d=g_rp_rates[t+1].time;
       CustomTicksDelete("NNFXR_WALK",(long)d*1000,(long)(d+86399)*1000);
       CustomRatesDelete("NNFXR_WALK",d,d+86399);
       MqlRates u[2]; u[0]=g_rp_rates[t+1]; u[1]=OpenOnly(g_rp_rates[t+2]);
-      if(CustomRatesUpdate("NNFXR_WALK",u)<=0){ IndicatorRelease(h2); return("\"repaint\":\"untested_walk_update\""); }
+      if(CustomRatesUpdate("NNFXR_WALK",u)<=0){ stop="untested_walk_update"; break; }
       uint tw=GetTickCount(); while(Bars("NNFXR_WALK",PERIOD_D1)<t+3 && GetTickCount()-tw<10000) Sleep(5);
     }
   }
   IndicatorRelease(h2);
-  string v=(compared<20)?"untested_no_comparable_values":((diffs==0)?"aligned":"repaints");
+  // a difference already found is hindsight however the walk ended -- a later step failing must not undo
+  // it -- and it counts however few values were comparable
+  string v=(diffs>0)?"repaints":((stop!="")?stop:((compared<20)?"untested_no_comparable_values":"aligned"));
   return("\"repaint\":\""+v+"\",\"compared\":"+IntegerToString(compared)+",\"diffs\":"+IntegerToString(diffs)+
          ",\"deepest\":"+IntegerToString(deepest));
 }
@@ -924,7 +943,7 @@ def repaint_label(verdicts, key):
     if v is None:
         return 'not_run'
     if v['repaint'] == 'repaints':
-        return f"repaints ({v['diffs']} of {v['compared']} shared values differ, deepest {v['deepest']} bars before a decision bar)"
+        return f"repaints ({v['diffs']} of {v['compared']} compared values differ from what was knowable at the time)"
     if v['repaint'] == 'newest_bar_only':
         # older extractions: the value at the last bar of the cut history -- the bar a trade is decided
         # on -- differed from the finished history. That IS the hindsight the gate exists for (zigzag and
@@ -1288,9 +1307,9 @@ def _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_
         finished = _wait_batch(files_dir, proc, rt=rt, timeout=max(180, 20 * n_jobs * len(symbols)
                                                             + 2 * job_timeout * n_jobs + 150 * len(symbols)
                                                             # P1.2 repaint pass: queue check, FULL load and the
-                                                            # RP_WALK-step walk per job, 4 control runs
-                                                            + (60 + 2 * job_timeout + 3 * RP_WALK) * n_jobs
-                                                            + 4 * (2 * job_timeout + 3 * RP_WALK) + 60))
+                                                            # walk (its own deadline: 4 time limits) per job,
+                                                            # 4 control runs
+                                                            + (60 + 6 * job_timeout) * n_jobs + 4 * 6 * job_timeout + 60))
     finally:
         pb.terminate_tree(proc)
         for other in _runtime_terminals(rt):  # an MT5 LiveUpdate relaunch is not in proc's tree
