@@ -2194,7 +2194,7 @@ def self_test():
     if not all(checks.values()):raise RuntimeError(f'Preview self-test failed: {checks}')
     emit({'ok':True,'checks':checks})
 
-def main():
+def build_parser():
     a=argparse.ArgumentParser();s=a.add_subparsers(dest='cmd',required=True)
     s.add_parser('detect');s.add_parser('self-test')
     p=s.add_parser('preflight');p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--terminal')
@@ -2206,7 +2206,10 @@ def main():
     p=s.add_parser('memory-stats');p.add_argument('--db',required=True)
     p=s.add_parser('remove-source');p.add_argument('--db',required=True);p.add_argument('--source',required=True)
     p=s.add_parser('archive-reset');p.add_argument('--db',required=True)
-    x=a.parse_args()
+    return a
+
+def main():
+    x=build_parser().parse_args()
     if x.cmd=='detect':detect()
     elif x.cmd=='self-test':self_test()
     elif x.cmd=='preflight':preflight(x.source,x.out,x.terminal)
