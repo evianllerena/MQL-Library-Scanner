@@ -20,6 +20,7 @@ on:
       - 'package.json'
       - 'ui/**'
       - 'src-tauri/**'
+      - 'tests/**'
   push:
     branches: [main]
     paths:
@@ -37,6 +38,7 @@ on:
       - 'package.json'
       - 'ui/**'
       - 'src-tauri/**'
+      - 'tests/**'
 
 concurrency:
   group: windows-beta-${{ github.ref }}

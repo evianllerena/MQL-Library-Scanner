@@ -1,4 +1,4 @@
-"""Guards that used to be ~70 regex lines in windows-beta.yml's "Validate source" step (plan, Packaging:
+"""Guards that used to be 69 regex lines in windows-beta.yml's "Validate source" step (plan, Packaging:
 "a change-detector, not a test suite"). Each guard is now a named test: behaviour where it can run without
 MetaTrader (CLI, constants, heartbeat payload, resident-EA path), otherwise a static check on the source that
 says which fix it protects. Discovery/pairing/compile-log behaviour is exercised by `preview_bridge.py self-test`.
@@ -20,7 +20,7 @@ def _read(rel):
 
 
 def bridge_source():
-    """All preview-bridge Python source, so the guards survive moving code between its modules."""
+    """The preview-bridge Python source the static guards search."""
     return _read('preview_bridge.py')
 
 
@@ -43,6 +43,10 @@ class BridgeCli(unittest.TestCase):
 
     def test_preview_selftest(self):
         self.assertEqual(self.parse('preview-selftest', '--out', 'o').cmd, 'preview-selftest')
+
+    def test_command_functions_exist(self):
+        for name in ('detect', 'self_test', 'preflight', 'render', 'render_server', 'preview_selftest', 'compile_pool'):
+            self.assertTrue(callable(getattr(pb, name, None)), name)
 
     def test_detect_and_self_test(self):
         self.assertEqual(self.parse('detect').cmd, 'detect')
@@ -83,13 +87,16 @@ class BridgeSourceGuards(unittest.TestCase):
             self.assertIn(n, src)
 
     def test_no_live_trading_in_render_terminals(self):  # P0.3
-        self.assertNotIn('AllowLiveTrading=1', bridge_source())
+        self.assertNotRegex(bridge_source(), r'(?i)AllowLiveTrading\s*=\s*1')
 
     def test_whole_mql_tree_seed_does_not_return(self):
         self.assertNotIn('copytree(src,dst,dirs_exist_ok=True,ignore=ign)', bridge_source())
 
     def test_runtime_markers_and_selection_cache(self):
         self.assertHas('mt5-preview-prime-v3', 'seed-v5', 'selection-v5.json')
+
+    def test_metaeditor_found_from_the_terminal_install(self):
+        self.assertHas('terminal-install-dir')
 
     def test_shutdown_config_is_numeric(self):
         self.assertHas('ShutdownTerminal=1')
