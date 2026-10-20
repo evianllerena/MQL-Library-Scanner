@@ -32,6 +32,16 @@ class P2ReviewLow(unittest.TestCase):
         body = re.search(r'function changeBacktestSort\(slot,key\)\{.*?loadBacktestBoard', js, re.S).group(0)
         self.assertIn("b.sortBy='rank'", body)
 
+    def test_unverified_repaint_rows_are_flagged(self):
+        # owner decision 2026-10-19: untested_* rows stay ranked, but visibly flagged
+        js = _first('ui/main.js', 'main.js')
+        board = re.search(r'^function renderBacktestBoard\(slot\)\{.*$', js, re.M).group(0)
+        self.assertIn('${btRepaintBadge(r)}', board)
+        badge = re.search(r'^function btRepaintBadge\(r\)\{.*$', js, re.M).group(0)
+        self.assertIn("(!(r.trades>0)||r.repaint_test==='aligned')?''", badge)  # unscored rows: no badge
+        self.assertIn('repaint not verified', badge)
+        self.assertIn('"repaint_test":', _first('src-tauri/src/lib.rs', 'lib.rs'))
+
     def test_dead_preview_timer_and_job_id_removed(self):
         js = _first('ui/preview_ui.js', 'preview_ui.js')
         self.assertNotIn('previewTimer', js)

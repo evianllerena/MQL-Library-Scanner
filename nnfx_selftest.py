@@ -1131,12 +1131,12 @@ def unit_tests() -> Check:
     v_bad = nb.repaint_verdicts([dict(ctl_ok[0], repaint='repaints'), ctl_ok[1]] + cand)
     c.that('P1.2 repaint verdicts are trusted only when the session controls behave (MetaTrader MA aligned at the '
            'start AND the end, the deterministic NNFXR_Mirror control repaints; MetaTrader ZigZag is informational); a repainter is labelled with its counts; a difference on '
-           'the newest bar only is reported (newest_bar_only), not gated; an older extract is not_run',
+           'the newest bar only (the decision bar) is repainting too, so it is gated; an older extract is not_run',
            nb.repaint_label(v_ok, 'zz').startswith('repaints (400 of 400') and nb.repaint_label(v_ok, 'ma') == 'aligned'
            and nb.repaint_label(v_bad, 'zz') == 'untested_controls_failed'
            and nb.repaint_label(nb.repaint_verdicts(ctl_ok[:2] + cand), 'zz') == 'untested_controls_failed'
            and nb.repaint_label(nb.repaint_verdicts(ctl_ok + [dict(cand[0], repaint='newest_bar_only', deepest=0)]), 'zz')
-               == 'newest_bar_only'
+               .startswith('repaints')
            and nb.repaint_label(nb.repaint_verdicts([]), 'zz') == 'not_run', detail=str(v_bad))
     tail0 = [dict(r) for r in two_line]
     for r in tail0:

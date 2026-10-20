@@ -107,7 +107,7 @@ def set_runtime_maxbars(rt, maxbars: int) -> None:
         else:
             lines += ['[Charts]', f'MaxBars={maxbars}']
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('\r\n'.join(lines) + '\r\n', encoding='utf-16')
+    path.write_text('\r\n'.join(lines) + '\r\n', encoding='utf-16', newline='')  # no '\n' translation
 
 
 def usable_symbols(statuses: dict, symbols, history_from: str):
@@ -377,15 +377,20 @@ bool SyncHistory(string sym,datetime from,uint timeout_ms){
   return(false);
 }
 
-// P1.2 repaint test (the method of tools/indicator_fix/IndicatorQA.mq5): the candidate runs on two
-// custom copies of the first symbol's D1 history -- NNFXR_FULL (every bar) and NNFXR_CUT (the newest
-// RP_CUT bars removed) -- and its buffers must be identical on the RP_CMP bars both histories share.
-// Any difference means a value the backtest reads at bar t was not known at bar t (repainting or
-// lookahead). A value present on one side and EMPTY/0 on the other counts as a difference (ZigZag-type
-// pivots appear and disappear); bars EMPTY/0 on both sides are not compared.
-#define RP_CUT 150
-#define RP_CMP 400
-int g_bars_full=0, g_bars_cut=0;   // bar counts at creation; a change voids the comparison
+// P1.2 repaint test: a point-in-time walk. NNFXR_FULL holds the first symbol's whole D1 history (what the
+// backtest reads); NNFXR_WALK holds it only up to a decision bar t, then bar t+1 as it opens (O=H=L=C=open,
+// one tick) -- the market as it looks when a trade on bar t is decided. For RP_WALK consecutive decision
+// bars the candidate is loaded FRESH on NNFXR_WALK and its values at bar t and t-1 (a cross reads both)
+// must equal NNFXR_FULL's. Any difference means the backtest read a value that was not known at the time
+// (repainting or lookahead). A value present on one side and EMPTY/0 on the other counts as a difference
+// (ZigZag-type pivots appear and disappear); bars EMPTY/0 on both sides are not compared.
+// Every bar has to be a decision bar: a pivot that vanishes has usually vanished by the time a later
+// cut is taken, so comparing older bars of a few cut histories missed most zigzags (2026-10-19, F:\True
+// MQL5: a one-cut test passed fastzz, ATRZigZag, rvmgann_sv8 and extremline, which repaint on 9-73% of
+// bars in a day-by-day replay).
+#define RP_WALK 120
+MqlRates g_rp_rates[]; int g_rp_n=0; string g_rp_sym="";   // the first symbol's D1 bars, copied once: FULL and WALK share them
+int g_bars_full=0;                     // FULL's bar count at creation; a change voids the comparison
 // custom symbols get no ticks; indicators that wait for a tick before finishing would never calculate.
 // Each symbol keeps its OWN clock (its last tick) and a pump never leaves the last bar's day -- a
 // shared clock once put CUT's ticks 150 days ahead, adding a bar and shifting every comparison.
@@ -400,20 +405,27 @@ void PumpTick(string sym){
   tk[0].volume=1; tk[0].flags=TICK_FLAG_BID|TICK_FLAG_ASK;
   CustomTicksAdd(sym,tk);
 }
-bool MakeCustom(string name,string origin,int drop){
-  MqlRates r[]; ArraySetAsSeries(r,false);
-  int n=CopyRates(origin,PERIOD_D1,0,Bars(origin,PERIOD_D1),r);
-  if(n<=RP_CUT+RP_CMP+200) return(false);
+MqlRates OpenOnly(const MqlRates &x){   // a bar as it looks at its first tick
+  MqlRates o=x; o.high=x.open; o.low=x.open; o.close=x.open; o.tick_volume=1; o.real_volume=0; return(o);
+}
+// name: the first `keep` bars of g_rp_rates (all when keep>=g_rp_n), then -- when cut -- the next bar
+// as it opens. Emptied first: replacing a range keeps any stored bars outside it.
+bool MakeCustom(string name,string origin,int keep){
+  int n=g_rp_n; if(n<=RP_WALK+400) return(false);
+  int m=(keep<n)?keep+1:n;
   SymbolSelect(name,false); CustomSymbolDelete(name);
-  if(!CustomSymbolCreate(name,"NNFXR",origin)) return(false);
-  MqlRates k[]; ArrayResize(k,n-drop); for(int i=0;i<n-drop;i++) k[i]=r[i];
-  if(CustomRatesReplace(name,k[0].time,k[n-drop-1].time+86400,k)<=0) return(false);
+  bool custom=false;
+  if(!CustomSymbolCreate(name,"NNFXR",origin) && !(SymbolExist(name,custom) && custom)) return(false);
+  CustomRatesDelete(name,0,LONG_MAX); CustomTicksDelete(name,0,LONG_MAX);
+  MqlRates k[]; ArrayResize(k,m); for(int i=0;i<m;i++) k[i]=g_rp_rates[i];
+  if(keep<n) k[m-1]=OpenOnly(g_rp_rates[m-1]);
+  if(CustomRatesReplace(name,k[0].time,k[m-1].time+86400,k)<=0) return(false);
   SymbolSelect(name,true);
-  MqlTick tk[1]; tk[0].time=k[n-drop-1].time+3600; tk[0].bid=k[n-drop-1].close; tk[0].ask=k[n-drop-1].close+10*SymbolInfoDouble(origin,SYMBOL_POINT);
+  MqlTick tk[1]; tk[0].time=k[m-1].time+3600; tk[0].bid=k[m-1].close; tk[0].ask=k[m-1].close+10*SymbolInfoDouble(origin,SYMBOL_POINT);
   tk[0].last=tk[0].bid; tk[0].volume=1; tk[0].time_msc=(long)tk[0].time*1000; tk[0].flags=TICK_FLAG_BID|TICK_FLAG_ASK;
   CustomTicksAdd(name,tk);
-  uint t0=GetTickCount(); while(Bars(name,PERIOD_D1)<n-drop && GetTickCount()-t0<30000) Sleep(100);
-  return(Bars(name,PERIOD_D1)>=n-drop);
+  uint t0=GetTickCount(); while(Bars(name,PERIOD_D1)<m && GetTickCount()-t0<30000) Sleep(100);
+  return(Bars(name,PERIOD_D1)==m);
 }
 int LoadCalc(string sym,string rel,uint timeout,string &status){
   int need=Bars(sym,PERIOD_D1); uint t0=GetTickCount(); int calc=-1; uint lastpump=0;
@@ -428,32 +440,66 @@ int LoadCalc(string sym,string rel,uint timeout,string &status){
   return(h);
 }
 bool Blank(double v){ return(v==EMPTY_VALUE || !MathIsValidNumber(v) || v==0.0); }
+// bar t on NNFXR_WALK (shift 1) is the real bar: the open-only one it replaced is gone (bar counts alone
+// cannot tell), waiting briefly for MetaTrader to apply the update
+bool WalkBarIs(const MqlRates &x){
+  double tol=0.5*SymbolInfoDouble(g_rp_sym,SYMBOL_POINT); uint tw=GetTickCount();
+  while(true){
+    MqlRates w[]; ArraySetAsSeries(w,true);
+    if(CopyRates("NNFXR_WALK",PERIOD_D1,1,1,w)==1 && w[0].time==x.time && w[0].tick_volume==x.tick_volume
+       && MathAbs(w[0].open-x.open)<=tol && MathAbs(w[0].high-x.high)<=tol && MathAbs(w[0].low-x.low)<=tol
+       && MathAbs(w[0].close-x.close)<=tol) return(true);
+    if(GetTickCount()-tw>=2000) return(false);
+    Sleep(10);
+  }
+}
 string RepaintTest(string rel,int bufA,int bufB,uint timeout){
-  string st1,st2;
-  int h1=LoadCalc("NNFXR_CUT",rel,timeout,st1);
-  if(st1!="ok"){ if(h1!=INVALID_HANDLE) IndicatorRelease(h1); return("\"repaint\":\"untested_cut_"+st1+"\""); }
+  string st2;
   int h2=LoadCalc("NNFXR_FULL",rel,timeout,st2);
-  if(st2!="ok"){ IndicatorRelease(h1); if(h2!=INVALID_HANDLE) IndicatorRelease(h2); return("\"repaint\":\"untested_full_"+st2+"\""); }
-  if(Bars("NNFXR_CUT",PERIOD_D1)!=g_bars_cut || Bars("NNFXR_FULL",PERIOD_D1)!=g_bars_full){
-    IndicatorRelease(h1); IndicatorRelease(h2); return("\"repaint\":\"untested_history_changed\""); }
-  int compared=0,diffs=0,deepest=-1;
-  for(int q=0;q<2;q++){
-    int b=(q==0)?bufA:bufB; if(b<0) continue;
-    double a[],f[]; ArraySetAsSeries(a,true); ArraySetAsSeries(f,true);
-    int ga=CopyBuffer(h1,b,0,RP_CMP,a);        // NNFXR_CUT newest RP_CMP bars (j = j bars before the cut)
-    int gf=CopyBuffer(h2,b,RP_CUT,RP_CMP,f);   // the SAME bars on NNFXR_FULL
-    int n=MathMin(ga,gf);
-    for(int j=0;j<n;j++){
-      bool ea=Blank(a[j]), ef=Blank(f[j]);
-      if(ea && ef) continue;
-      compared++;
-      if(ea!=ef || MathAbs(a[j]-f[j])>1e-8*MathMax(1.0,MathAbs(a[j]))){ diffs++; if(j>deepest) deepest=j; }
+  if(st2!="ok"){ if(h2!=INVALID_HANDLE) IndicatorRelease(h2); return("\"repaint\":\"untested_full_"+st2+"\""); }
+  int n=g_rp_n, t0=n-RP_WALK-2;          // decision bars t0..n-3; bar n-1 is the live, unfinished one
+  if(!MakeCustom("NNFXR_WALK",g_rp_sym,t0+1)){ IndicatorRelease(h2); return("\"repaint\":\"untested_walk_setup\""); }
+  int compared=0,diffs=0,deepest=-1; string stop="";
+  uint deadline=GetTickCount()+4*timeout;   // the walk's own budget, inside the session's (Python side)
+  // a repainter is settled by its first difference; clean candidates walk all RP_WALK bars
+  for(int k=0;k<RP_WALK && diffs==0;k++){
+    int t=t0+k;                          // NNFXR_WALK: bars 0..t, then bar t+1 at its open
+    if(GetTickCount()>=deadline){ stop="untested_walk_too_slow"; break; }
+    if(Bars("NNFXR_WALK",PERIOD_D1)!=t+2 || !WalkBarIs(g_rp_rates[t])){ stop="untested_history_changed"; break; }
+    string st1;
+    int h1=LoadCalc("NNFXR_WALK",rel,timeout,st1);
+    if(st1!="ok"){ if(h1!=INVALID_HANDLE) IndicatorRelease(h1); stop="untested_walk_"+st1; break; }
+    if(Bars("NNFXR_WALK",PERIOD_D1)!=t+2 || Bars("NNFXR_FULL",PERIOD_D1)!=g_bars_full){
+      IndicatorRelease(h1); stop="untested_history_changed"; break; }
+    for(int q=0;q<2;q++){
+      int b=(q==0)?bufA:bufB; if(b<0) continue;
+      double a[],f[]; ArraySetAsSeries(a,true); ArraySetAsSeries(f,true);
+      int ga=CopyBuffer(h1,b,1,2,a);          // bar t (j=0) and t-1 (j=1) as known at the decision
+      int gf=CopyBuffer(h2,b,n-1-t,2,f);      // the SAME bars on NNFXR_FULL
+      int m=MathMin(ga,gf);
+      for(int j=0;j<m;j++){
+        bool ea=Blank(a[j]), ef=Blank(f[j]);
+        if(ea && ef) continue;
+        compared++;
+        if(ea!=ef || MathAbs(a[j]-f[j])>1e-8*MathMax(1.0,MathAbs(a[j]))){ diffs++; if(j>deepest) deepest=j; }
+      }
+    }
+    IndicatorRelease(h1);                // reloaded each step: a fresh calculation on the history known then
+    if(diffs==0 && k+1<RP_WALK){
+      // custom symbols keep minute bars: the pump ticks of the open-only day built some, and they would
+      // survive the real bar written over it (its close came out equal to its open) -- delete both first
+      datetime d=g_rp_rates[t+1].time;
+      CustomTicksDelete("NNFXR_WALK",(long)d*1000,(long)(d+86399)*1000);
+      CustomRatesDelete("NNFXR_WALK",d,d+86399);
+      MqlRates u[2]; u[0]=g_rp_rates[t+1]; u[1]=OpenOnly(g_rp_rates[t+2]);
+      if(CustomRatesUpdate("NNFXR_WALK",u)<=0){ stop="untested_walk_update"; break; }
+      uint tw=GetTickCount(); while(Bars("NNFXR_WALK",PERIOD_D1)<t+3 && GetTickCount()-tw<10000) Sleep(5);
     }
   }
-  IndicatorRelease(h1); IndicatorRelease(h2);
-  // only the newest shared bar differs: a not-yet-final last value or tick volume from the pumps --
-  // reported, not treated as repainting
-  string v=(compared<50)?"untested_no_comparable_values":((diffs==0)?"aligned":((deepest==0)?"newest_bar_only":"repaints"));
+  IndicatorRelease(h2);
+  // a difference already found is hindsight however the walk ended -- a later step failing must not undo
+  // it -- and it counts however few values were comparable
+  string v=(diffs>0)?"repaints":((stop!="")?stop:((compared<20)?"untested_no_comparable_values":"aligned"));
   return("\"repaint\":\""+v+"\",\"compared\":"+IntegerToString(compared)+",\"diffs\":"+IntegerToString(diffs)+
          ",\"deepest\":"+IntegerToString(deepest));
 }
@@ -582,8 +628,10 @@ void OnStart(){
   // P1.2 repaint test, once per candidate, on the first symbol's history (repainting is a property of
   // the indicator, not of the pair). Skipped for candidates that already struck out.
   string rsym=syms[0];
-  bool rp_ok=nsyms>0 && MakeCustom("NNFXR_FULL",rsym,0) && MakeCustom("NNFXR_CUT",rsym,RP_CUT);
-  g_bars_full=Bars("NNFXR_FULL",PERIOD_D1); g_bars_cut=Bars("NNFXR_CUT",PERIOD_D1);
+  ArraySetAsSeries(g_rp_rates,false); g_rp_sym=rsym;
+  g_rp_n=(nsyms>0)?CopyRates(rsym,PERIOD_D1,0,Bars(rsym,PERIOD_D1),g_rp_rates):0;
+  bool rp_ok=nsyms>0 && MakeCustom("NNFXR_FULL",rsym,g_rp_n);
+  g_bars_full=Bars("NNFXR_FULL",PERIOD_D1);
   AppendResult("{\"info\":\"repaint_test\",\"symbol\":\""+rsym+"\",\"custom_symbols\":"+(rp_ok?"true":"false")+"}");
   // controls, every session: MetaTrader's own moving average must come out aligned, and the deterministic
   // positive control NNFXR_Mirror (reads close newest-first without ArraySetAsSeries -- the exact bug of
@@ -895,7 +943,12 @@ def repaint_label(verdicts, key):
     if v is None:
         return 'not_run'
     if v['repaint'] == 'repaints':
-        return f"repaints ({v['diffs']} of {v['compared']} shared values differ, deepest {v['deepest']} bars before the cut)"
+        return f"repaints ({v['diffs']} of {v['compared']} compared values differ from what was knowable at the time)"
+    if v['repaint'] == 'newest_bar_only':
+        # older extractions: the value at the last bar of the cut history -- the bar a trade is decided
+        # on -- differed from the finished history. That IS the hindsight the gate exists for (zigzag and
+        # fractal pivots that later vanish); it was excused as tick-volume noise and ranked at the top.
+        return 'repaints (the decision bar differs from the finished history)'
     return v['repaint']
 
 
@@ -1253,9 +1306,10 @@ def _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_
         n_jobs = len(job_json['jobs'])
         finished = _wait_batch(files_dir, proc, rt=rt, timeout=max(180, 20 * n_jobs * len(symbols)
                                                             + 2 * job_timeout * n_jobs + 150 * len(symbols)
-                                                            # P1.2 repaint pass: queue check + 2 loads per job,
-                                                            # 3 control runs, custom-symbol setup
-                                                            + (60 + 2 * job_timeout) * n_jobs + 6 * job_timeout + 60))
+                                                            # P1.2 repaint pass: queue check, FULL load and the
+                                                            # walk (its own deadline: 4 time limits) per job,
+                                                            # 4 control runs
+                                                            + (60 + 6 * job_timeout) * n_jobs + 4 * 6 * job_timeout + 60))
     finally:
         pb.terminate_tree(proc)
         for other in _runtime_terminals(rt):  # an MT5 LiveUpdate relaunch is not in proc's tree
