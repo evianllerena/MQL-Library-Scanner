@@ -107,7 +107,7 @@ def set_runtime_maxbars(rt, maxbars: int) -> None:
         else:
             lines += ['[Charts]', f'MaxBars={maxbars}']
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('\r\n'.join(lines) + '\r\n', encoding='utf-16')
+    path.write_text('\r\n'.join(lines) + '\r\n', encoding='utf-16', newline='')  # no '\n' translation
 
 
 def usable_symbols(statuses: dict, symbols, history_from: str):
