@@ -250,8 +250,9 @@ async function loadAllBacktest(){await Promise.all(BACKTEST_SLOTS.map(([slot])=>
 function fmtNum(v){return v==null?'—':Number(v).toFixed(2);}
 function fmtPct(v){return v==null?'—':`${Number(v).toFixed(1)}%`;}
 // P1.2: a scored row whose repaint test did not finish (or predates it) is ranked but flagged -- its result
-// may be hindsight. Repainting rows are never scored, so 'aligned' is the only verified verdict.
-function btRepaintBadge(r){return r.repaint_test==='aligned'?'':` <span class="badge" title="${esc(r.repaint_test||'not_run')}">repaint not verified</span>`;}
+// may be hindsight. Rows that were not scored (repaints, failed, garbage: status rows, 0 trades) keep a
+// stale or empty repaint_test and get no badge; 'aligned' is the only verified verdict.
+function btRepaintBadge(r){return (!(r.trades>0)||r.repaint_test==='aligned')?'':` <span class="badge" title="${esc(r.repaint_test||'not_run')}">repaint not verified</span>`;}
 function renderBacktestBoard(slot){const b=state.backtest[slot],tbody=el(`btRows_${slot}`);tbody.innerHTML=b.rows.map(r=>`<tr class="${r.insufficient_sample?'insufficient':''}"><td>${esc(r.filename)}${r.insufficient_sample?' <span class="badge">insufficient sample</span>':''}${btRepaintBadge(r)}</td><td>${r.trades}</td><td>${fmtPct(r.win_rate)}</td><td>${fmtNum(r.expectancy_pips)}</td><td>${fmtNum(r.profit_factor)}</td><td>${fmtNum(r.max_drawdown)}</td></tr>`).join('');el(`btEmpty_${slot}`).style.display=b.rows.length?'none':'block';updateBacktestSortMarks(slot);}
 function updateBacktestSortMarks(slot){const b=state.backtest[slot];document.querySelectorAll(`[data-bt-mark^="${slot}:"]`).forEach(x=>{const key=x.dataset.btMark.split(':')[1];x.textContent=key===b.sortBy?(b.sortDir==='asc'?'▲':'▼'):'';});}
 function changeBacktestSort(slot,key){const b=state.backtest[slot],first=key==='name'?'asc':'desc';if(b.sortBy===key){if(b.sortDir!==first){b.sortBy='rank';b.sortDir='desc';}else b.sortDir=first==='asc'?'desc':'asc';}else{b.sortBy=key;b.sortDir=first;}loadBacktestBoard(slot);logEvent('INFO','backtest_sort_change',{slot,sortBy:b.sortBy,sortDir:b.sortDir});}

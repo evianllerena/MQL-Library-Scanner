@@ -38,7 +38,7 @@ class P2ReviewLow(unittest.TestCase):
         board = re.search(r'^function renderBacktestBoard\(slot\)\{.*$', js, re.M).group(0)
         self.assertIn('${btRepaintBadge(r)}', board)
         badge = re.search(r'^function btRepaintBadge\(r\)\{.*$', js, re.M).group(0)
-        self.assertIn("r.repaint_test==='aligned'?''", badge)
+        self.assertIn("(!(r.trades>0)||r.repaint_test==='aligned')?''", badge)  # unscored rows: no badge
         self.assertIn('repaint not verified', badge)
         self.assertIn('"repaint_test":', _first('src-tauri/src/lib.rs', 'lib.rs'))
 
