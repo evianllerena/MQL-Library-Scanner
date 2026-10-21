@@ -128,6 +128,14 @@ def usable_symbols(statuses: dict, symbols, history_from: str):
     return keep, dropped
 
 JOB_TIMEOUT_SECONDS = 30  # per candidate per pair; a candidate that misses it on 2 pairs is skipped
+STALL_SECONDS = 600  # no new controller result line for this long = the session is dead (see _wait_batch)
+
+
+def stall_limit(job_timeout):
+    """The controller's longest silent stretch grows with the job time limit T: a repaint job is up to
+    ~103 s + 6T (health wait, FULL load, WALK setup, 4T walk + its last step), a symbol's first job up
+    to ~301 s + T (login, history sync, backdrop, health wait). 120 + 8T covers both with margin."""
+    return max(STALL_SECONDS, 120 + 8 * job_timeout)
 
 
 def job_failures(results):
@@ -780,22 +788,33 @@ def _runtime_terminals(rt):
     return out
 
 
-def _wait_batch(files_dir, proc, timeout, rt=None, relaunch_grace=90, relaunch_allowance=300):
+def _wait_batch(files_dir, proc, timeout, rt=None, relaunch_grace=90, relaunch_allowance=300,
+                stall_after=STALL_SECONDS):
     """True when the controller wrote its done flag. If the launched terminal exits first, an MT5
     LiveUpdate relaunch of the same runtime carries on the session, so wait for that instead of
-    declaring a timeout (seen 2026-10-18 when build 6272 shipped: every session died ~1 min in)."""
+    declaring a timeout (seen 2026-10-18 when build 6272 shipped: every session died ~1 min in).
+    No new result line for stall_after seconds ends the wait too: the controller script can die
+    ('Abnormal termination', 2026-10-20) while MT5 stays open, and the ceiling is hours away."""
     done = files_dir / 'nnfx_batch_done.flag'
     end = time.monotonic() + timeout
     last = -1
+    last_change = None
     exited_at = None
     relaunch_seen = False
-    while time.monotonic() < end:
+    while True:
+        now = time.monotonic()
+        if now >= end:
+            break
         pb.hide_pid(proc.pid)
         res = _read_jsonl(files_dir / 'nnfx_batch_results.jsonl')
         if len(res) != last:
             last = len(res)
+            last_change = now
             stage_event('batch_progress', events=last)
         if done.exists():
+            break
+        if now - last_change > stall_after:
+            stage_event('batch_stalled', events=last, idle_seconds=round(now - last_change))
             break
         if proc.poll() is not None:
             others = _runtime_terminals(rt) if rt is not None else []
@@ -804,6 +823,7 @@ def _wait_batch(files_dir, proc, timeout, rt=None, relaunch_grace=90, relaunch_a
                     relaunch_seen = True
                     end += relaunch_allowance  # the update gap (~3 min) does no extraction work
                     stage_event('mt5_relaunched', pids=[o.pid for o in others])
+                    last_change = now  # ... and writes no results
                 for o in others:
                     pb.hide_pid(o.pid)
                 exited_at = None
@@ -1304,7 +1324,8 @@ def _run_session(rt, terminal_exe, editor, mqlroot, scripts_dir, files_dir, job_
         # ceiling: ~20 s per candidate per pair, + 2 time limits per candidate (strikes), + up to
         # 2.5 min per symbol for the controller's history download/sync
         n_jobs = len(job_json['jobs'])
-        finished = _wait_batch(files_dir, proc, rt=rt, timeout=max(180, 20 * n_jobs * len(symbols)
+        finished = _wait_batch(files_dir, proc, rt=rt, stall_after=stall_limit(job_timeout),
+                               timeout=max(180, 20 * n_jobs * len(symbols)
                                                             + 2 * job_timeout * n_jobs + 150 * len(symbols)
                                                             # P1.2 repaint pass: queue check, FULL load and the
                                                             # walk (its own deadline: 4 time limits) per job,
